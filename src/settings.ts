@@ -1,4 +1,5 @@
 import { PluginSettingTab, Setting, type App } from "obsidian";
+import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
 import type LiteratureInboxPlugin from "./main";
 
 export interface LiteratureInboxSettings {
@@ -18,6 +19,13 @@ export interface LiteratureInboxSettings {
 
   /** How many top-cited papers the kernel run seeds the papers folder with. */
   kernelSize: number;
+
+  /**
+   * What "new" means, in days back from today. The user's definition, not
+   * "since you last ran" — that returns an empty inbox on day one and on any
+   * second run the same day, both of which read as a broken plugin.
+   */
+  newWindowDays: number;
 
   maxArrivalsPerRun: number;
   keepWindowDays: number;
@@ -44,6 +52,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   rssEnabled: false,
   rssFeeds: "",
   kernelSize: 100,
+  newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 25,
   keepWindowDays: 30,
   pruneEnabled: false,
@@ -202,6 +211,27 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     });
 
     new Setting(containerEl)
+      .setName("What counts as new")
+      .setDesc(
+        "How many days back an update looks. Counted from when a paper was indexed, " +
+          "not when it was published — indexing lags publication by weeks, and a " +
+          "window on publication date silently skips anything indexed late. Runs " +
+          "overlap on purpose; papers you already have are recognised and skipped.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(String(DEFAULT_RECENCY_WINDOW_DAYS))
+          .setValue(String(this.plugin.settings.newWindowDays))
+          .onChange(async (value) => {
+            this.plugin.settings.newWindowDays = parseCount(
+              value,
+              DEFAULT_SETTINGS.newWindowDays,
+            );
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("OpenAlex")
       .setDesc(
         "Recent papers on your topic. The best source for citation edges, because " +
@@ -238,11 +268,13 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("RSS / Atom feeds")
+      .setName("RSS / Atom feeds — the fastest source")
       .setDesc(
-        "Journal tables of contents, bioRxiv, Scholar alerts — any feed URL, one per " +
-          "line. A DOI is resolved for each item where possible, so feed items still " +
-          "get citation edges instead of arriving as isolated dots.",
+        "Recommended. Journal tables of contents, bioRxiv, Scholar alerts — any feed " +
+          "URL, one per line. Feeds carry a paper the day it appears, well before " +
+          "OpenAlex indexes it, so this is the quickest way to a non-empty inbox. A " +
+          "DOI is resolved for each item where possible, so feed items still get " +
+          "citation edges instead of arriving as isolated dots.",
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.rssEnabled).onChange(async (value) => {
@@ -253,6 +285,10 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Feed URLs")
+      .setDesc(
+        "One per line. Test them after pasting — a dead or mistyped feed is otherwise " +
+          "indistinguishable from a quiet one.",
+      )
       .addTextArea((text) =>
         text
           .setPlaceholder("https://example.org/journal/feed.xml")
@@ -261,6 +297,12 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
             this.plugin.settings.rssFeeds = value;
             await this.plugin.saveSettings();
           }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Test feeds")
+          .setTooltip("Fetch each feed once and report what came back")
+          .onClick(() => void this.plugin.testFeeds()),
       );
   }
 

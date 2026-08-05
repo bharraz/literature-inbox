@@ -25,6 +25,7 @@ import {
   setRequestResponder,
 } from "./fakes/obsidian";
 import LiteratureInboxPlugin from "../src/main";
+import { isoDaysAgo } from "../src/core/dates";
 
 // --- canned API payloads -------------------------------------------------------
 
@@ -571,6 +572,69 @@ describe("building the starting graph", () => {
     await runCommand(plugin, "update-inbox");
 
     expect(requestedUrls[0]).toBe(first);
+  });
+});
+
+describe("what counts as new", () => {
+  it("asks OpenAlex for the window the user configured", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.newWindowDays = 7;
+    });
+
+    await runCommand(plugin, "update-inbox");
+
+    // The colon is percent-encoded in the query string, so match the parts.
+    expect(requestedUrls[0]).toContain("from_created_date");
+    expect(requestedUrls[0]).toContain(isoDaysAgo(7));
+  });
+
+  it("defaults to a window wide enough to return something on day one", async () => {
+    const { plugin } = await bootPlugin();
+    expect(plugin.settings.newWindowDays).toBe(30);
+  });
+});
+
+describe("testing feeds before trusting them", () => {
+  const feedXml = (title: string) =>
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>A Journal</title>` +
+    `<item><title>${title}</title><link>https://example.org/a</link></item>` +
+    `</channel></rss>`;
+
+  it("says so rather than silently doing nothing when no feeds are set", async () => {
+    const { plugin } = await bootPlugin();
+    await plugin.testFeeds();
+    expect(notices.some((n) => n.includes("feed URL"))).toBe(true);
+    expect(requestedUrls).toHaveLength(0);
+  });
+
+  it("fetches every configured feed once, even with the source switched off", async () => {
+    // Testing a feed before enabling the source is the normal order — you
+    // paste a URL, check it works, then turn it on.
+    respondWith(feedXml("A Recent Paper"));
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.rssEnabled = false;
+      p.settings.rssFeeds = "https://example.org/one.xml\nhttps://example.org/two.xml";
+    });
+
+    await plugin.testFeeds();
+
+    expect(requestedUrls).toEqual([
+      "https://example.org/one.xml",
+      "https://example.org/two.xml",
+    ]);
+  });
+
+  it("reports a dead feed instead of throwing", async () => {
+    setRequestResponder(() => {
+      throw new Error("ENOTFOUND");
+    });
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.rssFeeds = "https://example.org/dead.xml";
+    });
+
+    await expect(plugin.testFeeds()).resolves.toBeUndefined();
   });
 });
 

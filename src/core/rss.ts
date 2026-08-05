@@ -20,7 +20,7 @@
  */
 
 import { ARXIV, DOI, RSS, URL_NS, bareArxivId, makeId, normalizeDoi } from "./ids";
-import { getWithRetry, type Transport } from "./http";
+import { getWithRetry, type RetryOptions, type Transport } from "./http";
 import { childText, collapseWhitespace, parseXml } from "./xml";
 import { emptyWork, type Work } from "./types";
 
@@ -171,6 +171,31 @@ export async function backfillDois(
   return resolved;
 }
 
-export async function fetchFeed(transport: Transport, url: string): Promise<Work[]> {
-  return parseFeed(await getWithRetry(transport, url));
+export async function fetchFeed(
+  transport: Transport,
+  url: string,
+  options: RetryOptions = {},
+): Promise<Work[]> {
+  return parseFeed(await getWithRetry(transport, url, options));
+}
+
+/**
+ * The most recent item in a feed, for showing the user what a feed actually
+ * contains when they test it.
+ *
+ * Feeds conventionally list newest first, but that is a convention and not a
+ * rule, so dated items are compared by date and undated ones fall back to
+ * document order. Seeing a title from three years ago is exactly the signal
+ * that a feed URL is wrong.
+ */
+export function newestItem(works: readonly Work[]): Work | undefined {
+  let best: Work | undefined;
+  for (const work of works) {
+    if (!best) {
+      best = work;
+      continue;
+    }
+    if (work.date && (!best.date || work.date > best.date)) best = work;
+  }
+  return best;
 }

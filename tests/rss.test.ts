@@ -3,6 +3,7 @@ import {
   backfillDois,
   extractArxivIdFromText,
   extractDoiFromText,
+  newestItem,
   parseFeed,
 } from "../src/core/rss";
 import { titlesMatch } from "../src/core/ids";
@@ -34,6 +35,34 @@ describe("DOI extraction from free text", () => {
   it("returns undefined when there is no DOI", () => {
     expect(extractDoiFromText("no identifier here")).toBeUndefined();
     expect(extractDoiFromText(undefined)).toBeUndefined();
+  });
+});
+
+describe("newestItem", () => {
+  const dated = (key: string, date?: string): Work => {
+    const work = emptyWork(key);
+    work.title = key;
+    work.date = date;
+    return work;
+  };
+
+  it("returns nothing for an empty feed", () => {
+    expect(newestItem([])).toBeUndefined();
+  });
+
+  it("picks the latest date, not the first item", () => {
+    // Newest-first is a convention, not a rule — a feed listing oldest first
+    // would otherwise report a title from years ago as its most recent.
+    const works = [dated("old", "2020-01-01"), dated("new", "2026-08-01")];
+    expect(newestItem(works)?.title).toBe("new");
+  });
+
+  it("falls back to document order when nothing is dated", () => {
+    expect(newestItem([dated("first"), dated("second")])?.title).toBe("first");
+  });
+
+  it("prefers a dated item over an undated one", () => {
+    expect(newestItem([dated("undated"), dated("dated", "2026-08-01")])?.title).toBe("dated");
   });
 });
 

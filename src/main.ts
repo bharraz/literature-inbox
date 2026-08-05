@@ -11,9 +11,9 @@
 
 import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
-import { DEFAULT_RECENCY_WINDOW_DAYS, isoDaysAgo } from "./core/dates";
+import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
-import { backfillDois, fetchFeed } from "./core/rss";
+import { backfillDois, fetchFeed, newestItem } from "./core/rss";
 import { titlesMatch, normalizeTitle } from "./core/ids";
 import {
   EMPTY_STATE,
@@ -234,15 +234,15 @@ export default class LiteratureInboxPlugin extends Plugin {
 
     if (this.settings.openAlexEnabled && this.settings.openAlexTopic.trim()) {
       try {
-        // A fixed window back from today, never `topWorks` and never "since you
-        // last ran". `topWorks` returns the most-cited papers on the topic —
-        // exactly what a kernel run just seeded — so using it here reported
+        // The user's window back from today, never `topWorks` and never "since
+        // you last ran". `topWorks` returns the most-cited papers on the topic
+        // — exactly what a kernel run just seeded — so using it here reported
         // "0 new" on every first update, guaranteed. And anchoring on
         // `lastUpdate` narrows the window to nothing on a second run the same
         // day. The window overlaps previous runs on purpose: dedup is exact
         // and cheap, so re-seeing a paper costs nothing and missing one is
         // permanent.
-        const since = isoDaysAgo(DEFAULT_RECENCY_WINDOW_DAYS);
+        const since = isoDaysAgo(this.settings.newWindowDays);
         works.push(
           ...(await this.openAlex().worksSince(this.settings.openAlexTopic, since, perSource)),
         );
@@ -572,6 +572,45 @@ export default class LiteratureInboxPlugin extends Plugin {
     }).open();
   }
 
+  /**
+   * Fetch each configured feed once and report what came back.
+   *
+   * A feed that is dead, mistyped, or not actually a feed is otherwise
+   * indistinguishable from a feed that simply has nothing new — you find out
+   * three empty updates later, if at all. Checking at the point of entry is
+   * the whole value. Deliberately ignores the RSS toggle: testing a feed
+   * before switching the source on is the normal order.
+   */
+  async testFeeds(): Promise<void> {
+    const urls = splitList(this.settings.rssFeeds);
+    if (urls.length === 0) {
+      notify("Add at least one feed URL first.");
+      return;
+    }
+
+    notify(`Testing ${urls.length} feed(s)…`);
+    const results: FeedTestResult[] = [];
+    for (const url of urls) {
+      try {
+        // No retries here, unlike a real update: this is a diagnostic, and a
+        // user waiting on a button wants the answer now. Backing off three
+        // times over a dead URL would sit silent for the better part of a
+        // minute across a few feeds.
+        const works = await fetchFeed(this.transport(), url, { maxRetries: 0 });
+        const newest = newestItem(works);
+        results.push({
+          url,
+          count: works.length,
+          newestTitle: newest?.title,
+          newestDate: newest?.date,
+        });
+      } catch (error) {
+        results.push({ url, count: 0, error: String(error) });
+      }
+    }
+    new FeedTestModal(this.app, results).open();
+  }
+
   async previewTopic(): Promise<void> {
     const topic = this.settings.openAlexTopic.trim();
     if (!topic) {
@@ -584,6 +623,53 @@ export default class LiteratureInboxPlugin extends Plugin {
     } catch (error) {
       notify(`Preview failed: ${String(error)}`);
     }
+  }
+}
+
+interface FeedTestResult {
+  url: string;
+  count: number;
+  newestTitle?: string;
+  newestDate?: string;
+  error?: string;
+}
+
+/** What a feed actually returned, per URL — a count alone doesn't tell you
+ * whether you subscribed to the right thing. */
+class FeedTestModal extends Modal {
+  constructor(app: App, private readonly results: FeedTestResult[]) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    this.titleEl.setText("Feed test");
+    for (const result of this.results) {
+      const block = this.contentEl.createDiv();
+      block.createEl("p", { text: result.url });
+      if (result.error) {
+        block.createEl("p", {
+          cls: "setting-item-description",
+          text: `Could not be read — ${result.error}`,
+        });
+        continue;
+      }
+      if (result.count === 0) {
+        block.createEl("p", {
+          cls: "setting-item-description",
+          text: "Reachable, but no items — probably not a feed URL, or an empty feed.",
+        });
+        continue;
+      }
+      const dated = result.newestDate ? ` (${result.newestDate})` : "";
+      block.createEl("p", {
+        cls: "setting-item-description",
+        text: `${result.count} item(s). Most recent: ${result.newestTitle ?? "untitled"}${dated}`,
+      });
+    }
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
   }
 }
 
