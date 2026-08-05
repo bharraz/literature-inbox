@@ -92,12 +92,19 @@ export async function getWithRetry(
   throw lastError ?? new FetchError(`request failed: ${url}`);
 }
 
-/** Enforces a minimum gap between successive requests. */
+/**
+ * Enforces a minimum gap between successive requests.
+ *
+ * The 150ms default sits just under OpenAlex's published 10/s ceiling rather
+ * than exactly on it: at 100ms any clock jitter puts a burst over the line and
+ * earns a 429, and the margin costs nothing on runs measured in tens of
+ * requests.
+ */
 export class RateLimiter {
   private lastRequestAt = 0;
 
   constructor(
-    private readonly minIntervalMs = 100,
+    private readonly minIntervalMs = 150,
     private readonly sleep: (ms: number) => Promise<void> = defaultSleep,
     private readonly now: () => number = () => Date.now(),
   ) {}
