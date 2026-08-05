@@ -2,6 +2,20 @@ import { PluginSettingTab, Setting, type App } from "obsidian";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
 import type LiteratureInboxPlugin from "./main";
 
+/**
+ * Ways to build the starting graph. Ordered as the dropdown shows them:
+ * cheapest input first, most personal last.
+ */
+export type KernelMode = "topic" | "seeds" | "snowball" | "author" | "library";
+
+export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
+  topic: "Top-cited papers on a topic",
+  seeds: "A list of papers I paste",
+  snowball: "Papers I paste, plus what they cite and what cites them",
+  author: "Everything by one author",
+  library: "Expand outward from papers I already have",
+};
+
 export interface LiteratureInboxSettings {
   /** Where arrivals land. Keeping them in one folder is what makes "moving a
    * note out" a usable keep signal. */
@@ -19,6 +33,17 @@ export interface LiteratureInboxSettings {
 
   /** How many top-cited papers the kernel run seeds the papers folder with. */
   kernelSize: number;
+
+  /**
+   * How the starting graph gets built. `topic` needs no input and gives you
+   * the field's canon; the others start from papers or people the user names
+   * and give them their own neighbourhood instead.
+   */
+  kernelMode: KernelMode;
+  /** Pasted DOIs / arXiv ids, for the `seeds` and `snowball` modes. */
+  kernelSeeds: string;
+  /** OpenAlex author id, ORCID, or name, for the `author` mode. */
+  kernelAuthor: string;
 
   /**
    * What "new" means, in days back from today. The user's definition, not
@@ -52,6 +77,9 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   rssEnabled: false,
   rssFeeds: "",
   kernelSize: 100,
+  kernelMode: "topic",
+  kernelSeeds: "",
+  kernelAuthor: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 25,
   keepWindowDays: 30,
@@ -75,6 +103,10 @@ function parseCount(value: string, fallback: number, min = 1): number {
 }
 
 export class LiteratureInboxSettingTab extends PluginSettingTab {
+  /** Scratch state for the bulk-add box: deliberately not persisted. */
+  private manualAdd = "";
+  private manualAddTarget: "inbox" | "papers" = "papers";
+
   constructor(app: App, private readonly plugin: LiteratureInboxPlugin) {
     super(app, plugin);
   }
@@ -87,6 +119,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     this.renderFolders(containerEl);
     this.renderSources(containerEl);
     this.renderArrivals(containerEl);
+    this.renderAddByHand(containerEl);
     this.renderCleanup(containerEl);
     this.renderIntegrations(containerEl);
   }
@@ -130,30 +163,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           .onClick(() => void this.plugin.previewTopic()),
       );
 
-    new Setting(containerEl)
-      .setName("2. Build your starting graph")
-      .setDesc(
-        `Fetches the ${this.plugin.settings.kernelSize} most-cited papers on that topic ` +
-          `into ${this.plugin.settings.papersFolder}/, wired to each other by citations. ` +
-          "New arrivals connect to this core — without it every arrival looks equally " +
-          "unfamiliar. Safe to run again later; it skips anything you already have.",
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Build starting graph")
-          .setCta()
-          .onClick(() => void this.plugin.buildKernel()),
-      );
-
-    new Setting(containerEl)
-      .setName("Starting graph size")
-      .setDesc("More papers means a denser core, but a longer first run.")
-      .addText((text) =>
-        text.setValue(String(this.plugin.settings.kernelSize)).onChange(async (value) => {
-          this.plugin.settings.kernelSize = parseCount(value, DEFAULT_SETTINGS.kernelSize);
-          await this.plugin.saveSettings();
-        }),
-      );
+    this.renderStartingGraph(containerEl);
 
     new Setting(containerEl)
       .setName("3. Fetch new papers")
@@ -164,6 +174,118 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       )
       .addButton((button) =>
         button.setButtonText("Update inbox now").onClick(() => void this.plugin.updateInbox()),
+      );
+  }
+
+  /**
+   * The starting graph, in five flavours.
+   *
+   * Only the input the chosen mode actually needs is shown — five modes with
+   * every field visible at once is exactly the settings-page clutter this is
+   * meant to avoid. Changing the mode re-renders the tab, which is cheap and
+   * keeps the page honest about what it will use.
+   */
+  private renderStartingGraph(containerEl: HTMLElement): void {
+    const mode = this.plugin.settings.kernelMode;
+
+    new Setting(containerEl)
+      .setName("2. Build your starting graph")
+      .setDesc(
+        `Writes papers into ${this.plugin.settings.papersFolder}/, wired to each other by ` +
+          "citations. New arrivals connect to this core — without it every arrival looks " +
+          "equally unfamiliar. Safe to run again later; it skips anything you already have.",
+      )
+      .addDropdown((dropdown) => {
+        for (const [value, label] of Object.entries(KERNEL_MODE_LABELS)) {
+          dropdown.addOption(value, label);
+        }
+        dropdown.setValue(mode).onChange(async (value) => {
+          this.plugin.settings.kernelMode = value as KernelMode;
+          await this.plugin.saveSettings();
+          this.display(); // show the input this mode needs, hide the rest
+        });
+      })
+      .addButton((button) =>
+        button
+          .setButtonText("Build starting graph")
+          .setCta()
+          .onClick(() => void this.plugin.buildKernel()),
+      );
+
+    if (mode === "topic") {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          `Uses the topic above. You get the field's canon — the papers everything else ` +
+          "cites — which needs no input but is not specific to you. If your graph looks " +
+          "like a stranger's, try one of the other modes.",
+      });
+    }
+
+    if (mode === "seeds" || mode === "snowball") {
+      new Setting(containerEl)
+        .setName("Papers to start from")
+        .setDesc(
+          "DOIs or arXiv ids, one per line — paste a bibliography, your own reference " +
+            "list, or a handful of papers that define what you work on. Full URLs are " +
+            "fine. Anything unrecognised is reported, never silently skipped." +
+            (mode === "snowball"
+              ? " Each one is expanded with what it cites and what cites it, so a few " +
+                "papers become a neighbourhood."
+              : ""),
+        )
+        .addTextArea((text) =>
+          text
+            .setPlaceholder("10.1103/PhysRevA.101.032330\n2401.12345")
+            .setValue(this.plugin.settings.kernelSeeds)
+            .onChange(async (value) => {
+              this.plugin.settings.kernelSeeds = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
+
+    if (mode === "author") {
+      new Setting(containerEl)
+        .setName("Author")
+        .setDesc(
+          "An OpenAlex author id (A5023888391) or an ORCID is exact. A plain name is a " +
+            "search, so it can merge two people who share one — check the result.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("0000-0002-1825-0097")
+            .setValue(this.plugin.settings.kernelAuthor)
+            .onChange(async (value) => {
+              this.plugin.settings.kernelAuthor = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
+
+    if (mode === "library") {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          `Takes the papers already in ${this.plugin.settings.papersFolder}/ — whether you ` +
+          "kept them here or zot2vault wrote them — and pulls in what they cite and what " +
+          "cites them. The most personal starting graph available, and it needs no typing. " +
+          "Does nothing if that folder is empty.",
+      });
+    }
+
+    new Setting(containerEl)
+      .setName("Starting graph size")
+      .setDesc(
+        mode === "seeds"
+          ? "Ignored in this mode: you get exactly the papers you pasted."
+          : "More papers means a denser core, but a longer first run.",
+      )
+      .addText((text) =>
+        text.setValue(String(this.plugin.settings.kernelSize)).onChange(async (value) => {
+          this.plugin.settings.kernelSize = parseCount(value, DEFAULT_SETTINGS.kernelSize);
+          await this.plugin.saveSettings();
+        }),
       );
   }
 
@@ -320,6 +442,54 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           );
           await this.plugin.saveSettings();
         }),
+      );
+  }
+
+  /**
+   * Adding papers by hand, in bulk.
+   *
+   * The same control the command palette offers, except it takes a list and
+   * lets you say where the papers land. Not persisted between sessions: this
+   * is a scratch input, and saving it would mean the plugin quietly kept a
+   * list you pasted once.
+   */
+  private renderAddByHand(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Add papers by hand").setHeading();
+
+    new Setting(containerEl)
+      .setName("DOIs or arXiv ids")
+      .setDesc(
+        "One per line. Full URLs are fine. Papers added this way are never touched by " +
+          "cleanup — you asked for them on purpose.",
+      )
+      .addTextArea((text) =>
+        text
+          .setPlaceholder("10.1103/PhysRevA.101.032330\nhttps://arxiv.org/abs/2401.12345")
+          .setValue(this.manualAdd)
+          .onChange((value) => {
+            this.manualAdd = value;
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Add them to")
+      .setDesc(
+        `${this.plugin.settings.papersFolder}/ for papers you already know you want — ` +
+          `${this.plugin.settings.inboxFolder}/ if you still want to triage them.`,
+      )
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("papers", `${this.plugin.settings.papersFolder}/ (keep straight away)`)
+          .addOption("inbox", `${this.plugin.settings.inboxFolder}/ (triage first)`)
+          .setValue(this.manualAddTarget)
+          .onChange((value) => {
+            this.manualAddTarget = value === "inbox" ? "inbox" : "papers";
+          });
+      })
+      .addButton((button) =>
+        button
+          .setButtonText("Add")
+          .onClick(() => void this.plugin.addByIds(this.manualAdd, this.manualAddTarget)),
       );
   }
 

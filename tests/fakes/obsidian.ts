@@ -366,6 +366,32 @@ export class ToggleComponent extends BaseComponent {
   }
 }
 
+export class DropdownComponent extends BaseComponent {
+  value = "";
+  /** Option value -> label, in the order they were added. */
+  readonly options = new Map<string, string>();
+  addOption(value: string, label: string): this {
+    this.options.set(value, label);
+    return this;
+  }
+  setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
+  getValue(): string {
+    return this.value;
+  }
+  onChange(cb: (value: string) => unknown): this {
+    this.onChangeCallback = cb as (value: string | boolean) => unknown;
+    return this;
+  }
+  /** Test helper: simulate the user picking an option. */
+  async simulateSelect(value: string): Promise<void> {
+    this.value = value;
+    await this.onChangeCallback?.(value);
+  }
+}
+
 export class ButtonComponent extends BaseComponent {
   text = "";
   tooltip = "";
@@ -407,6 +433,7 @@ export class Setting {
   readonly texts: TextComponent[] = [];
   readonly toggles: ToggleComponent[] = [];
   readonly buttons: ButtonComponent[] = [];
+  readonly dropdowns: DropdownComponent[] = [];
   readonly settingEl: HTMLElement;
 
   constructor(containerEl: HTMLElement) {
@@ -448,12 +475,10 @@ export class Setting {
     cb(component);
     return this;
   }
-  addDropdown(cb: (component: unknown) => unknown): this {
-    cb({
-      addOption: () => undefined,
-      setValue: () => undefined,
-      onChange: () => undefined,
-    });
+  addDropdown(cb: (component: DropdownComponent) => unknown): this {
+    const component = new DropdownComponent();
+    this.dropdowns.push(component);
+    cb(component);
     return this;
   }
 }

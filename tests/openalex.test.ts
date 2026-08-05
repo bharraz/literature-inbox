@@ -148,6 +148,69 @@ describe("worksSince recency basis", () => {
   });
 });
 
+describe("queries the starting-graph modes depend on", () => {
+  const page = (results: unknown[]) =>
+    JSON.stringify({ results, meta: { next_cursor: null } });
+  const record = (id: string) => ({
+    id: `https://openalex.org/${id}`,
+    title: id,
+    type: "article",
+    publication_date: "2026-01-01",
+  });
+
+  it("looks DOIs up in one batched request", async () => {
+    const { client, transport } = clientWith([page([record("W1"), record("W2")])]);
+    await client.worksByDois(["10.1234/one", "https://doi.org/10.1234/TWO"]);
+
+    expect(transport.requested).toHaveLength(1);
+    // Normalised on the way in, so the caller can paste URLs and mixed case.
+    expect(queryOf(transport.requested[0] as string).filter).toBe(
+      "doi:10.1234/one|10.1234/two",
+    );
+  });
+
+  it("sorts citers by influence, not by date", async () => {
+    // A snowball wants what built on your seeds and mattered, not merely the
+    // most recent thing to reference one.
+    const { client, transport } = clientWith([page([record("W9")])]);
+    await client.worksCiting(["W1", "W2"], 5);
+
+    const query = queryOf(transport.requested[0] as string);
+    expect(query.filter).toContain("cites:W1|W2");
+    expect(query.sort).toBe("cited_by_count:desc");
+  });
+
+  it("asks for nothing when there is nothing to cite", async () => {
+    const { client, transport } = clientWith([]);
+    expect(await client.worksCiting([], 5)).toEqual([]);
+    expect(transport.requested).toHaveLength(0);
+  });
+
+  it("treats a bare author id as exact, not as a name search", async () => {
+    const { client, transport } = clientWith([page([record("W1")])]);
+    await client.worksByAuthor("A5023888391", 5);
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "authorships.author.id:A5023888391",
+    );
+  });
+
+  it("recognises an ORCID", async () => {
+    const { client, transport } = clientWith([page([record("W1")])]);
+    await client.worksByAuthor("0000-0002-1825-0097", 5);
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "authorships.author.orcid:https://orcid.org/0000-0002-1825-0097",
+    );
+  });
+
+  it("falls back to a name search", async () => {
+    const { client, transport } = clientWith([page([record("W1")])]);
+    await client.worksByAuthor("Ada Lovelace", 5);
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "raw_author_name.search:Ada Lovelace",
+    );
+  });
+});
+
 describe("junk filtering against real bad data", () => {
   it("drops entries with implausible future publication dates", async () => {
     // This fixture holds five REAL OpenAlex records dated 2027-2050, plus one

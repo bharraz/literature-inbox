@@ -32,6 +32,8 @@ import { appendCitations } from "./core/notes";
 import { contentHash } from "./core/hash";
 import { runExecutable, type Spawner } from "./core/launcher";
 import { runKernel } from "./core/kernel";
+import { parseSeedList, seedsFromOriginIds } from "./core/seeds";
+import { snowball } from "./core/snowball";
 import type { Work } from "./core/types";
 import {
   ObsidianTransport,
@@ -55,6 +57,13 @@ interface PersistedData {
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
+
+/**
+ * How many existing papers are used as seeds when expanding from the vault's
+ * own library. A large library would otherwise issue an enormous expansion,
+ * and once the core is dense the marginal seed adds almost nothing.
+ */
+const LIBRARY_SEED_LIMIT = 50;
 
 export default class LiteratureInboxPlugin extends Plugin {
   override settings: LiteratureInboxSettings = { ...DEFAULT_SETTINGS };
@@ -373,24 +382,161 @@ export default class LiteratureInboxPlugin extends Plugin {
    * core for arrivals to attach to, every new paper looks equally unfamiliar
    * and the whole triage-by-looking premise is invisible.
    */
+  /**
+   * Resolve a pasted list of identifiers into works.
+   *
+   * DOIs go in one batched request; arXiv ids go one at a time, because the
+   * arXiv API has no batch form and asks for a 3s gap. Anything that didn't
+   * resolve comes back so the caller can say which — a paper silently absent
+   * from your starting graph is worse than a slightly noisier notice.
+   */
+  private async resolveSeeds(raw: string): Promise<{
+    works: Work[];
+    missing: string[];
+    unrecognised: string[];
+  }> {
+    const list = parseSeedList(raw);
+    const works: Work[] = [];
+    const missing: string[] = [];
+
+    if (list.dois.length > 0) {
+      const found = await this.openAlex().worksByDois(list.dois);
+      works.push(...found);
+      const resolved = new Set(
+        found.map((work) => work.doi).filter((doi): doi is string => Boolean(doi)),
+      );
+      for (const doi of list.dois) if (!resolved.has(doi)) missing.push(doi);
+    }
+
+    if (list.arxivIds.length > 0) {
+      const client = new ArxivClient(this.transport());
+      for (const id of list.arxivIds) {
+        const work = await client.workById(id);
+        if (work) works.push(work);
+        else missing.push(id);
+      }
+    }
+
+    return { works, missing, unrecognised: list.unrecognised };
+  }
+
+  /** The papers already in the vault, as seeds to expand from. */
+  private async librarySeeds(limit: number): Promise<Work[]> {
+    const vault = await this.vaultIndex();
+    const { openAlexIds, dois } = seedsFromOriginIds(
+      [...vault.entriesForIndex()].map((entry) => entry.originIds),
+      limit,
+    );
+    if (openAlexIds.length === 0 && dois.length === 0) return [];
+
+    const client = this.openAlex();
+    const works: Work[] = [];
+    // Re-fetched rather than read off disk: the notes carry identity but not
+    // reference lists, and references are the entire point of a snowball.
+    if (openAlexIds.length > 0) works.push(...(await client.worksByIds(openAlexIds)));
+    if (dois.length > 0) works.push(...(await client.worksByDois(dois)));
+    return works;
+  }
+
+  /**
+   * Fetch the works for whichever starting-graph mode is selected.
+   *
+   * Returns undefined when the mode's input is missing — the caller has
+   * already told the user what to fill in, and there is nothing to write.
+   */
+  private async gatherKernelWorks(): Promise<Work[] | undefined> {
+    const size = this.settings.kernelSize;
+    const mode = this.settings.kernelMode;
+
+    if (mode === "topic") {
+      const topic = this.settings.openAlexTopic.trim();
+      if (!topic) {
+        notify("Set a topic in Literature Inbox settings first.");
+        return undefined;
+      }
+      notify(`Fetching the ${size} most-cited papers on "${topic}"… this can take a minute.`);
+      return this.openAlex().topWorks(topic, size);
+    }
+
+    if (mode === "author") {
+      const author = this.settings.kernelAuthor.trim();
+      if (!author) {
+        notify("Enter an author id, ORCID, or name first.");
+        return undefined;
+      }
+      notify(`Fetching up to ${size} papers by ${author}…`);
+      return this.openAlex().worksByAuthor(author, size);
+    }
+
+    if (mode === "seeds" || mode === "snowball") {
+      if (!this.settings.kernelSeeds.trim()) {
+        notify("Paste some DOIs or arXiv ids first.");
+        return undefined;
+      }
+      notify("Looking up the papers you listed…");
+      const { works, missing, unrecognised } = await this.resolveSeeds(this.settings.kernelSeeds);
+      this.reportSeedProblems(missing, unrecognised);
+      if (works.length === 0) {
+        notify("None of those identifiers resolved to a paper.");
+        return undefined;
+      }
+      if (mode === "seeds") return works;
+      return this.expand(works, size);
+    }
+
+    // library
+    notify("Reading the papers you already have…");
+    const seeds = await this.librarySeeds(LIBRARY_SEED_LIMIT);
+    if (seeds.length === 0) {
+      notify(
+        `No papers with a usable identifier in ${this.settings.papersFolder}/ — ` +
+          "build a graph another way first.",
+      );
+      return undefined;
+    }
+    return this.expand(seeds, size);
+  }
+
+  /** Seeds plus their references and citers. */
+  private async expand(seeds: Work[], size: number): Promise<Work[]> {
+    notify(`Expanding ${seeds.length} paper(s) outward… this can take a minute.`);
+    const client = this.openAlex();
+    const report = await snowball({
+      seeds,
+      resolver: {
+        worksByIds: (ids) => client.worksByIds(ids),
+        worksCiting: (ids, limit) => client.worksCiting(ids, limit),
+      },
+      limit: size,
+    });
+    for (const error of report.errors) notify(`Part of the expansion failed — ${error}`);
+    notify(
+      `Found ${report.referenceCount} cited paper(s) and ${report.citerCount} citing paper(s).`,
+    );
+    return report.works;
+  }
+
+  private reportSeedProblems(missing: string[], unrecognised: string[]): void {
+    if (unrecognised.length > 0) {
+      notify(`Not an identifier, skipped: ${unrecognised.slice(0, 5).join(", ")}`);
+    }
+    if (missing.length > 0) {
+      notify(`Not found in OpenAlex or arXiv: ${missing.slice(0, 5).join(", ")}`);
+    }
+  }
+
   async buildKernel(): Promise<void> {
     if (this.running) {
       notify("Literature Inbox is already running.");
       return;
     }
-    const topic = this.settings.openAlexTopic.trim();
-    if (!topic) {
-      notify("Set a topic in Literature Inbox settings first.");
-      return;
-    }
 
     this.running = true;
-    const size = this.settings.kernelSize;
-    notify(`Fetching the ${size} most-cited papers on "${topic}"… this can take a minute.`);
     try {
-      const works = await this.openAlex().topWorks(topic, size);
+      const works = await this.gatherKernelWorks();
+      if (works === undefined) return;
       if (works.length === 0) {
-        notify(`No papers found for "${topic}". Try a broader query.`);
+        notify("No papers found. Try a broader query, or a different starting point.");
         return;
       }
 
@@ -480,27 +626,65 @@ export default class LiteratureInboxPlugin extends Plugin {
     notify(`Kept — moved to ${this.settings.papersFolder}/.`);
   }
 
-  async addById(rawValue: string): Promise<void> {
-    const value = rawValue.trim();
-    if (!value) return;
+  /**
+   * Add one or many papers by identifier.
+   *
+   * Identifier classification goes through `parseSeedList` rather than a
+   * `startsWith("10.")` check, which used to send a pasted
+   * `https://doi.org/10.…` URL — the thing you actually copy from a browser —
+   * to the arXiv client, where it always failed.
+   *
+   * `target` matters: papers added to build up a library belong in the papers
+   * folder, not the inbox. Sending them to the inbox would mean triaging
+   * papers you already decided you wanted.
+   */
+  async addByIds(raw: string, target: "inbox" | "papers" = "inbox"): Promise<void> {
+    if (!raw.trim()) {
+      notify("Enter a DOI or arXiv id first.");
+      return;
+    }
+    if (this.running) {
+      notify("Literature Inbox is already running.");
+      return;
+    }
+
+    this.running = true;
     try {
-      const isArxiv = !value.toLowerCase().startsWith("10.");
-      const work = isArxiv
-        ? await new ArxivClient(this.transport()).workById(value)
-        : await this.openAlex().workByDoi(value);
-      if (!work) {
-        notify(`Nothing found for ${value}.`);
+      const { works, missing, unrecognised } = await this.resolveSeeds(raw);
+      this.reportSeedProblems(missing, unrecognised);
+      if (works.length === 0) {
+        if (missing.length === 0 && unrecognised.length === 0) notify("Nothing found.");
         return;
       }
+
+      if (target === "papers") {
+        const report = await runKernel({
+          works,
+          vault: await this.vaultIndex(),
+          papersFolder: this.settings.papersFolder,
+          adapter: this.adapter(),
+          today: todayIso(),
+        });
+        this.keptCount += report.written.length;
+        notify(
+          `Added ${report.written.length} paper(s) to ${this.settings.papersFolder}/` +
+            (report.skipped ? `, ${report.skipped} you already had.` : "."),
+        );
+        return;
+      }
+
       const { report, inbox } = await runUpdate({
-        fetched: [work],
+        fetched: works,
         vault: await this.vaultIndex(),
         inbox: this.inbox,
         settings: this.updateSettings(),
         adapter: this.adapter(),
         today: todayIso(),
       });
-      if (report.skipped.length > 0) {
+
+      // For a single add, "you already have this" is the useful answer and
+      // opening the note is the useful action. For a list it would be noise.
+      if (works.length === 1 && report.skipped.length > 0) {
         const existing = report.skipped[0]?.existingPath;
         notify(`Already in your vault: ${existing ?? "an existing note"}.`);
         if (existing) {
@@ -509,6 +693,7 @@ export default class LiteratureInboxPlugin extends Plugin {
         }
         return;
       }
+
       // A manual add is deliberate, so it is exempt from automatic cleanup.
       this.inbox = inbox.map((record) =>
         report.arrived.some((arrival) => arrival.notePath === record.notePath)
@@ -516,10 +701,18 @@ export default class LiteratureInboxPlugin extends Plugin {
           : record,
       );
       await this.persist();
-      notify(`Added ${work.title ?? value}.`);
+      const skipped = report.skipped.length ? `, ${report.skipped.length} already known` : "";
+      notify(`Added ${report.arrived.length} paper(s) to ${this.settings.inboxFolder}/${skipped}.`);
     } catch (error) {
-      notify(`Could not add ${value}: ${String(error)}`);
+      notify(`Could not add: ${String(error)}`);
+    } finally {
+      this.running = false;
     }
+  }
+
+  /** The single-paper command form. */
+  async addById(rawValue: string): Promise<void> {
+    await this.addByIds(rawValue, "inbox");
   }
 
   async copyIdentifier(file: TFile): Promise<void> {

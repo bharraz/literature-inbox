@@ -150,7 +150,8 @@ export class OpenAlexClient {
     private readonly transport: Transport,
     private readonly options: OpenAlexOptions = {},
   ) {
-    this.limiter = new RateLimiter(options.minIntervalMs ?? 100, options.sleep);
+    // Just under OpenAlex's 10/s ceiling — see RateLimiter.
+    this.limiter = new RateLimiter(options.minIntervalMs ?? 150, options.sleep);
   }
 
   /** A free-text query, or an OpenAlex concept id like `C41008148`. */
@@ -262,6 +263,77 @@ export class OpenAlexClient {
     const data = await this.getJson(url);
     const first = (data.results ?? [])[0];
     return first ? workFromOpenAlex(first) : undefined;
+  }
+
+  /**
+   * Batched lookup by DOI, 50 per request.
+   *
+   * Same best-effort contract as `worksByIds`: OpenAlex simply won't have some
+   * DOIs, so the result is a subset and never a positional match to the input.
+   * Callers that need to report "these ones weren't found" must compare by id.
+   */
+  async worksByDois(dois: string[]): Promise<Work[]> {
+    const normalized = dois
+      .map((doi) => normalizeDoi(doi))
+      .filter((doi): doi is string => Boolean(doi));
+    const results: Work[] = [];
+    for (const chunk of chunked(normalized, 50)) {
+      const url = this.buildUrl(OPENALEX_BASE_URL, {
+        filter: `doi:${chunk.join("|")}`,
+        "per-page": String(chunk.length),
+      });
+      const data = await this.getJson(url);
+      for (const item of data.results ?? []) results.push(workFromOpenAlex(item));
+    }
+    return results;
+  }
+
+  /**
+   * Works that cite any of *ids* — the outward half of a snowball.
+   *
+   * Sorted by citation count rather than date on purpose: the point is to find
+   * the papers that built on your seeds and mattered, not merely the most
+   * recent thing to reference one.
+   */
+  async worksCiting(ids: string[], limit: number): Promise<Work[]> {
+    if (ids.length === 0 || limit <= 0) return [];
+    const results: Work[] = [];
+    const seen = new Set<string>();
+    // OpenAlex caps a filter's OR list, so ask in batches and merge. Each
+    // batch gets the full limit; duplicates across batches are expected,
+    // since one paper often cites several seeds.
+    for (const chunk of chunked(ids, 25)) {
+      if (results.length >= limit) break;
+      const filter = `cites:${chunk.join("|")},${this.typeFilter()}`;
+      for (const work of await this.paginated(filter, "cited_by_count:desc", limit)) {
+        if (seen.has(work.key)) continue;
+        seen.add(work.key);
+        results.push(work);
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Works by one author.
+   *
+   * Accepts an OpenAlex author id (`A5023888391`), an ORCID, or a plain name.
+   * A name is a search, so it can conflate two people who share one — the id
+   * and ORCID forms are exact, and the settings copy says so.
+   */
+  async worksByAuthor(author: string, n: number): Promise<Work[]> {
+    const trimmed = author.trim();
+    let authorFilter: string;
+    if (/^A\d+$/.test(trimmed)) {
+      authorFilter = `authorships.author.id:${trimmed}`;
+    } else if (/^(https?:\/\/orcid\.org\/)?\d{4}-\d{4}-\d{4}-\d{3}[\dX]$/i.test(trimmed)) {
+      const orcid = trimmed.replace(/^https?:\/\/orcid\.org\//i, "");
+      authorFilter = `authorships.author.orcid:https://orcid.org/${orcid}`;
+    } else {
+      authorFilter = `raw_author_name.search:${trimmed}`;
+    }
+    return this.paginated(`${authorFilter},${this.typeFilter()}`, "cited_by_count:desc", n);
   }
 
   /**

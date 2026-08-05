@@ -575,6 +575,193 @@ describe("building the starting graph", () => {
   });
 });
 
+describe("starting-graph modes", () => {
+  it("builds from a pasted list, writing exactly those papers to the kept folder", async () => {
+    respondWith(
+      openAlexPage([
+        openAlexWork("W1", "A Paper I Chose", [], "10.1234/one"),
+        openAlexWork("W2", "Another Paper I Chose", ["W1"], "10.1234/two"),
+      ]),
+    );
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "seeds";
+      p.settings.kernelSeeds = "10.1234/one\nhttps://doi.org/10.1234/two";
+    });
+
+    await plugin.buildKernel();
+
+    expect(app.vault.files.has("Papers/A Paper I Chose.md")).toBe(true);
+    expect(app.vault.files.has("Papers/Another Paper I Chose.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/A Paper I Chose.md")).toBe(false);
+    // One batched lookup, not one request per DOI.
+    expect(requestedUrls).toHaveLength(1);
+  });
+
+  it("says which pasted identifiers it could not use", async () => {
+    respondWith(openAlexPage([openAlexWork("W1", "A Real Paper", [], "10.1234/one")]));
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "seeds";
+      p.settings.kernelSeeds = "10.1234/one\n10.1234/missing\nbanana";
+    });
+
+    await plugin.buildKernel();
+
+    expect(notices.some((n) => n.includes("banana"))).toBe(true);
+    expect(notices.some((n) => n.includes("10.1234/missing"))).toBe(true);
+  });
+
+  it("refuses each mode without its input, rather than fetching nothing", async () => {
+    for (const [mode, field] of [
+      ["seeds", "DOIs"],
+      ["author", "author"],
+    ] as const) {
+      clearNotices();
+      const { app, plugin } = await bootPlugin((p) => {
+        p.settings.kernelMode = mode;
+      });
+      await plugin.buildKernel();
+      expect(notices.join(" ").toLowerCase()).toContain(field.toLowerCase());
+      expect(app.vault.files.size).toBe(0);
+    }
+  });
+
+  it("snowballs a seed into its references and citers", async () => {
+    // Seed cites W10; W20 cites the seed. Both directions must land.
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W1", "My Seed Paper", ["W10"], "10.1234/seed")]),
+        };
+      }
+      if (call === 2) {
+        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Paper It Cites")]) };
+      }
+      return { status: 200, text: openAlexPage([openAlexWork("W20", "A Paper Citing It", ["W1"])]) };
+    });
+
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "snowball";
+      p.settings.kernelSeeds = "10.1234/seed";
+      p.settings.kernelSize = 10;
+    });
+
+    await plugin.buildKernel();
+
+    expect(app.vault.files.has("Papers/My Seed Paper.md")).toBe(true);
+    expect(app.vault.files.has("Papers/A Paper It Cites.md")).toBe(true);
+    expect(app.vault.files.has("Papers/A Paper Citing It.md")).toBe(true);
+  });
+
+  it("builds from one author", async () => {
+    respondWith(openAlexPage([openAlexWork("W1", "Something She Wrote", [], "10.1234/one")]));
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "author";
+      p.settings.kernelAuthor = "A5023888391";
+    });
+
+    await plugin.buildKernel();
+
+    expect(app.vault.files.has("Papers/Something She Wrote.md")).toBe(true);
+    expect(requestedUrls[0]).toContain("authorships.author.id");
+  });
+
+  it("expands outward from papers already in the vault", async () => {
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "library";
+      p.settings.kernelSize = 10;
+    });
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/An Existing Paper.md",
+      keptNoteContent("An Existing Paper", "openalex:W1"),
+    );
+
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      // 1: resolve the library seed; 2: its references; 3: its citers.
+      if (call === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W1", "An Existing Paper", ["W10"])]),
+        };
+      }
+      if (call === 2) {
+        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Foundational Paper")]) };
+      }
+      return { status: 200, text: openAlexPage([openAlexWork("W20", "A Recent Follow-Up", ["W1"])]) };
+    });
+
+    await plugin.buildKernel();
+
+    expect(app.vault.files.has("Papers/A Foundational Paper.md")).toBe(true);
+    expect(app.vault.files.has("Papers/A Recent Follow-Up.md")).toBe(true);
+    // The paper it started from is not duplicated.
+    expect(app.vault.files.has("Papers/An Existing Paper 2.md")).toBe(false);
+  });
+
+  it("says so when the library is empty rather than building nothing quietly", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "library";
+    });
+
+    await plugin.buildKernel();
+
+    expect(notices.some((n) => n.includes("No papers with a usable identifier"))).toBe(true);
+  });
+});
+
+describe("adding papers by hand", () => {
+  it("accepts the DOI URL you copy from a browser", async () => {
+    // Regression: the old routing sent anything not starting with "10." to the
+    // arXiv client, so a doi.org URL could only ever fail.
+    respondWith(openAlexPage([openAlexWork("W1", "A Paper By URL", [], "10.1234/one")]));
+    const { app, plugin } = await bootPlugin();
+
+    await plugin.addByIds("https://doi.org/10.1234/one", "papers");
+
+    expect(app.vault.files.has("Papers/A Paper By URL.md")).toBe(true);
+    expect(requestedUrls[0]).toContain("doi%3A10.1234%2Fone");
+  });
+
+  it("adds a list straight to the kept folder", async () => {
+    respondWith(
+      openAlexPage([
+        openAlexWork("W1", "First Paper", [], "10.1234/one"),
+        openAlexWork("W2", "Second Paper", [], "10.1234/two"),
+      ]),
+    );
+    const { app, plugin } = await bootPlugin();
+
+    await plugin.addByIds("10.1234/one\n10.1234/two", "papers");
+
+    expect(app.vault.files.has("Papers/First Paper.md")).toBe(true);
+    expect(app.vault.files.has("Papers/Second Paper.md")).toBe(true);
+    expect(plugin.status().inboxCount).toBe(0);
+  });
+
+  it("adds to the inbox when asked, exempt from cleanup", async () => {
+    respondWith(openAlexPage([openAlexWork("W1", "A Triage Paper", [], "10.1234/one")]));
+    const { app, plugin } = await bootPlugin();
+
+    await plugin.addByIds("10.1234/one", "inbox");
+
+    expect(app.vault.files.has("Inbox/A Triage Paper.md")).toBe(true);
+    const records = (plugin as never as { inbox: { manual?: boolean }[] }).inbox;
+    expect(records[0]?.manual).toBe(true);
+  });
+
+  it("refuses an empty box instead of making a request", async () => {
+    const { plugin } = await bootPlugin();
+    await plugin.addByIds("   ", "papers");
+    expect(requestedUrls).toHaveLength(0);
+    expect(notices.some((n) => n.includes("DOI"))).toBe(true);
+  });
+});
+
 describe("what counts as new", () => {
   it("asks OpenAlex for the window the user configured", async () => {
     respondWith(DEFAULT_RESPONSE);
