@@ -1,0 +1,41 @@
+{
+  "note_manifest": {
+    "Authors/Ashish Vaswani.md": {
+      "content_hash": "219020e7a9b513d38cd999493f60ec187c23ef9b75789d200dedfc0b7f69b71a",
+      "generated_at": "2026-07-22T19:00:16Z",
+      "origin_ids": [
+        "author:ashish vaswani"
+      ],
+      "title": "Ashish Vaswani"
+    },
+    "Authors/Jane Smith.md": {
+      "content_hash": "b217990a10dd0b38fd92476cbda9c97b1357d6041f7ca42f9481f3c621e24b1b",
+      "generated_at": "2026-07-22T19:00:16Z",
+      "origin_ids": [
+        "author:jane smith"
+      ],
+      "title": "Jane Smith"
+    },
+    "Papers/Attention Is All You Need.md": {
+      "content_hash": "ca2296bd80268786e69fc2b3abc290c6dca7851d3250d20435aec5894fd0a75d",
+      "generated_at": "2026-07-22T19:00:16Z",
+      "origin_ids": [
+        "doi:10.5555/attention",
+        "zotero:ABC123",
+        "openalex:W2963403868"
+      ],
+      "title": "Attention Is All You Need"
+    },
+    "Papers/Some Textbook On Methods.md": {
+      "content_hash": "cbc8e06dfd98420c5e9f46b3d52bdebf7cf2d6bbd25ceb4a4efbdcb9ff797259",
+      "generated_at": "2026-07-22T19:00:16Z",
+      "origin_ids": [
+        "zotero:BOOK1"
+      ],
+      "title": "Some Textbook On Methods"
+    }
+  },
+  "params": {},
+  "pdf_cache": {},
+  "version": 1
+}

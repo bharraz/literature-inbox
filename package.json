@@ -1,0 +1,32 @@
+{
+  "name": "literature-inbox",
+  "version": "0.1.0",
+  "description": "New scholarly papers arrive as nodes in your Obsidian graph, already wired by citation edges to the papers you keep.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:live": "node scripts/live-api.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "research",
+    "openalex",
+    "arxiv",
+    "rss"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^25.0.0",
+    "obsidian": "latest",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

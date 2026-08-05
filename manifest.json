@@ -1,0 +1,9 @@
+{
+  "id": "literature-inbox",
+  "name": "Literature Inbox",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "New papers arrive as notes wired by citation edges to the papers you already keep, so you can triage by looking at your graph.",
+  "author": "Bahaa",
+  "isDesktopOnly": false
+}

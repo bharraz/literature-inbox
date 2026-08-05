@@ -1,0 +1,62 @@
+# Builds the plugin and attaches the three files Obsidian expects as release
+# assets. Pushing a version tag is the whole publish step:
+#
+#   git tag 0.1.0 && git push origin 0.1.0
+#
+# Tags are bare version numbers with no leading "v" — that is what the
+# community-plugin tooling and BRAT look for, and a "v" prefix is the usual
+# reason a submission bounces.
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Never ship a build whose tests don't pass. The suite is hermetic, so
+      # this needs no network; the live-API checks are deliberately excluded.
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the tag matches manifest.json
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+            echo "Tag $TAG does not match manifest.json version $MANIFEST_VERSION."
+            echo "Bump manifest.json (and versions.json) before tagging."
+            exit 1
+          fi
+
+      - name: Create the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # main.js and manifest.json must be attached as individual assets,
+          # not zipped: that is how Obsidian and BRAT fetch them.
+          FILES="main.js manifest.json"
+          [ -f styles.css ] && FILES="$FILES styles.css"
+          gh release create "$TAG" $FILES \
+            --title "$TAG" \
+            --generate-notes
