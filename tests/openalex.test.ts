@@ -122,6 +122,32 @@ describe("topWorks pagination", () => {
   });
 });
 
+describe("worksSince recency basis", () => {
+  it("filters on index date by default, not publication date", async () => {
+    // OpenAlex indexes papers weeks after their publication date. A window on
+    // publication date drops everything indexed late, permanently.
+    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    await client.worksSince("quantum", "2026-07-01");
+    const filter = queryOf(transport.requested[0] as string).filter ?? "";
+    expect(filter).toContain("from_created_date:2026-07-01");
+    expect(filter).not.toContain("from_publication_date");
+  });
+
+  it("still sorts newest-published first, so a capped run gets recent papers", async () => {
+    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    await client.worksSince("quantum", "2026-07-01");
+    expect(queryOf(transport.requested[0] as string).sort).toBe("publication_date:desc");
+  });
+
+  it("uses publication date when asked explicitly", async () => {
+    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    await client.worksSince("quantum", "2026-07-01", 500, "publication");
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "from_publication_date:2026-07-01",
+    );
+  });
+});
+
 describe("junk filtering against real bad data", () => {
   it("drops entries with implausible future publication dates", async () => {
     // This fixture holds five REAL OpenAlex records dated 2027-2050, plus one

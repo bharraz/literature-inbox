@@ -11,6 +11,7 @@
 
 import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
+import { DEFAULT_RECENCY_WINDOW_DAYS, isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
 import { backfillDois, fetchFeed } from "./core/rss";
 import { titlesMatch, normalizeTitle } from "./core/ids";
@@ -233,12 +234,17 @@ export default class LiteratureInboxPlugin extends Plugin {
 
     if (this.settings.openAlexEnabled && this.settings.openAlexTopic.trim()) {
       try {
-        const since = this.settings.lastUpdate;
-        const client = this.openAlex();
+        // A fixed window back from today, never `topWorks` and never "since you
+        // last ran". `topWorks` returns the most-cited papers on the topic —
+        // exactly what a kernel run just seeded — so using it here reported
+        // "0 new" on every first update, guaranteed. And anchoring on
+        // `lastUpdate` narrows the window to nothing on a second run the same
+        // day. The window overlaps previous runs on purpose: dedup is exact
+        // and cheap, so re-seeing a paper costs nothing and missing one is
+        // permanent.
+        const since = isoDaysAgo(DEFAULT_RECENCY_WINDOW_DAYS);
         works.push(
-          ...(since
-            ? await client.worksSince(this.settings.openAlexTopic, since, perSource)
-            : await client.topWorks(this.settings.openAlexTopic, perSource)),
+          ...(await this.openAlex().worksSince(this.settings.openAlexTopic, since, perSource)),
         );
       } catch (error) {
         report.sourceErrors.push({ source: "OpenAlex", message: String(error) });

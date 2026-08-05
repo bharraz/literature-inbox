@@ -17,7 +17,10 @@ import {
   Setting,
   TFile,
   allSettings,
+  clearNotices,
+  clearRequests,
   notices,
+  requestedUrls,
   resetFakeObsidian,
   setRequestResponder,
 } from "./fakes/obsidian";
@@ -528,6 +531,46 @@ describe("building the starting graph", () => {
     const arrival = app.vault.files.get("Inbox/A Newly Published Paper.md") as string;
     expect(arrival).toContain("Why you're seeing this");
     expect(arrival).toContain("[[The Foundational Paper]]");
+  });
+
+  it("does not re-ask for the top-cited papers on the first update", async () => {
+    // The bug this guards: with no `lastUpdate` recorded yet, the update ran
+    // `topWorks` — the *same* most-cited query the kernel had just seeded — so
+    // every result was skipped as already-in-vault and the run reported
+    // "0 new". Guaranteed, on every first update after building a graph.
+    respondWith(KERNEL_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "build-kernel");
+
+    clearRequests();
+    clearNotices();
+    respondWith(
+      openAlexPage([openAlexWork("W9", "A Newly Published Paper", ["W1"], "10.1234/new")]),
+    );
+    await runCommand(plugin, "update-inbox");
+
+    const url = requestedUrls[0] as string;
+    expect(url).toContain("from_created_date");
+    expect(url).not.toContain("cited_by_count");
+    expect(notices.some((n) => n.includes("1 new"))).toBe(true);
+  });
+
+  it("asks for the same window regardless of when it last ran", async () => {
+    // Anchoring the window on `lastUpdate` narrowed it to nothing on a second
+    // run the same day. Overlap is deliberate: dedup is exact, so re-seeing a
+    // paper costs nothing while missing one is permanent.
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+
+    await runCommand(plugin, "update-inbox");
+    const first = requestedUrls[0] as string;
+    expect(plugin.settings.lastUpdate).toBeTruthy();
+
+    clearRequests();
+    respondWith(DEFAULT_RESPONSE);
+    await runCommand(plugin, "update-inbox");
+
+    expect(requestedUrls[0]).toBe(first);
   });
 });
 

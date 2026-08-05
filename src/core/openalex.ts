@@ -131,6 +131,9 @@ function chunked<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
+/** Which date a recency window is measured against — see `worksSince`. */
+export type RecencyBasis = "created" | "publication";
+
 export interface OpenAlexOptions {
   mailto?: string;
   minIntervalMs?: number;
@@ -206,12 +209,31 @@ export class OpenAlexClient {
     return this.paginated(filter, "cited_by_count:desc", n);
   }
 
-  /** Works matching *topic* published on/after `since` (YYYY-MM-DD), newest first. */
-  async worksSince(topic: string, since: string, limit = 500): Promise<Work[]> {
+  /**
+   * Works matching *topic* that entered the window on/after `since`
+   * (YYYY-MM-DD), newest first.
+   *
+   * `basis` defaults to `created` — when OpenAlex *indexed* the record, not
+   * when the paper was published. Publication date is the intuitive choice and
+   * it is a trap: OpenAlex routinely indexes a paper weeks after its
+   * publication date, so a window anchored on publication and advanced on every
+   * run silently and permanently skips everything indexed late. Ingestion date
+   * is the only basis monotonic with what a caller can actually observe.
+   *
+   * Sorting stays on publication date, so a capped run returns the newest
+   * papers rather than an arbitrary slice of the window.
+   */
+  async worksSince(
+    topic: string,
+    since: string,
+    limit = 500,
+    basis: RecencyBasis = "created",
+  ): Promise<Work[]> {
+    const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
     const filter = [
       OpenAlexClient.topicFilter(topic),
       this.typeFilter(),
-      `from_publication_date:${since}`,
+      `${dateFilter}:${since}`,
     ].join(",");
     return this.paginated(filter, "publication_date:desc", limit);
   }
