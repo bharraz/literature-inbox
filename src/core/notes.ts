@@ -70,13 +70,6 @@ export interface InboxNoteOptions {
    * look; one connected only to other unread arrivals is not.
    */
   connectedKept?: string[];
-  /**
-   * Frontmatter tags. Defaults to `["inbox"]`; the kernel run passes
-   * `["kept"]` because those papers are the starting graph, not arrivals
-   * awaiting triage — and tagging them `inbox` would make them look like
-   * something to clean up.
-   */
-  tags?: string[];
 }
 
 function renderCitations(cites: string[], citedBy: string[]): string {
@@ -127,7 +120,12 @@ export function renderInboxNote(options: InboxNoteOptions): string {
     ["source", work.source],
     ["fetched", arrivedOn],
     ["origin-ids", originIds],
-    ["tags", options.tags ?? ["inbox"]],
+    // Deliberately no `inbox`/`kept` tag. The folder is the source of truth
+    // for whether a paper is kept, and a tag written at generation time cannot
+    // track a file the user drags by hand — so it went stale the moment
+    // keeping worked, labelling kept papers `inbox` and kernel seeds `kept`.
+    // Anything that needs to distinguish them, including graph colouring,
+    // keys on the path instead.
   ]);
 
   const title = work.title || work.key;

@@ -36,6 +36,32 @@ you never touched quietly cleans itself out.
    nothing" setting exists. Files the plugin didn't generate are invisible to
    cleanup, always — and so is anything you've edited, even in place.
 
+## Setting the graph up
+
+The plugin writes notes; Obsidian draws the graph. One 30-second setup turns
+the graph into a triage surface, and it only has to be done once per vault:
+
+- **Graph settings → Filters**, search box: `path:Inbox OR path:Papers`
+- **Graph settings → Groups**: a bright colour for `path:Inbox`, a muted one
+  for `path:Papers`
+
+Arrivals are then the bright dots and your library is the background they wire
+themselves into.
+
+Notes carry **no `inbox` or `kept` tag**, on purpose. A tag is written once,
+when the note is generated, and cannot follow a file you later drag from one
+folder to another — so it would claim a paper you kept was still an arrival.
+The folder is the source of truth for whether a paper is kept, and the graph
+should ask the same question the plugin does.
+
+## Cleanup is manual, always
+
+There is no timer, no scheduler, and no background task anywhere in this
+plugin. Nothing is fetched on load, and no note is ever removed unless you
+press **Clean up now** in settings — which then shows you the exact list and
+asks. The "unlock the cleanup button" toggle is off by default and does not
+schedule anything; it only decides whether that button is allowed to work.
+
 ## Sources and their ergonomics
 
 Configured in settings, each independently enabled with a per-run arrival cap

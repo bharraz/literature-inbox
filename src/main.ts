@@ -734,7 +734,10 @@ export default class LiteratureInboxPlugin extends Plugin {
 
   async cleanUp(): Promise<void> {
     if (!this.settings.pruneEnabled) {
-      notify("Cleanup is off. Enable it in Literature Inbox settings first.");
+      notify(
+        "Cleanup is locked. Unlock it in Literature Inbox settings — nothing is ever " +
+          "removed automatically, and you will still be shown the list and asked.",
+      );
       return;
     }
     const plan = await planPrune(

@@ -494,14 +494,21 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   }
 
   private renderCleanup(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Cleanup").setHeading();
+    new Setting(containerEl).setName("Cleanup — manual only").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        "Cleanup only ever touches notes that are still in the inbox, still exactly as " +
-        "they were generated, and past the keep window. It shows you the list first, " +
-        "and moves them to Obsidian's trash rather than deleting them. Anything you " +
-        "edited, moved, or wrote yourself is untouchable.",
+        "Nothing is ever removed automatically. There is no timer and no background " +
+        "task: cleanup runs only when you press the button below, and even then it " +
+        "shows you the list and asks first.",
+    });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "It can only touch a note that is still in the inbox folder, still byte-for-byte " +
+        "what was generated, and past the keep window — and it moves notes to Obsidian's " +
+        "trash rather than deleting them. Anything you edited, moved, or wrote yourself " +
+        "is invisible to it.",
     });
 
     new Setting(containerEl)
@@ -519,8 +526,11 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Allow cleanup")
-      .setDesc("When off, nothing is ever removed.")
+      .setName("Unlock the cleanup button")
+      .setDesc(
+        "Off by default. This does not schedule anything — it only lets the button " +
+          "below do its work. While it is off, cleanup refuses to run at all.",
+      )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.pruneEnabled).onChange(async (value) => {
           this.plugin.settings.pruneEnabled = value;
@@ -530,7 +540,10 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Clean up now")
-      .setDesc("Shows what would be removed and asks before doing anything.")
+      .setDesc(
+        "Runs once, right now. Shows what would be removed and asks before doing " +
+          "anything. This is the only thing that ever removes a note.",
+      )
       .addButton((button) =>
         button.setButtonText("Preview cleanup").onClick(() => void this.plugin.cleanUp()),
       );

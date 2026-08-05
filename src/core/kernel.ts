@@ -113,7 +113,6 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       citedBy,
       arrivedOn: today,
       originIds: entry.ids,
-      tags: ["kept"],
     });
     await adapter.write(notePath, content);
     report.written.push({

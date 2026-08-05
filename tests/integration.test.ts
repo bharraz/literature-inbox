@@ -395,7 +395,11 @@ describe("cleanup safety", () => {
     await runCommand(plugin, "clean-up-inbox");
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
-    expect(notices.some((n) => n.toLowerCase().includes("cleanup is off"))).toBe(true);
+    // And says why, including that nothing happens automatically — the point
+    // people most often misread about this setting.
+    const refusal = notices.find((n) => n.toLowerCase().includes("cleanup is locked"));
+    expect(refusal).toBeDefined();
+    expect(refusal?.toLowerCase()).toContain("automatically");
   });
 
   it("keeps recent arrivals even when cleanup is enabled", async () => {
@@ -483,14 +487,17 @@ describe("building the starting graph", () => {
     expect(cited).toContain("[[A Paper Building On It]]");
   });
 
-  it("tags seeded papers as kept, never as inbox", async () => {
+  it("writes no kept/inbox tag, leaving the folder as the only signal", async () => {
     respondWith(KERNEL_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
     await runCommand(plugin, "build-kernel");
 
     const note = app.vault.files.get("Papers/The Foundational Paper.md") as string;
-    expect(note).toContain("- kept");
-    expect(note).not.toContain("- inbox");
+    // No kept/inbox tag on any generated note. The tag could only describe
+    // where a note was *written*, and a paper kept by dragging the file would
+    // keep saying `inbox` forever. The folder answers the question instead.
+    expect(note).not.toContain("tags:");
+    expect(note).not.toContain("- kept");
   });
 
   it("is additive: re-running adds nothing it already has", async () => {
@@ -851,7 +858,10 @@ describe("the plugin's visible surface", () => {
     const headings = allSettings.filter((s: Setting) => s.isHeading).map((s: Setting) => s.name);
     expect(headings).toContain("Getting started");
     expect(headings).toContain("Folders");
-    expect(headings).toContain("Cleanup");
+    expect(headings).toContain("Add papers by hand");
+    // The heading itself has to say cleanup never runs on its own — that is
+    // the misreading the wording exists to prevent.
+    expect(headings).toContain("Cleanup — manual only");
   });
 
   it("puts the starting-graph action in front of the user", async () => {
