@@ -15,7 +15,13 @@ import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
 import { PlanRequiredError, RateLimitError } from "./core/http";
 import { backfillDois, fetchFeed, newestItem } from "./core/rss";
-import { effective, migrateFeedList, withinWindow } from "./core/feeds";
+import {
+  arxivCategoryFeedUrl,
+  effective,
+  looksLikeArxivCategory,
+  migrateFeedList,
+  withinWindow,
+} from "./core/feeds";
 import { titlesMatch, normalizeTitle } from "./core/ids";
 import {
   EMPTY_STATE,
@@ -87,6 +93,15 @@ function describeFetchError(error: unknown, fetched: number, mailto: string): st
     return `OpenAlex needs a paid plan for that query, so it was skipped.${gathered}`;
   }
   if (error instanceof RateLimitError) {
+    const hours = error.retryAfterMs ? Math.round(error.retryAfterMs / 3_600_000) : 0;
+    if (hours >= 1) {
+      // OpenAlex's free tier is a daily spend allowance, not a rate limit.
+      return (
+        `OpenAlex's free daily budget is used up — it resets at midnight UTC, in about ` +
+        `${hours} hour(s).${gathered} Smaller starting graphs and fewer runs per day ` +
+        `stretch it further.`
+      );
+    }
     const advice = mailto.trim()
       ? "Wait a minute and run it again."
       : "Adding your email under Network and integrations puts you in OpenAlex's " +
@@ -394,30 +409,36 @@ export default class LiteratureInboxPlugin extends Plugin {
       }
     }
 
+    // arXiv categories and hand-entered feeds are the same mechanism: a
+    // category is just a feed URL the user should not have to know.
+    const feedSources: { label: string; url: string; windowDays?: number; cap?: number }[] = [];
     if (this.settings.arxivEnabled) {
-      const client = new ArxivClient(this.transport());
       for (const category of splitList(this.settings.arxivCategories)) {
-        try {
-          // arXiv has no date filter, so the window is applied to what comes
-          // back. Without this, "new means 7 days" governed only OpenAlex.
-          works.push(...withinWindow(await client.categoryFeed(category, perSource), since));
-        } catch (error) {
-          report.sourceErrors.push({ source: `arXiv ${category}`, message: String(error) });
-        }
+        feedSources.push({ label: `arXiv ${category}`, url: arxivCategoryFeedUrl(category) });
+      }
+    }
+    if (this.settings.rssEnabled) {
+      for (const feed of this.settings.feeds) {
+        if (!feed.enabled || !feed.url.trim()) continue;
+        feedSources.push({
+          label: feed.url,
+          url: feed.url,
+          windowDays: feed.windowDays,
+          cap: feed.maxPerRun,
+        });
       }
     }
 
-    if (this.settings.rssEnabled) {
+    if (feedSources.length > 0) {
       const feedWorks: Work[] = [];
-      for (const feed of this.settings.feeds) {
-        if (!feed.enabled || !feed.url.trim()) continue;
+      for (const source of feedSources) {
         try {
-          const items = await fetchFeed(this.transport(), feed.url);
-          const feedSince = isoDaysAgo(effective(feed.windowDays, this.settings.newWindowDays));
-          const cap = effective(feed.maxPerRun, perSource);
+          const items = await fetchFeed(this.transport(), source.url);
+          const feedSince = isoDaysAgo(effective(source.windowDays, this.settings.newWindowDays));
+          const cap = effective(source.cap, perSource);
           feedWorks.push(...withinWindow(items, feedSince).slice(0, cap));
         } catch (error) {
-          report.sourceErrors.push({ source: feed.url, message: String(error) });
+          report.sourceErrors.push({ source: source.label, message: String(error) });
         }
       }
       // Give feed items a DOI (and a reference list) where we can, so they
@@ -1007,11 +1028,18 @@ export default class LiteratureInboxPlugin extends Plugin {
     }
 
     notify(`Testing ${categories.length} categor(y/ies)…`);
-    const client = new ArxivClient(this.transport());
     const results: FeedTestResult[] = [];
     for (const category of categories) {
+      if (!looksLikeArxivCategory(category)) {
+        results.push({ url: category, count: 0, error: "not an arXiv category name" });
+        continue;
+      }
       try {
-        const works = await client.categoryFeed(category, 5);
+        // Tested through the same path an update uses, so a green test means
+        // the update will work — not that some other endpoint answered.
+        const works = await fetchFeed(this.transport(), arxivCategoryFeedUrl(category), {
+          maxRetries: 0,
+        });
         const newest = newestItem(works);
         results.push({
           url: category,

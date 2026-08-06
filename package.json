@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:live": "node scripts/live-api.mjs",
-    "test:vault": "vitest run tests/live-vault.test.ts"
+    "test:vault": "vitest run tests/live-vault.test.ts",
+    "test:sim": "vitest run tests/live-simulation.test.ts"
   },
   "keywords": [
     "obsidian",

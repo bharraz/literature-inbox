@@ -63,3 +63,25 @@ export function effective(override: number | undefined, fallback: number): numbe
     ? override
     : fallback;
 }
+
+/**
+ * The RSS feed for an arXiv category.
+ *
+ * Categories are the thing researchers actually know (`quant-ph`, `cs.CL`);
+ * feed URLs are not. So the setting takes a category and this builds the URL,
+ * rather than asking people to know arXiv's hosting arrangement.
+ *
+ * RSS rather than arXiv's Atom query API on purpose: both return the same
+ * metadata with no reference lists, but the feed path already has per-source
+ * windows, caps and a DOI-resolution pass, and arXiv asks for a 3s gap between
+ * API queries that the feed does not.
+ */
+export function arxivCategoryFeedUrl(category: string): string {
+  return `https://rss.arxiv.org/rss/${encodeURIComponent(category.trim())}`;
+}
+
+/** Loose shape check, so an obvious typo is caught before a silent empty feed.
+ * arXiv categories are `quant-ph`, `cs.CL`, `math.AG`, `astro-ph.HE`. */
+export function looksLikeArxivCategory(category: string): boolean {
+  return /^[a-z-]+(\.[A-Za-z]{2,})?$/.test(category.trim());
+}

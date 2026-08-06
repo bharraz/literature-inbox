@@ -67,6 +67,27 @@ export function isPlanRequired(body: string): boolean {
   return /plan upgrade required|requires a premium/i.test(body);
 }
 
+/**
+ * Does a 429 say the caller is out of *budget* for the day?
+ *
+ * OpenAlex's free tier is a small daily spend allowance, not a requests-per-
+ * second limit, and it answers an exhausted allowance with 429 and a
+ * `Retry-After` measured in hours ("Resets at midnight UTC"). Waiting is
+ * technically correct and completely useless: no run should sit for four hours.
+ */
+export function isBudgetExhausted(body: string): boolean {
+  return /insufficient budget|rate limit exceeded/i.test(body) && /budget|funds/i.test(body);
+}
+
+/**
+ * The longest we will ever honour a `Retry-After`.
+ *
+ * A server may legitimately ask for hours. A plugin the user just clicked a
+ * button in must not disappear for hours — far better to stop, say why, and
+ * let them run it again later.
+ */
+export const MAX_RETRY_WAIT_MS = 30_000;
+
 /** Seconds, or an HTTP date, into milliseconds to wait. */
 export function parseRetryAfter(value: string | undefined, now = Date.now()): number | undefined {
   if (!value) return undefined;
@@ -139,8 +160,15 @@ export async function getWithRetry(
       // batches can stop instead of hammering a service that just asked it
       // to slow down.
       const wait = parseRetryAfter(response.retryAfter);
-      lastError = new RateLimitError(`rate limited by ${url}`, wait);
-      if (attempt === maxRetries) break;
+      lastError = new RateLimitError(
+        isBudgetExhausted(response.text)
+          ? `OpenAlex daily budget exhausted: ${response.text.slice(0, 200)}`
+          : `rate limited by ${url}`,
+        wait,
+      );
+      // Never sleep for an unbounded period just because the server said so:
+      // an exhausted daily budget comes back with hours on the clock.
+      if (attempt === maxRetries || (wait !== undefined && wait > MAX_RETRY_WAIT_MS)) break;
       await sleep(wait ?? backoffSeconds * 2 ** attempt * 1000);
       continue;
     }

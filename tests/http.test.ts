@@ -148,3 +148,67 @@ describe("buildUrl", () => {
     expect(buildUrl("https://api.test/works", {})).toBe("https://api.test/works");
   });
 });
+
+describe("429s that are not rate limiting", () => {
+  const budgetBody = JSON.stringify({
+    error: "Rate limit exceeded",
+    message:
+      "Insufficient budget. This request costs $0.001 but you only have $0.0002 remaining. " +
+      "Resets at midnight UTC. Need more? Add funds at https://openalex.org/pricing",
+  });
+
+  it("never sleeps for the hours an exhausted daily budget asks for", async () => {
+    // OpenAlex answers a spent daily allowance with 429 and Retry-After in
+    // hours. Honouring that literally would park the plugin until midnight.
+    const slept: number[] = [];
+    const transport = {
+      async get() {
+        return { status: 429, text: budgetBody, retryAfter: "16043" };
+      },
+    };
+
+    await expect(
+      getWithRetry(transport, "https://example.org/x", {
+        sleep: async (ms) => {
+          slept.push(ms);
+        },
+      }),
+    ).rejects.toThrow(/budget/i);
+    expect(slept).toEqual([]);
+  });
+
+  it("still honours a short Retry-After", async () => {
+    const slept: number[] = [];
+    let calls = 0;
+    const transport = {
+      async get() {
+        calls += 1;
+        return calls === 1
+          ? { status: 429, text: "slow down", retryAfter: "5" }
+          : { status: 200, text: "ok" };
+      },
+    };
+
+    await getWithRetry(transport, "https://example.org/x", {
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+    });
+    expect(slept).toEqual([5000]);
+  });
+
+  it("does not retry a paid-plan refusal, because waiting cannot help", async () => {
+    let calls = 0;
+    const transport = {
+      async get() {
+        calls += 1;
+        return { status: 429, text: '{"error":"Plan upgrade required"}' };
+      },
+    };
+
+    await expect(
+      getWithRetry(transport, "https://example.org/x", { sleep: async () => {} }),
+    ).rejects.toThrow(/paid plan/i);
+    expect(calls).toBe(1);
+  });
+});
