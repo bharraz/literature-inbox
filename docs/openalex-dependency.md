@@ -132,16 +132,51 @@ Each of these is a deliberate trade, not an accident:
 
 | Change | Impact | What needs rewriting |
 |---|---|---|
-| **`referenced_works` removed or paywalled** | **Fatal.** No citation edges; the product premise is gone | Nothing salvages it in-tree. Would need a second provider — OpenCitations/COCI (free DOI-to-DOI edges, no metadata) or Semantic Scholar (needs a key) |
+| **`referenced_works` removed or paywalled** | **Severe.** Outbound edges survive via Crossref at ~half coverage (§5a); adjacency selection does not survive at all | New client for Crossref `/works/{doi}` behind `ReferenceResolver`; `worksCitingSince` and the `adjacent` mode retire |
 | Keyless tier removed | Plugin stops working on install | `openAlexApiKey` becomes required; onboarding gains a mandatory step; README's "no account" claim goes |
 | Daily allowance cut sharply | Large starting graphs become impractical | Lower `kernelSize` default; make topic search opt-in; lean harder on adjacency (filter-priced) |
-| `cites:` filter paywalled | Adjacency selection dies — arrivals stop being connected by construction | Fall back to topic search plus post-hoc edge resolution; `worksCitingSince` and the `adjacent` mode retire |
-| Search calls paywalled | Topic mode and title backfill die | Starting graph falls back to seeds/snowball/library modes (all filter-priced). `topWorks`, `worksByAuthor`'s name branch, `workByTitle` retire |
+| `cites:` filter paywalled | Adjacency selection dies — arrivals stop being connected by construction. **No free substitute exists** (§5a) | Fall back to topic search plus post-hoc edge resolution; `worksCitingSince` and the `adjacent` mode retire |
+| Search calls paywalled | Topic mode dies; title backfill moves to Crossref (§5a) | Starting graph falls back to seeds/snowball/library modes (all filter-priced). `topWorks` and `worksByAuthor`'s name branch retire; `workByTitle` re-points at Crossref |
 | `X-RateLimit-*` headers dropped | Gauge silently reverts to estimating | `budget.ts` already falls back to the local tally; only the label changes |
 | Pricing per call type changes | §2's arithmetic is wrong | Re-measure with a probe; update this file and the `ADJACENCY_BATCH` / cap constants |
 | Cursor pagination changed | Multi-page fetches break | `paginated()` in `core/openalex.ts` |
 | `abstract_inverted_index` removed | Notes lose abstracts; edges unaffected | `reconstructAbstract` and the note template |
 | Rate limit expressed differently | Retry logic may mis-handle | `getWithRetry` in `core/http.ts`, plus `isPlanRequired` / `isBudgetExhausted` |
+
+## 5a. Measured alternatives (probed 2026-08-06)
+
+Before assuming OpenAlex is irreplaceable, the candidates were actually tried
+against the same paper (`10.1109/cvpr.2016.90`).
+
+| Source | Outbound references | Inbound citations | Title → DOI | Cost |
+|---|---|---|---|---|
+| **OpenAlex** | inline with the record, all ids resolvable | `cites:` filter, date-filterable, 50 anchors/request | `title.search` | credits; search is 10× |
+| **Crossref** | `/works/{doi}` → 49 refs, **only 23 carry a DOI** | not offered | `query.bibliographic`, **292 ms** | free, keyless |
+| **OpenCitations COCI** | `/references/{doi}` → 26, all DOI-to-DOI, ~1.2 s | `/citations/{doi}` — **504 after 280 s** | not offered | free, keyless |
+
+Three things follow:
+
+1. **Outbound references are replaceable, at roughly half the coverage.**
+   Crossref returned 49 references but only 23 with a DOI, and an id-less
+   reference cannot be matched to anything in the vault. OpenCitations agrees
+   at 26, which is unsurprising — COCI is built from Crossref deposits.
+   OpenAlex also returns references *inline with the work*, so one filter call
+   fetches 50 papers **and** their reference lists; Crossref needs one request
+   per paper.
+2. **Inbound citations are effectively not replaceable.** The one free source
+   that offers them timed out. Even working, it answers per-DOI with no date
+   filter — so "what cited any of my 100 papers in the last 30 days" would be
+   100 requests and client-side filtering, against one OpenAlex call.
+3. **Title → DOI is replaceable, cleanly and for free.** Crossref's
+   `query.bibliographic` answered in under 300 ms with no key and no credits.
+   Its near-miss behaviour is the expected one — searching "Attention is all
+   you need" returned "Is Attention All You Need?" — which our existing
+   `titlesMatch` guard already rejects.
+
+**Actionable:** moving title resolution to Crossref would take the *only*
+search-priced operation off OpenAlex entirely, leaving nothing but
+filter-priced calls. That is the single highest-value change available for
+reducing this dependency.
 
 ### The single point of failure
 
