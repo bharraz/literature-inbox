@@ -153,13 +153,22 @@ A typical update, keyless (1,000/day):
 | Topic search | ~10 |
 | Feed fetches (arXiv/RSS) | 0 — not OpenAlex |
 | Scheduled backfill, DOIs batched | 1 |
-| Scheduled backfill, title searches | ~10 each |
+| Scheduled backfill, titles | **0 — goes to Crossref** (§0.1) |
 
-So an ordinary run costs ~13 credits: about 75 runs a day. Building a
-100-paper starting graph is one search plus a few filters, ~12 credits.
+| Configuration | Credits per run | Runs per keyless day |
+|---|---|---|
+| Adjacency only | ~3 | ~300 |
+| Adjacency + topic (default) | ~13 | ~75 |
+| Topic only | ~11 | ~90 |
 
-**Title search is the only thing that can blow the budget**, which is why feed
-items are no longer resolved by title at fetch time — see §4.
+Building a 100-paper starting graph is one search plus a few filters, ~12
+credits.
+
+**The topic search is now the dominant cost** — the only search-priced call
+left on OpenAlex, and it is one per run rather than one per feed item. Before
+Crossref, an update against a 25-item feed spent ~250 credits on title lookups
+that mostly missed; that is now zero. A user who prefers adjacency selection
+never issues a search-priced call at all.
 
 ---
 
