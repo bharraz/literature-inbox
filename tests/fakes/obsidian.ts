@@ -451,6 +451,10 @@ export class Setting {
     this.name = name;
     return this;
   }
+  setClass(cls: string): this {
+    this.settingEl.classList.add(cls);
+    return this;
+  }
   setDesc(desc: string): this {
     this.desc = desc;
     return this;

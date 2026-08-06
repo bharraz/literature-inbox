@@ -11,7 +11,6 @@ import { FilenameAllocator } from "./filenames";
 import { contentHash } from "./hash";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds } from "./ids";
 import { renderInboxNote, type SubjectOptions } from "./notes";
-import { renderInboxPage, type InboxEntry } from "./inbox-page";
 import { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
 
@@ -27,14 +26,8 @@ export interface InboxRecord {
   contentHash: string;
   /** Manual adds are intentional and never auto-pruned. */
   manual?: boolean;
-  /**
-   * How many vault papers this arrival cites, recorded at arrival.
-   *
-   * Stored on the record rather than recomputed, because `_Inbox.md` is
-   * regenerated after a keep and after a cleanup too — and neither of those
-   * has a citation index to hand. Without this the count would appear on one
-   * run and silently vanish on the next.
-   */
+  /** How many vault papers this arrival cites, recorded at arrival and shown
+   * in the run report. */
   edgeCount?: number;
   /** Backfill attempts spent so far, and when the last one ran. */
   backfillAttempts?: number;
@@ -57,8 +50,6 @@ export interface UpdateSettings {
   papersFolder: string;
   maxArrivalsPerRun: number;
   subjects?: SubjectOptions;
-  /** When false, `_Inbox.md` is not written — see the setting's rationale. */
-  inboxPageEnabled?: boolean;
 }
 
 export type SkipReason = "already-in-vault" | "already-in-inbox" | "duplicate-in-batch";
@@ -231,31 +222,6 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     });
   }
 
-  await writeInboxPage(inbox, settings, adapter);
   return { report, inbox };
 }
 
-/**
- * Regenerate `_Inbox.md` from the current record set.
- *
- * Edge counts come off the records themselves, so the front page says the same
- * thing whether it was rebuilt by an update, a keep, or a cleanup.
- */
-export async function writeInboxPage(
-  inbox: readonly InboxRecord[],
-  settings: UpdateSettings,
-  adapter: VaultAdapter,
-): Promise<void> {
-  if (settings.inboxPageEnabled === false) return;
-  const entries: InboxEntry[] = inbox.map((record) => {
-    const base = record.notePath.split("/").pop() ?? record.notePath;
-    const filename = base.endsWith(".md") ? base.slice(0, -3) : base;
-    return {
-      filename,
-      date: record.arrivedOn,
-      label: record.title && record.title !== filename ? record.title : undefined,
-      edgeCount: record.edgeCount,
-    };
-  });
-  await adapter.write(`${settings.inboxFolder}/_Inbox.md`, renderInboxPage(entries));
-}

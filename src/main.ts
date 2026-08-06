@@ -34,7 +34,7 @@ import {
   scanFolderIdentities,
 } from "./core/vault-state";
 import { parseNoteIdentity } from "./core/note-identity";
-import { runUpdate, writeInboxPage, type InboxRecord, type UpdateReport } from "./core/update";
+import { runUpdate, type InboxRecord, type UpdateReport } from "./core/update";
 import { applyPrune, planPrune } from "./core/prune";
 import {
   backfillReferences,
@@ -400,7 +400,6 @@ export default class LiteratureInboxPlugin extends Plugin {
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
       subjects: this.subjectOptions(),
-      inboxPageEnabled: this.settings.inboxPageEnabled,
     };
   }
 
@@ -976,7 +975,6 @@ ${content.slice(marker)}`;
     }
     this.inbox = this.inbox.filter((record) => record.notePath !== file.path);
     await this.persist();
-    await writeInboxPage(this.inbox, this.updateSettings(), this.adapter());
     // Recount rather than increment: papers also arrive in this folder by
     // being dragged there, by zot2vault, or by a kernel run, so a counter
     // nudged only on this path drifts out of step with the folder.
@@ -1121,7 +1119,6 @@ ${content.slice(marker)}`;
     new ConfirmPruneModal(this.app, plan.prunable.map((c) => c.record), async () => {
       this.inbox = await applyPrune(plan, (path) => trashNote(this.app, path));
       await this.persist();
-      await writeInboxPage(this.inbox, this.updateSettings(), this.adapter());
       notify(`Moved ${plan.prunable.length} untouched arrival(s) to trash.`);
     }).open();
   }

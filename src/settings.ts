@@ -21,9 +21,9 @@ export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
 export type ArrivalSelection = "both" | "adjacent" | "topic";
 
 export const ARRIVAL_SELECTION_LABELS: Record<ArrivalSelection, string> = {
-  both: "Both (recommended)",
-  adjacent: "Papers citing my library",
-  topic: "Papers matching my topic",
+  both: "Both",
+  adjacent: "Only papers that cite my library",
+  topic: "Only papers matching my topic",
 };
 
 export interface LiteratureInboxSettings {
@@ -73,16 +73,6 @@ export interface LiteratureInboxSettings {
 
   maxArrivalsPerRun: number;
 
-  /**
-   * Whether to write `_Inbox.md`.
-   *
-   * Off by default, because it actively harms the thing it sits next to: the
-   * page wikilinks every arrival, so in the graph it becomes a hub node that
-   * wires all arrivals to each other and pulls them into a star around a file
-   * that means nothing. That competes with the citation edges the whole plugin
-   * exists to show. The inbox folder, sorted by date, is already the list.
-   */
-  inboxPageEnabled: boolean;
 
   /** Where OpenAlex's subject terms go in a generated note, if anywhere. */
   subjectPlacement: "off" | "property" | "tags";
@@ -136,7 +126,6 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   kernelAuthor: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 25,
-  inboxPageEnabled: false,
   // Terms as a property by default, never as tags: tags show up in the tag
   // pane and the graph, and a vault-wide dump of machine-assigned subject
   // terms is exactly the clutter people rightly fear. Concepts stays off for
@@ -168,10 +157,6 @@ function parseCount(value: string, fallback: number, min = 1): number {
 }
 
 export class LiteratureInboxSettingTab extends PluginSettingTab {
-  /** Scratch state for the bulk-add box: deliberately not persisted. */
-  private manualAdd = "";
-  private manualAddTarget: "inbox" | "papers" = "papers";
-
   constructor(app: App, private readonly plugin: LiteratureInboxPlugin) {
     super(app, plugin);
   }
@@ -180,26 +165,22 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    this.renderGettingStarted(containerEl);
-    this.renderFolders(containerEl);
+    // Order follows what a user actually does, most-often first: add papers,
+    // fetch new ones, then the settings behind each of those, then the rest.
+    this.renderStatus(containerEl);
+    this.renderStartingGraph(containerEl);
+    this.renderEveryday(containerEl);
+    this.renderGraphSetup(containerEl);
     this.renderSources(containerEl);
     this.renderArrivals(containerEl);
-    this.renderInboxPageSetting(containerEl);
     this.renderNoteContent(containerEl);
-    this.renderAddByHand(containerEl);
+    this.renderFolders(containerEl);
     this.renderCleanup(containerEl);
     this.renderIntegrations(containerEl);
   }
 
-  /**
-   * The top of the settings page is a first-run path, not a preference dump.
-   * A new user's real question is "what do I do now", and the honest answer
-   * is: name your field, build a starting graph, then update. Ordering the
-   * page that way is most of the onboarding.
-   */
-  private renderGettingStarted(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Getting started").setHeading();
-
+  /** Where things stand, and what is left of today's allowance. */
+  private renderStatus(containerEl: HTMLElement): void {
     const status = this.plugin.status();
     containerEl.createEl("p", {
       cls: "setting-item-description",
@@ -207,40 +188,61 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         `${status.keptCount} papers in your library · ${status.inboxCount} in the inbox` +
         (status.lastUpdate ? ` · last updated ${status.lastUpdate}` : " · never updated"),
     });
-
     this.renderBudget(containerEl);
+  }
+
+  /**
+   * The two buttons people press repeatedly, in one obvious place.
+   *
+   * These used to be scattered — "fetch" was stranded at the end of the
+   * graph-setup instructions, which is where you look once and never again.
+   * Frequency of use is the only sensible ordering principle for a settings
+   * page that doubles as a control panel.
+   */
+  private renderEveryday(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Everyday").setHeading();
 
     new Setting(containerEl)
-      .setName("1. What do you work on?")
+      .setName("Fetch new papers")
       .setDesc(
-        'A topic query — "quantum error correction", "machine translation" — or an ' +
-          "OpenAlex concept id like C41008148. Everything else keys off this.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("quantum error correction")
-          .setValue(this.plugin.settings.openAlexTopic)
-          .onChange(async (value) => {
-            this.plugin.settings.openAlexTopic = value;
-            await this.plugin.saveSettings();
-          }),
+        "Run this whenever you like — nothing fetches on its own. New papers land in " +
+          `${this.plugin.settings.inboxFolder}/; keep one by moving its note into ` +
+          `${this.plugin.settings.papersFolder}/.`,
       )
       .addButton((button) =>
         button
-          .setButtonText("Preview")
-          .setTooltip("Show the top few papers, to check the query matches your field")
-          .onClick(() => void this.plugin.previewTopic()),
+          .setButtonText("Update inbox")
+          .setCta()
+          .onClick(() => void this.plugin.updateInbox()),
       );
 
-    this.renderStartingGraph(containerEl);
+    new Setting(containerEl)
+      .setName("Clean up old arrivals")
+      .setDesc(
+        "Shows what would go and asks first. Only ever touches notes still in the " +
+          "inbox, unedited, and past the keep window — see Cleanup below.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Clean up").onClick(() => void this.plugin.cleanUp()),
+      );
+  }
 
-    new Setting(containerEl).setName("3. Set up the graph (once, 30 seconds)").setHeading();
+  /**
+   * How to make Obsidian's graph a triage surface.
+   *
+   * Instructions rather than automation: graph settings live in Obsidian's own
+   * config, and writing that from a plugin is fragile and the kind of thing
+   * review questions. A one-time setup the user does themselves is the honest
+   * trade — but bookmarking it is what makes it a habit rather than a chore.
+   */
+  private renderGraphSetup(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Set up the graph (once)").setHeading();
     const graph = containerEl.createEl("div", { cls: "setting-item-description" });
     graph.createEl("p", {
       text:
-        "The plugin writes notes; Obsidian draws the graph. Out of the box every note in " +
-        "the vault shows up and arrivals look like everything else. In graph view, open " +
-        "its settings (the slider icon) and:",
+        "The plugin writes notes; Obsidian draws the graph. Out of the box every note " +
+        "in the vault shows up and arrivals look like everything else. Open graph view " +
+        "(Ctrl/Cmd+G), then its settings (the slider icon), and:",
     });
     const steps = graph.createEl("ol");
     steps.createEl("li", {
@@ -250,34 +252,29 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     });
     steps.createEl("li", {
       text:
-        `Groups → New group: path:${this.plugin.settings.inboxFolder} in a bright colour, ` +
-        `then a second group for path:${this.plugin.settings.papersFolder} in a muted one.`,
+        `Groups → New group: path:${this.plugin.settings.inboxFolder} in a bright ` +
+        `colour, then a second group for path:${this.plugin.settings.papersFolder} in a ` +
+        "muted one.",
+    });
+    steps.createEl("li", {
+      text:
+        "Bookmark it: with the graph open and configured, run “Bookmarks: bookmark " +
+        "current view” from the command palette. This is the step that makes it " +
+        "stick — the graph becomes one click from the sidebar instead of a setup " +
+        "you redo each time.",
     });
     graph.createEl("p", {
       text:
-        "New papers are then the bright dots and your library is the background they wire " +
-        "into. Colour by path rather than by tag: notes carry no inbox/kept tag on " +
-        "purpose, because a tag written when the note is generated cannot follow a file " +
-        "you later drag into another folder.",
+        "Colour by path rather than by tag: notes carry no inbox/kept tag on purpose, " +
+        "because a tag written when the note is generated cannot follow a file you " +
+        "later drag into another folder.",
     });
     graph.createEl("p", {
       text:
         "Once you are reading regularly, a third group is worth adding: tag your own " +
-        "favourites (#favourite, #to-read, whatever you use) and give that group its own " +
-        "colour. Those tags are yours, they follow the note anywhere, and the plugin " +
-        "never touches them.",
+        "favourites (#favourite, #to-read, whatever you use) and give that group its " +
+        "own colour. Those tags are yours and the plugin never touches them.",
     });
-
-    new Setting(containerEl)
-      .setName("4. Fetch new papers")
-      .setDesc(
-        "Run this whenever you like — there is no background fetching. Keep a paper " +
-          `by moving its note out of ${this.plugin.settings.inboxFolder}/ into ` +
-          `${this.plugin.settings.papersFolder}/.`,
-      )
-      .addButton((button) =>
-        button.setButtonText("Update inbox now").onClick(() => void this.plugin.updateInbox()),
-      );
   }
 
   /**
@@ -331,7 +328,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     const mode = this.plugin.settings.kernelMode;
 
     new Setting(containerEl)
-      .setName("2. Add papers to your graph")
+      .setName("Add papers to your graph")
       .setDesc(
         `Writes papers into ${this.plugin.settings.papersFolder}/, wired to each other by ` +
           "citations. New arrivals connect to this core — without it every arrival looks " +
@@ -354,14 +351,33 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           .onClick(() => void this.plugin.buildKernel()),
       );
 
+    // The topic field belongs to the modes that use it, not to the top of the
+    // page — it was step 1 of onboarding while doing nothing at all in four of
+    // the five modes.
     if (mode === "topic") {
-      containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text:
-          `Uses the topic above. You get the field's canon — the papers everything else ` +
-          "cites — which needs no input but is not specific to you. If your graph looks " +
-          "like a stranger's, try one of the other modes.",
-      });
+      new Setting(containerEl)
+        .setName("Topic")
+        .setDesc(
+          'A query — "quantum error correction", "machine translation" — or an OpenAlex ' +
+            "concept id like C41008148. You get the field's canon: the papers everything " +
+            "else cites. Needs no input beyond this, but is not specific to you — if the " +
+            "result looks like a stranger's library, try one of the other modes.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("quantum error correction")
+            .setValue(this.plugin.settings.openAlexTopic)
+            .onChange(async (value) => {
+              this.plugin.settings.openAlexTopic = value;
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Preview")
+            .setTooltip("Show the top few papers, to check the query matches your field")
+            .onClick(() => void this.plugin.previewTopic()),
+        );
     }
 
     if (mode === "seeds" || mode === "snowball") {
@@ -416,19 +432,24 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       });
     }
 
-    new Setting(containerEl)
-      .setName("How many papers to add")
-      .setDesc(
-        mode === "seeds"
-          ? "Ignored in this mode: you get exactly the papers you pasted."
-          : "More papers means a denser core, but a longer first run.",
-      )
-      .addText((text) =>
-        text.setValue(String(this.plugin.settings.kernelSize)).onChange(async (value) => {
-          this.plugin.settings.kernelSize = parseCount(value, DEFAULT_SETTINGS.kernelSize);
-          await this.plugin.saveSettings();
-        }),
-      );
+    // Hidden in "seeds" mode, where it does nothing: you get exactly the
+    // papers you pasted. A control that is present but inert teaches people
+    // not to trust the ones next to it.
+    if (mode !== "seeds") {
+      new Setting(containerEl)
+        .setName("How many papers to add")
+        .setDesc(
+          mode === "snowball" || mode === "library"
+            ? "A ceiling on what the expansion adds, beyond the papers you started from."
+            : "More papers means a denser core, but a longer first run.",
+        )
+        .addText((text) =>
+          text.setValue(String(this.plugin.settings.kernelSize)).onChange(async (value) => {
+            this.plugin.settings.kernelSize = parseCount(value, DEFAULT_SETTINGS.kernelSize);
+            await this.plugin.saveSettings();
+          }),
+        );
+    }
   }
 
   private renderFolders(containerEl: HTMLElement): void {
@@ -496,14 +517,12 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Which papers OpenAlex should look for")
+      .setName("What counts as a new paper for you")
       .setDesc(
-        '"Papers citing my library" asks what has recently cited the papers in ' +
-          `${this.plugin.settings.papersFolder}/ — so every arrival is connected to ` +
-          "something you kept, rather than merely matching a query. It needs a starting " +
-          "graph to work from. Topic search covers the rest of the field, including work " +
-          "that has not cited you yet. Both is usually right; when the per-run cap bites, " +
-          "citing papers are kept first.",
+        "Papers that cite your library are guaranteed to connect to something you kept. " +
+          "Papers matching your topic cover the rest of the field, including work that " +
+          "has not cited you yet — but some will arrive unconnected. Both is usually " +
+          "right, and citing papers are kept first if the per-run cap bites.",
       )
       .addDropdown((dropdown) => {
         for (const [value, label] of Object.entries(ARRIVAL_SELECTION_LABELS)) {
@@ -598,6 +617,10 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     feeds.forEach((feed, index) => {
       const row = new Setting(containerEl)
         .setName(`Feed ${index + 1}`)
+        // Obsidian lays a Setting out as one line; six controls overflow it,
+        // and the overflow visibly escapes the box. This class lets the
+        // controls wrap instead — see styles.css.
+        .setClass("literature-inbox-feed-row")
         .addToggle((toggle) =>
           toggle
             .setValue(feed.enabled)
@@ -704,54 +727,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   }
 
   /**
-   * Adding papers by hand, in bulk.
-   *
-   * The same control the command palette offers, except it takes a list and
-   * lets you say where the papers land. Not persisted between sessions: this
-   * is a scratch input, and saving it would mean the plugin quietly kept a
-   * list you pasted once.
-   */
-  private renderAddByHand(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Add papers by hand").setHeading();
-
-    new Setting(containerEl)
-      .setName("DOIs or arXiv ids")
-      .setDesc(
-        "One per line. Full URLs are fine. Papers added this way are never touched by " +
-          "cleanup — you asked for them on purpose.",
-      )
-      .addTextArea((text) =>
-        text
-          .setPlaceholder("10.1103/PhysRevA.101.032330\nhttps://arxiv.org/abs/2401.12345")
-          .setValue(this.manualAdd)
-          .onChange((value) => {
-            this.manualAdd = value;
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Add them to")
-      .setDesc(
-        `${this.plugin.settings.papersFolder}/ for papers you already know you want — ` +
-          `${this.plugin.settings.inboxFolder}/ if you still want to triage them.`,
-      )
-      .addDropdown((dropdown) => {
-        dropdown
-          .addOption("papers", `${this.plugin.settings.papersFolder}/ (keep straight away)`)
-          .addOption("inbox", `${this.plugin.settings.inboxFolder}/ (triage first)`)
-          .setValue(this.manualAddTarget)
-          .onChange((value) => {
-            this.manualAddTarget = value === "inbox" ? "inbox" : "papers";
-          });
-      })
-      .addButton((button) =>
-        button
-          .setButtonText("Add")
-          .onClick(() => void this.plugin.addByIds(this.manualAdd, this.manualAddTarget)),
-      );
-  }
-
-  /**
    * What a generated note contains beyond the essentials.
    *
    * Deliberately a fixed set of switches rather than a template. The
@@ -759,23 +734,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    * zot2vault (`docs/interop-spec.md` §5) — an arbitrary template would break
    * upgrade-in-place and turn a kept note into a competing duplicate.
    */
-  private renderInboxPageSetting(containerEl: HTMLElement): void {
-    new Setting(containerEl)
-      .setName("Write an _Inbox.md index page")
-      .setDesc(
-        "Off by default, and worth leaving off. The page links every arrival, which " +
-          "makes it a hub node in the graph — arrivals cluster around that file instead " +
-          "of around the papers they cite, which is the opposite of the point. Your " +
-          "inbox folder sorted by date is already the list.",
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.inboxPageEnabled).onChange(async (value) => {
-          this.plugin.settings.inboxPageEnabled = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-  }
-
   private renderNoteContent(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("What goes in a note").setHeading();
     containerEl.createEl("p", {

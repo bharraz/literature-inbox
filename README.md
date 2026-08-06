@@ -7,7 +7,7 @@ five papers you care about is visually loud; an isolated dot is easy to ignore.
 You triage by looking at the graph, open what looks interesting, and everything
 you never touched quietly cleans itself out.
 
-> **Status:** built and tested (381 hermetic tests, `tsc` clean, plus live
+> **Status:** built and tested (385 hermetic tests, `tsc` clean, plus live
 > harnesses that build a real vault and measure connectivity). Loaded in a real
 > vault; still being shaken out. See `roadmap.md` for design context and the
 > path to the community store, `docs/interop-spec.md` for the on-disk contract

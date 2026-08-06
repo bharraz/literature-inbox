@@ -1,0 +1,23 @@
+/*
+ * A feed row carries six controls — enable, URL, window, cap, test, remove —
+ * which is more than Obsidian's single-line Setting layout accommodates. Left
+ * alone the controls overflow the row and visibly escape its container.
+ *
+ * Allowing the control block to wrap, and giving the URL box room to grow,
+ * keeps the row inside its box at any width.
+ */
+.literature-inbox-feed-row .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: var(--size-4-2);
+}
+
+.literature-inbox-feed-row .setting-item-control input[type="text"] {
+  min-width: 6em;
+}
+
+/* The URL is the one field that needs real width; the two override boxes are
+   short numbers and should not take space from it. */
+.literature-inbox-feed-row .setting-item-control input[type="text"]:first-of-type {
+  flex: 1 1 20em;
+}

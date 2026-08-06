@@ -171,12 +171,36 @@ describe("plugin load", () => {
   });
 
   it("shows the current values in the settings tab", async () => {
+    // The topic box lives inside the topic mode now, not at the top of the
+    // page — it did nothing in four of the five starting-graph modes.
     const { plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "topic";
       p.settings.openAlexTopic = "quantum error correction";
     });
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
-    const topic = allSettings.find((s: Setting) => s.name.includes("What do you work on"));
+    const topic = allSettings.find((s: Setting) => s.name === "Topic");
     expect(topic?.texts[0]?.value).toBe("quantum error correction");
+  });
+
+  it("hides the topic box in modes that do not use it", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "seeds";
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+    expect(allSettings.some((s: Setting) => s.name === "Topic")).toBe(false);
+    // ...and so is the size box, which that mode ignores entirely.
+    expect(allSettings.some((s: Setting) => s.name.includes("How many papers"))).toBe(false);
+  });
+
+  it("puts the everyday actions in their own section", async () => {
+    // Fetch and clean-up are what a user presses repeatedly; they used to be
+    // stranded at the end of one-time setup instructions.
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+    const fetch = allSettings.find((s: Setting) => s.name === "Fetch new papers");
+    const clean = allSettings.find((s: Setting) => s.name === "Clean up old arrivals");
+    expect(fetch?.buttons[0]?.text).toBe("Update inbox");
+    expect(clean?.buttons[0]?.text).toBe("Clean up");
   });
 });
 
@@ -193,16 +217,16 @@ describe("update inbox", () => {
     expect(app.vault.files.has("Inbox/A Paper About Attention.md")).toBe(true);
   });
 
-  it("writes no _Inbox.md by default, so nothing becomes a graph hub", async () => {
-    // The page links every arrival, which in the graph pulls them into a star
-    // around a file that means nothing — competing with the citation edges
-    // that are the entire point.
+  it("writes no index page, so nothing becomes a graph hub", async () => {
+    // An index linking every arrival would be a hub node in the graph, pulling
+    // arrivals into a star around a file that means nothing and competing with
+    // the citation edges that are the entire point. The folder is the list.
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
 
     await runCommand(plugin, "update-inbox");
 
-    expect(app.vault.files.has("Inbox/_Inbox.md")).toBe(false);
+    expect([...app.vault.files.keys()].some((p) => p.includes("_Inbox"))).toBe(false);
   });
 
   it("creates the inbox folder rather than failing to write into it", async () => {
@@ -1037,38 +1061,8 @@ describe("Crossref alongside OpenAlex", () => {
   });
 });
 
-describe("the inbox front page", () => {
-  it("shows how connected each arrival is", async () => {
-    // The signal that makes the page worth reading. It is computed at arrival
-    // and stored on the record, so it survives later regenerations.
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.inboxPageEnabled = true;
-    });
-
-    await plugin.updateInbox();
-
-    const page = app.vault.files.get("Inbox/_Inbox.md") as string;
-    expect(page).toContain("1 link into your library");
-  });
-
-  it("keeps those counts when the page is rebuilt after a keep", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.inboxPageEnabled = true;
-    });
-    await plugin.updateInbox();
-
-    const file = app.vault.getAbstractFileByPath("Inbox/A Paper About Attention.md");
-    await plugin.keepActiveNote(file as never);
-
-    const page = app.vault.files.get("Inbox/_Inbox.md") as string;
-    expect(page).toContain("1 link into your library");
-  });
-
-  it("keeps the library count in step when a paper is kept", async () => {
+describe("keeping a paper", () => {
+  it("keeps the library count in step", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
     await plugin.updateInbox();
@@ -1264,9 +1258,8 @@ describe("the plugin's visible surface", () => {
     expect(() => tab.display()).not.toThrow();
 
     const headings = allSettings.filter((s: Setting) => s.isHeading).map((s: Setting) => s.name);
-    expect(headings).toContain("Getting started");
+    expect(headings).toContain("Everyday");
     expect(headings).toContain("Folders");
-    expect(headings).toContain("Add papers by hand");
     // The heading itself has to say cleanup never runs on its own — that is
     // the misreading the wording exists to prevent.
     expect(headings).toContain("Cleanup — manual only");

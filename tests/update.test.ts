@@ -90,7 +90,7 @@ describe("findExisting — never inbox what the vault already has (spec §7.1)",
 describe("runUpdate", () => {
   const today = "2026-07-19";
 
-  it("writes a note per arrival and regenerates the inbox page", async () => {
+  it("writes a note per arrival, and nothing else", async () => {
     const adapter = new MemoryVault();
     const { report, inbox } = await runUpdate({
       fetched: [paper("W1", "First Arrival Paper"), paper("W2", "Second Arrival Paper")],
@@ -99,7 +99,9 @@ describe("runUpdate", () => {
 
     expect(report.arrived).toHaveLength(2);
     expect(adapter.files.has("Inbox/First Arrival Paper.md")).toBe(true);
-    expect(adapter.files.has("Inbox/_Inbox.md")).toBe(true);
+    // No index page: it would link every arrival and become a hub node that
+    // clusters them around itself instead of around the papers they cite.
+    expect(adapter.files.size).toBe(2);
     expect(inbox).toHaveLength(2);
     expect(inbox[0]?.arrivedOn).toBe(today);
   });

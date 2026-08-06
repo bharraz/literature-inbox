@@ -89,3 +89,30 @@ describe("seedsFromOriginIds", () => {
     expect(seedsFromOriginIds([["openalex:W1"], ["openalex:W1"]], 10).openAlexIds).toEqual(["W1"]);
   });
 });
+
+describe("arXiv-minted DOIs", () => {
+  it("treats 10.48550/arXiv.* as an arXiv id, not a DOI", () => {
+    // These are registered with DataCite, so Crossref 404s on them, and
+    // OpenAlex often has no record of a fresh preprint. arXiv's own API
+    // always resolves the id, which is right there in the string.
+    const list = parseSeedList("https://doi.org/10.48550/arXiv.2608.04079");
+    expect(list.arxivIds).toEqual(["2608.04079"]);
+    expect(list.dois).toEqual([]);
+  });
+
+  it("handles the bare form and mixed case", () => {
+    expect(parseSeedList("10.48550/ARXIV.2401.12345").arxivIds).toEqual(["2401.12345"]);
+  });
+
+  it("leaves ordinary DOIs alone", () => {
+    const list = parseSeedList("https://doi.org/10.1103/PhysRevA.108.022412");
+    expect(list.dois).toEqual(["10.1103/physreva.108.022412"]);
+    expect(list.arxivIds).toEqual([]);
+  });
+
+  it("de-duplicates a paper given as both an arXiv DOI and a bare id", () => {
+    expect(parseSeedList("10.48550/arXiv.2401.12345\n2401.12345").arxivIds).toEqual([
+      "2401.12345",
+    ]);
+  });
+});

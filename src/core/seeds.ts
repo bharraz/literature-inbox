@@ -29,6 +29,19 @@ const ARXIV_NEW = /^\d{4}\.\d{4,5}$/;
 const ARXIV_OLD = /^[a-z-]+(\.[A-Za-z]{2})?\/\d{7}$/;
 
 /**
+ * arXiv mints its own DOIs under the `10.48550` prefix.
+ *
+ * These look like ordinary DOIs and are not: they are registered with
+ * **DataCite**, so Crossref answers 404, and OpenAlex often has no record of a
+ * fresh preprint either. The arXiv id is right there inside the string, and
+ * arXiv's own API resolves it every time — so unwrap it rather than sending a
+ * doomed DOI lookup. (Cost a real "why didn't this work": a pasted
+ * `https://doi.org/10.48550/arXiv.2608.04079` failed against both DOI sources
+ * while the paper sat happily on arXiv.)
+ */
+const ARXIV_DOI = /^10\.48550\/arxiv\.(\S+)$/i;
+
+/**
  * Split on newlines and whitespace, but **not** on commas: a comma is legal
  * inside a DOI, and splitting on it would quietly corrupt one. A pasted
  * comma-separated list still works, because the separator is almost always
@@ -44,7 +57,7 @@ function tokenize(raw: string): string[] {
 /** Strip the prefixes people paste around an arXiv id, including a version
  * suffix — `2401.12345v3` and `2401.12345` are the same paper. */
 function asArxivId(token: string): string | undefined {
-  let value = token.trim();
+  let value = arxivIdFromDoi(token) ?? token.trim();
   const urlMatch = value.match(/arxiv\.org\/(?:abs|pdf)\/(\S+)/i);
   if (urlMatch?.[1]) value = urlMatch[1];
   value = value.replace(/^arxiv:/i, "").replace(/\.pdf$/i, "");
@@ -58,7 +71,17 @@ function asArxivId(token: string): string | undefined {
 
 function asDoi(token: string): string | undefined {
   const value = normalizeDoi(token.replace(/^doi:/i, ""));
-  return value && DOI_PATTERN.test(value) ? value : undefined;
+  if (!value || !DOI_PATTERN.test(value)) return undefined;
+  // An arXiv-minted DOI is an arXiv id wearing a costume — see ARXIV_DOI.
+  if (ARXIV_DOI.test(value)) return undefined;
+  return value;
+}
+
+/** The arXiv id inside an arXiv-minted DOI, if that is what this is. */
+function arxivIdFromDoi(token: string): string | undefined {
+  const value = normalizeDoi(token.replace(/^doi:/i, ""));
+  const match = value?.match(ARXIV_DOI);
+  return match?.[1];
 }
 
 /**
