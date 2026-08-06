@@ -716,7 +716,11 @@ ${content.slice(marker)}`;
     const missing: string[] = [];
 
     if (list.dois.length > 0) {
-      const found = await this.openAlex().worksByDois(list.dois);
+      // Through the composed resolver, not OpenAlex directly: pasting DOIs is
+      // the main way to build a personal graph, and it should not stop working
+      // because OpenAlex's daily allowance is spent. Crossref answers the same
+      // question for free.
+      const found = await doiResolver(this.openAlex(), this.crossref()).worksByDois(list.dois);
       works.push(...found);
       const resolved = new Set(
         found.map((work) => work.doi).filter((doi): doi is string => Boolean(doi)),

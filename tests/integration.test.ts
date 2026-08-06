@@ -627,6 +627,9 @@ describe("starting-graph modes", () => {
     const { app, plugin } = await bootPlugin((p) => {
       p.settings.kernelMode = "seeds";
       p.settings.kernelSeeds = "10.1234/one\nhttps://doi.org/10.1234/two";
+      // Isolated to OpenAlex, so this measures batching rather than the
+      // Crossref fallback (which fires for any record lacking references).
+      p.settings.crossrefEnabled = false;
     });
 
     await plugin.buildKernel();
