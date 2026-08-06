@@ -20,8 +20,59 @@ import type { Work, WorkId } from "./types";
 
 /** The narrow slice of the OpenAlex client this needs. */
 export interface ReferenceResolver {
-  workByDoi(doi: string): Promise<Work | undefined>;
+  /** Batched: one request per 50 DOIs rather than one per DOI. */
+  worksByDois(dois: string[]): Promise<Work[]>;
   workByTitle(title: string): Promise<Work | undefined>;
+}
+
+/**
+ * When to re-ask about a paper that had no references last time.
+ *
+ * Days since the arrival, per attempt: the next day, a few days later, then
+ * about a month. A preprint OpenAlex has not indexed within a day is often
+ * indexed within a week; one still missing after a month usually never will
+ * be. Three widening tries catch the realistic cases without re-querying every
+ * isolated dot on every run forever — which is what this replaces, and which
+ * cost roughly 25 requests per update indefinitely.
+ */
+export const BACKFILL_SCHEDULE_DAYS = [0, 4, 30];
+
+export interface BackfillProgress {
+  /** How many lookups have already been spent on this note. */
+  backfillAttempts?: number;
+  /** `YYYY-MM-DD` of the last lookup. */
+  lastBackfillOn?: string;
+}
+
+function daysBetween(from: string, to: string): number {
+  const start = Date.parse(`${from}T00:00:00Z`);
+  const end = Date.parse(`${to}T00:00:00Z`);
+  if (Number.isNaN(start) || Number.isNaN(end)) return 0;
+  return Math.round((end - start) / 86_400_000);
+}
+
+/**
+ * Is this note due for another lookup?
+ *
+ * False once the schedule is exhausted — that is the give-up, and the caller
+ * marks the note so the user can see it was tried and failed rather than
+ * silently skipped.
+ */
+export function isDueForBackfill(
+  progress: BackfillProgress,
+  arrivedOn: string,
+  today: string,
+): boolean {
+  const attempts = progress.backfillAttempts ?? 0;
+  if (attempts >= BACKFILL_SCHEDULE_DAYS.length) return false;
+  if (progress.lastBackfillOn === today) return false;
+  const dueAfter = BACKFILL_SCHEDULE_DAYS[attempts] as number;
+  return daysBetween(arrivedOn, today) >= dueAfter;
+}
+
+/** True once every scheduled attempt has been spent. */
+export function hasGivenUp(progress: BackfillProgress): boolean {
+  return (progress.backfillAttempts ?? 0) >= BACKFILL_SCHEDULE_DAYS.length;
 }
 
 export interface BackfillCandidate {
@@ -68,6 +119,24 @@ export async function backfillReferences(
 ): Promise<BackfillOutcome[]> {
   const outcomes: BackfillOutcome[] = [];
 
+  // Everything with a DOI resolves in one batched request rather than one
+  // request each — the single biggest saving available here.
+  const withDoi = candidates
+    .filter((candidate) => !candidate.hasEdges && doiFrom(candidate.originIds))
+    .slice(0, limit);
+  const byDoi = new Map<string, Work>();
+  if (withDoi.length > 0) {
+    try {
+      const dois = withDoi.map((candidate) => doiFrom(candidate.originIds) as string);
+      for (const work of await resolver.worksByDois(dois)) {
+        const doi = normalizeDoi(work.doi);
+        if (doi) byDoi.set(doi, work);
+      }
+    } catch {
+      // A failed batch leaves every note in it exactly as it was.
+    }
+  }
+
   for (const candidate of candidates) {
     if (outcomes.length >= limit) break;
     if (candidate.hasEdges) continue;
@@ -77,7 +146,7 @@ export async function backfillReferences(
 
     try {
       if (doi) {
-        resolved = await resolver.workByDoi(doi);
+        resolved = byDoi.get(doi);
       } else if (candidate.title) {
         const guess = await resolver.workByTitle(candidate.title);
         // Only trust a title lookup when the title genuinely matches.

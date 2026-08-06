@@ -190,6 +190,8 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         (status.lastUpdate ? ` · last updated ${status.lastUpdate}` : " · never updated"),
     });
 
+    this.renderBudget(containerEl);
+
     new Setting(containerEl)
       .setName("1. What do you work on?")
       .setDesc(
@@ -268,6 +270,45 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    * meant to avoid. Changing the mode re-renders the tab, which is cheap and
    * keeps the page honest about what it will use.
    */
+  /**
+   * OpenAlex's daily allowance, as a bar.
+   *
+   * Deliberately in requests rather than currency: the allowance is metered,
+   * but the user pays nothing, and a dollar figure implies a bill that does
+   * not exist. Placed here because the expensive actions — building a graph,
+   * snowballing — are two clicks below it.
+   */
+  private renderBudget(containerEl: HTMLElement): void {
+    const budget = this.plugin.budgetGauge();
+    const wrapper = containerEl.createDiv({ cls: "setting-item-description" });
+
+    const bar = wrapper.createDiv();
+    bar.style.height = "6px";
+    bar.style.borderRadius = "3px";
+    bar.style.background = "var(--background-modifier-border)";
+    bar.style.overflow = "hidden";
+    bar.style.margin = "4px 0";
+
+    const fill = bar.createDiv();
+    fill.style.height = "100%";
+    fill.style.width = `${Math.round(budget.fraction * 100)}%`;
+    fill.style.background =
+      budget.fraction > 0.9
+        ? "var(--text-error)"
+        : budget.fraction > 0.6
+          ? "var(--text-warning)"
+          : "var(--interactive-accent)";
+
+    wrapper.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        `OpenAlex daily allowance: ${budget.label}. ` +
+        (budget.fraction > 0.9
+          ? "Nearly used up — it resets at midnight UTC."
+          : "Resets at midnight UTC."),
+    });
+  }
+
   private renderStartingGraph(containerEl: HTMLElement): void {
     const mode = this.plugin.settings.kernelMode;
 

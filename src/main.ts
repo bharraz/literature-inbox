@@ -12,7 +12,7 @@
 import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
-import { OpenAlexClient } from "./core/openalex";
+import { OpenAlexClient, OPENALEX_BASE_URL } from "./core/openalex";
 import { PlanRequiredError, RateLimitError } from "./core/http";
 import { backfillDois, fetchFeed, newestItem } from "./core/rss";
 import {
@@ -34,9 +34,22 @@ import {
 import { parseNoteIdentity } from "./core/note-identity";
 import { runUpdate, writeInboxPage, type InboxRecord, type UpdateReport } from "./core/update";
 import { applyPrune, planPrune } from "./core/prune";
-import { backfillReferences, type BackfillCandidate } from "./core/backfill";
+import {
+  backfillReferences,
+  hasGivenUp,
+  isDueForBackfill,
+  type BackfillCandidate,
+} from "./core/backfill";
+import {
+  emptyBudget,
+  gauge,
+  recordRequests,
+  utcDay,
+  type BudgetGauge,
+  type BudgetState,
+} from "./core/budget";
 import { CitationIndex } from "./core/citations";
-import { appendCitations, type SubjectOptions } from "./core/notes";
+import { GENERATED_END, appendCitations, type SubjectOptions } from "./core/notes";
 import { contentHash } from "./core/hash";
 import { runExecutable, type Spawner } from "./core/launcher";
 import { runKernel } from "./core/kernel";
@@ -60,6 +73,10 @@ import {
 interface PersistedData {
   settings: LiteratureInboxSettings;
   inbox: InboxRecord[];
+  budget?: BudgetState;
+  /** DOI -> OpenAlex id for kept papers, so adjacency stops re-resolving the
+   * same library on every run. The mapping never changes. */
+  openAlexIdByDoi?: Record<string, string>;
 }
 
 function todayIso(): string {
@@ -79,6 +96,12 @@ const LIBRARY_SEED_LIMIT = 50;
  * library is a hit — and the cost is one request per 25 anchors.
  */
 const ADJACENCY_ANCHOR_LIMIT = 100;
+
+/** Shown in a note whose references were looked for and never found. */
+const UNINDEXED_NOTICE =
+  "> **No citation links found.** OpenAlex has not indexed this paper's " +
+  "references, so it can't be wired into your graph yet. Checked three times " +
+  "over about a month; it won't be checked again.";
 
 /**
  * Turn a fetch failure into something the user can act on.
@@ -114,6 +137,8 @@ function describeFetchError(error: unknown, fetched: number, mailto: string): st
 export default class LiteratureInboxPlugin extends Plugin {
   override settings: LiteratureInboxSettings = { ...DEFAULT_SETTINGS };
   private inbox: InboxRecord[] = [];
+  private budget: BudgetState = emptyBudget(utcDay());
+  private openAlexIdByDoi: Record<string, string> = {};
   private running = false;
   /** The OpenAlex client for the run in progress, if any — see openAlex(). */
   private runClient?: OpenAlexClient;
@@ -231,10 +256,17 @@ export default class LiteratureInboxPlugin extends Plugin {
     this.settings.feeds = migrateFeedList(this.settings.rssFeeds, this.settings.feeds);
     delete this.settings.rssFeeds;
     this.inbox = Array.isArray(data?.inbox) ? (data?.inbox as InboxRecord[]) : [];
+    this.budget = data?.budget ?? emptyBudget(utcDay());
+    this.openAlexIdByDoi = data?.openAlexIdByDoi ?? {};
   }
 
   private async persist(): Promise<void> {
-    await this.saveData({ settings: this.settings, inbox: this.inbox } satisfies PersistedData);
+    await this.saveData({
+      settings: this.settings,
+      inbox: this.inbox,
+      budget: this.budget,
+      openAlexIdByDoi: this.openAlexIdByDoi,
+    } satisfies PersistedData);
   }
 
   async saveSettings(): Promise<void> {
@@ -244,7 +276,22 @@ export default class LiteratureInboxPlugin extends Plugin {
   // --- shared helpers ------------------------------------------------------
 
   private transport() {
-    return new ObsidianTransport();
+    // Every request the plugin makes passes through here, which makes it the
+    // only honest place to count them against OpenAlex's daily allowance.
+    const inner = new ObsidianTransport();
+    return {
+      get: async (url: string) => {
+        if (url.startsWith(OPENALEX_BASE_URL)) {
+          this.budget = recordRequests(this.budget, 1);
+        }
+        return inner.get(url);
+      },
+    };
+  }
+
+  /** What to draw in the settings gauge. */
+  budgetGauge(): BudgetGauge {
+    return gauge(this.budget, utcDay());
   }
 
   /**
@@ -348,12 +395,34 @@ export default class LiteratureInboxPlugin extends Plugin {
       ADJACENCY_ANCHOR_LIMIT,
     );
     const anchors = [...openAlexIds];
-    if (dois.length > 0) {
-      for (const work of await this.openAlex().worksByDois(dois)) {
+
+    // A DOI's OpenAlex id never changes, so resolving the same library note
+    // on every single run is pure waste. Cache the mapping and only ask about
+    // DOIs we have not seen before.
+    const unknown: string[] = [];
+    for (const doi of dois) {
+      const cached = this.openAlexIdByDoi[doi];
+      if (cached) {
+        if (!anchors.includes(cached)) anchors.push(cached);
+      } else {
+        unknown.push(doi);
+      }
+    }
+
+    if (unknown.length > 0) {
+      let learned = false;
+      for (const work of await this.openAlex().worksByDois(unknown)) {
+        const doi = work.doi;
         for (const id of work.ids) {
-          if (id.namespace === "openalex" && !anchors.includes(id.value)) anchors.push(id.value);
+          if (id.namespace !== "openalex") continue;
+          if (!anchors.includes(id.value)) anchors.push(id.value);
+          if (doi && this.openAlexIdByDoi[doi] !== id.value) {
+            this.openAlexIdByDoi[doi] = id.value;
+            learned = true;
+          }
         }
       }
+      if (learned) await this.persist();
     }
     return anchors;
   }
@@ -467,15 +536,23 @@ export default class LiteratureInboxPlugin extends Plugin {
     const adapter = this.adapter();
     const candidates: BackfillCandidate[] = [];
 
+    const today = todayIso();
+    const due: InboxRecord[] = [];
     for (const record of this.inbox) {
       const content = await adapter.read(record.notePath);
       if (content === undefined) continue;
       if (contentHash(content) !== record.contentHash) continue; // user edited it
+      const hasEdges = content.includes("## Citations");
+      // Only ask about notes that are actually due. Without this, every
+      // isolated arrival was re-queried on every run forever — around 25
+      // requests per update against a daily allowance of roughly 100.
+      if (!hasEdges && !isDueForBackfill(record, record.arrivedOn, today)) continue;
+      if (!hasEdges) due.push(record);
       candidates.push({
         notePath: record.notePath,
         originIds: record.originIds,
         title: record.title,
-        hasEdges: content.includes("## Citations"),
+        hasEdges,
       });
     }
     if (candidates.length === 0) return 0;
@@ -486,7 +563,21 @@ export default class LiteratureInboxPlugin extends Plugin {
     } catch {
       return 0; // backfill is an improvement on what's there, never a blocker
     }
-    if (outcomes.length === 0) return 0;
+
+    // Spend an attempt on everything we asked about, whether or not it
+    // resolved — that is what makes the schedule widen rather than repeat.
+    const resolvedPaths = new Set(outcomes.map((outcome) => outcome.notePath));
+    for (const record of due) {
+      record.backfillAttempts = (record.backfillAttempts ?? 0) + 1;
+      record.lastBackfillOn = today;
+      if (!resolvedPaths.has(record.notePath) && hasGivenUp(record)) {
+        await this.markUnindexed(record);
+      }
+    }
+    if (outcomes.length === 0) {
+      await this.persist();
+      return 0;
+    }
 
     // Resolve the new references against everything the vault knows, so the
     // edges point at real notes rather than dangling.
@@ -527,6 +618,28 @@ export default class LiteratureInboxPlugin extends Plugin {
   /** Re-read the papers folder. Cheap, local, and no network. */
   private async refreshKeptCount(): Promise<void> {
     this.keptCount = (await this.adapter().list(this.settings.papersFolder)).length;
+  }
+
+  /**
+   * Say on the note itself that we looked and found nothing.
+   *
+   * A paper OpenAlex never indexed would otherwise sit as an unexplained
+   * isolated dot forever, indistinguishable from one we simply hadn't got to.
+   */
+  private async markUnindexed(record: InboxRecord): Promise<void> {
+    const adapter = this.adapter();
+    const content = await adapter.read(record.notePath);
+    if (content === undefined) return;
+    if (contentHash(content) !== record.contentHash) return; // user edited it
+    if (content.includes(UNINDEXED_NOTICE)) return;
+
+    const marker = content.indexOf(GENERATED_END);
+    if (marker === -1) return;
+    const updated = `${content.slice(0, marker)}${UNINDEXED_NOTICE}
+
+${content.slice(marker)}`;
+    await adapter.write(record.notePath, updated);
+    record.contentHash = contentHash(updated);
   }
 
   /** Counts shown at the top of the settings page, so the plugin's state is

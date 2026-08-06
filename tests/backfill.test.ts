@@ -22,7 +22,7 @@ const candidate = (overrides: Partial<BackfillCandidate> = {}): BackfillCandidat
 });
 
 const noResolver = {
-  workByDoi: async () => undefined,
+  worksByDois: async () => [],
   workByTitle: async () => undefined,
 };
 
@@ -32,7 +32,7 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate({ hasEdges: true })],
       {
-        workByDoi: async () => { called = true; return undefined; },
+        worksByDois: async () => { called = true; return []; },
         workByTitle: async () => { called = true; return undefined; },
       },
       titlesMatch,
@@ -45,9 +45,10 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate({ originIds: ["doi:10.1/x", "arxiv:2401.12345"] })],
       {
-        workByDoi: async (doi) => {
-          expect(doi).toBe("10.1/x");
-          return resolvedWork("A Fresh Preprint About Things", ["W9"], "10.1/x");
+        worksByDois: async (dois: string[]) => {
+          // One request for every DOI in the run, not one request each.
+          expect(dois).toEqual(["10.1/x"]);
+          return [resolvedWork("A Fresh Preprint About Things", ["W9"], "10.1/x")];
         },
         workByTitle: async () => {
           throw new Error("must not fall back to title when a DOI is known");
@@ -63,7 +64,7 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate()],
       {
-        workByDoi: async () => undefined,
+        worksByDois: async () => [],
         workByTitle: async () => resolvedWork("a fresh preprint about things!", ["W9"], "10.1/y"),
       },
       titlesMatch,
@@ -80,7 +81,7 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate()],
       {
-        workByDoi: async () => undefined,
+        worksByDois: async () => [],
         workByTitle: async () => resolvedWork("An Entirely Different Paper", ["W9"]),
       },
       titlesMatch,
@@ -92,7 +93,7 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate()],
       {
-        workByDoi: async () => undefined,
+        worksByDois: async () => [],
         workByTitle: async () => resolvedWork("A Fresh Preprint About Things", []),
       },
       titlesMatch,
@@ -104,7 +105,7 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       [candidate({ originIds: ["doi:10.1/x"] })],
       {
-        workByDoi: async () => resolvedWork("A Fresh Preprint About Things", ["W9"], "10.1/x"),
+        worksByDois: async () => [resolvedWork("A Fresh Preprint About Things", ["W9"], "10.1/x")],
         workByTitle: async () => undefined,
       },
       titlesMatch,
@@ -112,24 +113,40 @@ describe("backfillReferences", () => {
     expect(outcomes[0]?.newIds).not.toContain("doi:10.1/x");
   });
 
-  it("survives a lookup failure without losing the other candidates", async () => {
-    let call = 0;
+  it("returns nothing rather than throwing when the batch fails", async () => {
+    // Batching trades failure granularity for cost: one dead request now
+    // means no references for that whole batch, where individual lookups
+    // would have isolated it. That is the right trade only because the retry
+    // schedule exists — those notes are simply due again later, and a run
+    // that fails must still leave every note exactly as it was.
     const outcomes = await backfillReferences(
       [
-        candidate({ notePath: "Inbox/Fails.md", originIds: ["doi:10.1/fail"] }),
-        candidate({ notePath: "Inbox/Works.md", originIds: ["doi:10.1/ok"] }),
+        candidate({ notePath: "Inbox/One.md", originIds: ["doi:10.1/one"] }),
+        candidate({ notePath: "Inbox/Two.md", originIds: ["doi:10.1/two"] }),
       ],
       {
-        workByDoi: async () => {
-          call += 1;
-          if (call === 1) throw new Error("offline");
-          return resolvedWork("A Fresh Preprint About Things", ["W9"], "10.1/ok");
+        worksByDois: async () => {
+          throw new Error("offline");
         },
         workByTitle: async () => undefined,
       },
       titlesMatch,
     );
-    expect(outcomes.map((o) => o.notePath)).toEqual(["Inbox/Works.md"]);
+    expect(outcomes).toEqual([]);
+  });
+
+  it("still falls back to a title lookup when a note has no DOI", async () => {
+    const outcomes = await backfillReferences(
+      [candidate({ notePath: "Inbox/Titled.md", originIds: ["arxiv:2401.1"] })],
+      {
+        worksByDois: async () => {
+          throw new Error("should not be asked: no DOIs among the candidates");
+        },
+        workByTitle: async () => resolvedWork("A Fresh Preprint About Things", ["W9"]),
+      },
+      titlesMatch,
+    );
+    expect(outcomes.map((o) => o.notePath)).toEqual(["Inbox/Titled.md"]);
   });
 
   it("caps how many lookups one run performs", async () => {
@@ -139,7 +156,8 @@ describe("backfillReferences", () => {
     const outcomes = await backfillReferences(
       many,
       {
-        workByDoi: async (doi) => resolvedWork("A Fresh Preprint About Things", ["W9"], doi),
+        worksByDois: async (dois: string[]) =>
+          dois.map((doi) => resolvedWork("A Fresh Preprint About Things", ["W9"], doi)),
         workByTitle: async () => undefined,
       },
       titlesMatch,

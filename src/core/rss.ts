@@ -145,10 +145,17 @@ export async function backfillDois(
   works: Work[],
   resolver: TitleResolver,
   titlesMatchFn: (a: string | undefined, b: string | undefined) => boolean,
+  limit = 25,
 ): Promise<number> {
   let resolved = 0;
+  let spent = 0;
   for (const work of works) {
     if (work.doi || !work.title) continue;
+    // One title search per item, and titles cannot be batched — so this is
+    // capped. An uncapped noisy feed was the second-largest source of
+    // requests in a run, after per-note reference lookups.
+    if (spent >= limit) break;
+    spent += 1;
     let candidate: Work | undefined;
     try {
       candidate = await resolver.workByTitle(work.title);

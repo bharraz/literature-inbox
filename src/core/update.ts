@@ -36,6 +36,9 @@ export interface InboxRecord {
    * run and silently vanish on the next.
    */
   edgeCount?: number;
+  /** Backfill attempts spent so far, and when the last one ran. */
+  backfillAttempts?: number;
+  lastBackfillOn?: string;
 }
 
 /** The minimum this module needs from Obsidian, kept narrow so tests can

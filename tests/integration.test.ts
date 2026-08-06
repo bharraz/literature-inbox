@@ -109,6 +109,21 @@ async function runCommand(plugin: LiteratureInboxPlugin, id: string): Promise<vo
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Pretend *days* have passed since each inbox note arrived and was last
+ * checked, so a scheduled retry becomes due without waiting for the clock.
+ */
+function ageBackfillState(plugin: LiteratureInboxPlugin, days: number): void {
+  const shift = (iso: string | undefined) => {
+    const base = iso ? Date.parse(`${iso}T00:00:00Z`) : Date.now();
+    return new Date(base - days * 86_400_000).toISOString().slice(0, 10);
+  };
+  for (const record of (plugin as never as { inbox: Record<string, unknown>[] }).inbox) {
+    record.arrivedOn = shift(record.arrivedOn as string | undefined);
+    if (record.lastBackfillOn) record.lastBackfillOn = shift(record.lastBackfillOn as string);
+  }
+}
+
 function enableOpenAlex(plugin: LiteratureInboxPlugin, topic = "transformers") {
   plugin.settings.openAlexEnabled = true;
   plugin.settings.openAlexTopic = topic;
@@ -1243,12 +1258,49 @@ describe("citation backfill", () => {
     const first = app.vault.files.get("Inbox/An Isolated Preprint Paper.md") as string;
     expect(first).not.toContain("## Citations");
 
+    // Backfill is scheduled, not repeated: a second run the same day
+    // deliberately does not re-ask. Age the record to stand in for a later
+    // day, which is when the retry is actually due.
+    ageBackfillState(plugin, 5);
+
     phase = 1;
     await runCommand(plugin, "update-inbox");
 
     const second = app.vault.files.get("Inbox/An Isolated Preprint Paper.md") as string;
     expect(second).toContain("## Citations");
     expect(second).toContain("[[A Paper I Kept]]");
+  });
+
+  it("does not re-ask about the same isolated arrival twice in one day", async () => {
+    // This is the saving: previously every edge-less arrival was re-queried on
+    // every run, forever — around 25 requests per update against a daily
+    // allowance of roughly 100.
+    let phase = 0;
+    stagedResponder(() => phase);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    clearRequests();
+    phase = 1;
+    await runCommand(plugin, "update-inbox");
+
+    expect(requestedUrls.some((url) => url.includes("title.search"))).toBe(false);
+  });
+
+  it("gives up after three tries and says so on the note", async () => {
+    let phase = 0;
+    stagedResponder(() => phase);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    // Three scheduled attempts: the next day, a few days later, then a month.
+    for (const days of [2, 10, 40]) {
+      ageBackfillState(plugin, days);
+      await runCommand(plugin, "update-inbox");
+    }
+
+    const note = app.vault.files.get("Inbox/An Isolated Preprint Paper.md") as string;
+    expect(note).toContain("No citation links found");
   });
 
   it("never rewrites a note the user has edited", async () => {
