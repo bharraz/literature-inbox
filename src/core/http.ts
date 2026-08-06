@@ -33,6 +33,27 @@ export class NotFoundError extends FetchError {
 export interface TransportResponse {
   status: number;
   text: string;
+  /** `Retry-After` header, when the server sent one. Seconds, or an HTTP date. */
+  retryAfter?: string;
+}
+
+/** A 429 that the caller should treat as "stop asking", not "try the next
+ * thing" — see `RateLimitError` handling in the clients. */
+export class RateLimitError extends FetchError {
+  constructor(message: string, readonly retryAfterMs?: number) {
+    super(message, 429);
+    this.name = "RateLimitError";
+  }
+}
+
+/** Seconds, or an HTTP date, into milliseconds to wait. */
+export function parseRetryAfter(value: string | undefined, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return undefined;
+  return Math.max(0, date - now);
 }
 
 export interface Transport {
@@ -85,6 +106,18 @@ export async function getWithRetry(
     if (response.status >= 200 && response.status < 300) {
       return response.text;
     }
+    if (response.status === 429) {
+      // Honour the server's own number when it gives one, rather than our
+      // guess — and surface 429 as its own type, so a caller looping over
+      // batches can stop instead of hammering a service that just asked it
+      // to slow down.
+      const wait = parseRetryAfter(response.retryAfter);
+      lastError = new RateLimitError(`rate limited by ${url}`, wait);
+      if (attempt === maxRetries) break;
+      await sleep(wait ?? backoffSeconds * 2 ** attempt * 1000);
+      continue;
+    }
+
     lastError = new FetchError(`HTTP ${response.status} for ${url}`, response.status);
     if (!isRetryable(response.status) || attempt === maxRetries) break;
     await sleep(backoffSeconds * 2 ** attempt * 1000);

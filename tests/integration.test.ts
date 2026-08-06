@@ -96,8 +96,16 @@ async function runCommand(plugin: LiteratureInboxPlugin, id: string): Promise<vo
   if (!command) throw new Error(`no such command: ${id}`);
   if (command.callback) command.callback();
   else command.checkCallback?.(false);
-  // Commands kick off async work without awaiting; let it settle.
+  // Commands kick off async work without awaiting. Waiting a fixed couple of
+  // ticks used to be enough; now that one rate limiter paces a whole run, a
+  // multi-request command genuinely takes time, so wait on the plugin's own
+  // busy flag instead of guessing.
   await new Promise((resolve) => setTimeout(resolve, 0));
+  const state = plugin as never as { running: boolean };
+  const deadline = Date.now() + 10_000;
+  while (state.running && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
@@ -160,7 +168,7 @@ describe("plugin load", () => {
 // --- the update run -----------------------------------------------------------------
 
 describe("update inbox", () => {
-  it("writes a note per arrival, plus the inbox page", async () => {
+  it("writes a note per arrival", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
 
@@ -168,7 +176,18 @@ describe("update inbox", () => {
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
     expect(app.vault.files.has("Inbox/A Paper About Attention.md")).toBe(true);
-    expect(app.vault.files.has("Inbox/_Inbox.md")).toBe(true);
+  });
+
+  it("writes no _Inbox.md by default, so nothing becomes a graph hub", async () => {
+    // The page links every arrival, which in the graph pulls them into a star
+    // around a file that means nothing — competing with the citation edges
+    // that are the entire point.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+
+    await runCommand(plugin, "update-inbox");
+
+    expect(app.vault.files.has("Inbox/_Inbox.md")).toBe(false);
   });
 
   it("creates the inbox folder rather than failing to write into it", async () => {
@@ -899,7 +918,10 @@ describe("the inbox front page", () => {
     // The signal that makes the page worth reading. It is computed at arrival
     // and stored on the record, so it survives later regenerations.
     respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.inboxPageEnabled = true;
+    });
 
     await plugin.updateInbox();
 
@@ -909,7 +931,10 @@ describe("the inbox front page", () => {
 
   it("keeps those counts when the page is rebuilt after a keep", async () => {
     respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.inboxPageEnabled = true;
+    });
     await plugin.updateInbox();
 
     const file = app.vault.getAbstractFileByPath("Inbox/A Paper About Attention.md");
@@ -1123,11 +1148,13 @@ describe("the plugin's visible surface", () => {
     expect(headings).toContain("Cleanup — manual only");
   });
 
-  it("puts the starting-graph action in front of the user", async () => {
+  it("puts the add-papers action in front of the user", async () => {
+    // Named for a thing you do repeatedly, not a one-off "build": adding to
+    // the graph is meant to be re-run whenever you like.
     const { plugin } = await bootPlugin();
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
-    const kernel = allSettings.find((s: Setting) => s.name.includes("starting graph"));
-    expect(kernel?.buttons[0]?.text).toBe("Build starting graph");
+    const kernel = allSettings.find((s: Setting) => s.name.includes("Add papers to your graph"));
+    expect(kernel?.buttons[0]?.text).toBe("Add papers");
   });
 
   it("wires the settings buttons to real actions", async () => {

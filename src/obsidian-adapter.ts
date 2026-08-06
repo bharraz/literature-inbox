@@ -23,7 +23,10 @@ export class ObsidianTransport implements Transport {
       // can decide what is retryable.
       throw: false,
     });
-    return { status: response.status, text: response.text };
+    // `Retry-After` is how a 429 tells us how long to wait. Ignoring it and
+    // guessing is what turns one rate-limit into a stampede.
+    const retryAfter = response.headers?.["retry-after"] ?? response.headers?.["Retry-After"];
+    return { status: response.status, text: response.text, retryAfter };
   }
 }
 

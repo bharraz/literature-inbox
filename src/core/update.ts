@@ -54,6 +54,8 @@ export interface UpdateSettings {
   papersFolder: string;
   maxArrivalsPerRun: number;
   subjects?: SubjectOptions;
+  /** When false, `_Inbox.md` is not written — see the setting's rationale. */
+  inboxPageEnabled?: boolean;
 }
 
 export type SkipReason = "already-in-vault" | "already-in-inbox" | "duplicate-in-batch";
@@ -241,6 +243,7 @@ export async function writeInboxPage(
   settings: UpdateSettings,
   adapter: VaultAdapter,
 ): Promise<void> {
+  if (settings.inboxPageEnabled === false) return;
   const entries: InboxEntry[] = inbox.map((record) => {
     const base = record.notePath.split("/").pop() ?? record.notePath;
     const filename = base.endsWith(".md") ? base.slice(0, -3) : base;

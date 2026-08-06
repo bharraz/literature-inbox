@@ -19,7 +19,14 @@ import {
   DOI,
   OPENALEX,
 } from "./ids";
-import { RateLimiter, buildUrl, getWithRetry, NotFoundError, type Transport } from "./http";
+import {
+  RateLimiter,
+  RateLimitError,
+  buildUrl,
+  getWithRetry,
+  NotFoundError,
+  type Transport,
+} from "./http";
 import { emptyWork, type Author, type Work } from "./types";
 
 export const OPENALEX_BASE_URL = "https://api.openalex.org/works";
@@ -92,6 +99,13 @@ export function passesSanityFilters(data: any, maxFutureDays = 60, today = new D
  * these ranked, so taking the head keeps the useful ones.
  */
 const MAX_SUBJECT_TERMS = 8;
+
+/**
+ * How many ids go into one `cites:` filter. Fewer requests is the point: at 25
+ * a hundred anchors cost four round trips, which is four chances to be rate
+ * limited before a single paper arrives.
+ */
+const ADJACENCY_BATCH = 50;
 
 function subjectTerms(list: unknown): string[] {
   if (!Array.isArray(list)) return [];
@@ -201,6 +215,7 @@ export class OpenAlexClient {
   }
 
   private async getJson(url: string): Promise<any> {
+    if (this.rateLimited) throw this.rateLimited;
     await this.limiter.wait();
     const body = await getWithRetry(this.transport, url, {
       maxRetries: this.options.maxRetries,
@@ -227,9 +242,23 @@ export class OpenAlexClient {
     try {
       await work();
     } catch (error) {
+      // A rate limit means "stop asking", so remember it and let every later
+      // fetch on this client bail immediately. Without this, an outer loop
+      // over batches would keep issuing requests — each with its own retry
+      // ladder — against a service that had just asked us to back off, and
+      // report the same failure once per batch.
+      if (error instanceof RateLimitError) this.rateLimited = error;
       onPartial(error, collected.length);
     }
     return collected;
+  }
+
+  /** True once the API has rate-limited this client. Latches for the run. */
+  private rateLimited?: RateLimitError;
+
+  /** Whether the run has been told to stop. */
+  wasRateLimited(): boolean {
+    return this.rateLimited !== undefined;
   }
 
   /** Cursor-paginated fetch, junk-filtered, stopping at `limit`. */
@@ -368,8 +397,8 @@ export class OpenAlexClient {
     const seen = new Set<string>();
 
     return this.tolerant(results, async () => {
-      for (const chunk of chunked(ids, 25)) {
-        if (results.length >= limit) break;
+      for (const chunk of chunked(ids, ADJACENCY_BATCH)) {
+        if (results.length >= limit || this.rateLimited) break;
         const filter = [
           `cites:${chunk.join("|")}`,
           this.typeFilter(),
@@ -399,8 +428,8 @@ export class OpenAlexClient {
     // OpenAlex caps a filter's OR list, so ask in batches and merge. Each
     // batch gets the full limit; duplicates across batches are expected,
     // since one paper often cites several seeds.
-    for (const chunk of chunked(ids, 25)) {
-      if (results.length >= limit) break;
+    for (const chunk of chunked(ids, ADJACENCY_BATCH)) {
+      if (results.length >= limit || this.rateLimited) break;
       const filter = `cites:${chunk.join("|")},${this.typeFilter()}`;
       for (const work of await this.paginated(filter, "cited_by_count:desc", limit)) {
         if (seen.has(work.key)) continue;

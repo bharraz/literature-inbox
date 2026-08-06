@@ -22,9 +22,11 @@ import type { Transport, TransportResponse } from "../src/core/http";
 const FIXTURES = join(__dirname, "fixtures");
 const load = (name: string) => readFileSync(join(FIXTURES, name), "utf-8");
 
+type CannedResponse = string | { status: number; text: string; retryAfter?: string };
+
 class SequenceTransport implements Transport {
   readonly requested: string[] = [];
-  constructor(private readonly bodies: (string | { status: number; text: string })[]) {}
+  constructor(private readonly bodies: CannedResponse[]) {}
 
   async get(url: string): Promise<TransportResponse> {
     this.requested.push(url);
@@ -35,7 +37,7 @@ class SequenceTransport implements Transport {
 }
 
 const noSleep = async () => {};
-const clientWith = (bodies: (string | { status: number; text: string })[], today?: Date) => {
+const clientWith = (bodies: CannedResponse[], today?: Date) => {
   const transport = new SequenceTransport(bodies);
   const client = new OpenAlexClient(transport, {
     mailto: "test@example.com",
@@ -239,12 +241,12 @@ describe("adjacency selection", () => {
   });
 
   it("batches anchors and de-duplicates papers citing more than one", async () => {
-    const anchors = Array.from({ length: 30 }, (_, i) => `W${i}`);
+    const anchors = Array.from({ length: 60 }, (_, i) => `W${i}`);
     const { client, transport } = clientWith([page([record("X1")]), page([record("X1")])]);
 
     const works = await client.worksCitingSince(anchors, "2026-07-01", 25);
 
-    expect(transport.requested).toHaveLength(2); // 25 anchors per batch
+    expect(transport.requested).toHaveLength(2); // 50 anchors per batch
     expect(works).toHaveLength(1);
   });
 });
@@ -301,6 +303,66 @@ describe("partial fetches", () => {
 
     expect(works).toHaveLength(1);
     expect(partials).toEqual([1]);
+  });
+});
+
+describe("being rate limited", () => {
+  const page = (results: unknown[]) => JSON.stringify({ results, meta: { next_cursor: null } });
+  const tooMany = { status: 429, text: "slow down" };
+
+  it("stops asking after a 429 instead of working through every batch", async () => {
+    // The bug this guards: an outer loop over anchor batches caught each
+    // failure, continued to the next batch, and ran a fresh retry ladder
+    // against a service that had just asked us to back off — reporting the
+    // same failure once per batch.
+    const partials: number[] = [];
+    const transport = new SequenceTransport([tooMany, page([]), page([]), page([])]);
+    const client = new OpenAlexClient(transport, {
+      sleep: noSleep,
+      maxRetries: 0,
+      onPartialFetch: (_error, fetched) => partials.push(fetched),
+    });
+
+    const anchors = Array.from({ length: 200 }, (_, i) => `W${i}`); // four batches
+    await client.worksCitingSince(anchors, "2026-07-01", 25);
+
+    expect(transport.requested).toHaveLength(1);
+    expect(partials).toHaveLength(1);
+    expect(client.wasRateLimited()).toBe(true);
+  });
+
+  it("stays stopped for every later call on the same client", async () => {
+    // One client per run means one latch per run: once OpenAlex has said no,
+    // the topic query should not go and ask again either.
+    const transport = new SequenceTransport([tooMany]);
+    const client = new OpenAlexClient(transport, {
+      sleep: noSleep,
+      maxRetries: 0,
+      onPartialFetch: () => undefined,
+    });
+
+    await client.worksSince("quantum", "2026-07-01", 25);
+    await client.topWorks("quantum", 25);
+
+    expect(transport.requested).toHaveLength(1);
+  });
+
+  it("waits as long as the server asked", async () => {
+    const slept: number[] = [];
+    const transport = new SequenceTransport([
+      { status: 429, text: "slow down", retryAfter: "7" },
+      page([]),
+    ]);
+    const client = new OpenAlexClient(transport, {
+      sleep: async (ms) => {
+        slept.push(ms);
+      },
+      maxRetries: 1,
+    });
+
+    await client.topWorks("quantum", 5);
+
+    expect(slept).toContain(7000);
   });
 });
 

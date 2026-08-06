@@ -12,7 +12,7 @@ export type KernelMode = "topic" | "seeds" | "snowball" | "author" | "library";
 export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
   topic: "Top-cited papers on a topic",
   seeds: "A list of papers I paste",
-  snowball: "Papers I paste, plus what they cite and what cites them",
+  snowball: "Papers I paste, plus connected citations",
   author: "Everything by one author",
   library: "Expand outward from papers I already have",
 };
@@ -73,6 +73,17 @@ export interface LiteratureInboxSettings {
 
   maxArrivalsPerRun: number;
 
+  /**
+   * Whether to write `_Inbox.md`.
+   *
+   * Off by default, because it actively harms the thing it sits next to: the
+   * page wikilinks every arrival, so in the graph it becomes a hub node that
+   * wires all arrivals to each other and pulls them into a star around a file
+   * that means nothing. That competes with the citation edges the whole plugin
+   * exists to show. The inbox folder, sorted by date, is already the list.
+   */
+  inboxPageEnabled: boolean;
+
   /** Where OpenAlex's subject terms go in a generated note, if anywhere. */
   subjectPlacement: "off" | "property" | "tags";
   subjectTopics: boolean;
@@ -109,6 +120,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   kernelAuthor: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 25,
+  inboxPageEnabled: false,
   // Terms as a property by default, never as tags: tags show up in the tag
   // pane and the graph, and a vault-wide dump of machine-assigned subject
   // terms is exactly the clutter people rightly fear. Concepts stays off for
@@ -154,6 +166,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     this.renderFolders(containerEl);
     this.renderSources(containerEl);
     this.renderArrivals(containerEl);
+    this.renderInboxPageSetting(containerEl);
     this.renderNoteContent(containerEl);
     this.renderAddByHand(containerEl);
     this.renderCleanup(containerEl);
@@ -225,7 +238,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     const mode = this.plugin.settings.kernelMode;
 
     new Setting(containerEl)
-      .setName("2. Build your starting graph")
+      .setName("2. Add papers to your graph")
       .setDesc(
         `Writes papers into ${this.plugin.settings.papersFolder}/, wired to each other by ` +
           "citations. New arrivals connect to this core — without it every arrival looks " +
@@ -243,7 +256,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       })
       .addButton((button) =>
         button
-          .setButtonText("Build starting graph")
+          .setButtonText("Add papers")
           .setCta()
           .onClick(() => void this.plugin.buildKernel()),
       );
@@ -311,7 +324,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     }
 
     new Setting(containerEl)
-      .setName("Starting graph size")
+      .setName("How many papers to add")
       .setDesc(
         mode === "seeds"
           ? "Ignored in this mode: you get exactly the papers you pasted."
@@ -443,6 +456,12 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
             this.plugin.settings.arxivCategories = value;
             await this.plugin.saveSettings();
           }),
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Test categories")
+          .setTooltip("Fetch each category once — a misspelled one returns nothing, silently")
+          .onClick(() => void this.plugin.testArxivCategories()),
       );
 
     new Setting(containerEl)
@@ -647,6 +666,23 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    * zot2vault (`docs/interop-spec.md` §5) — an arbitrary template would break
    * upgrade-in-place and turn a kept note into a competing duplicate.
    */
+  private renderInboxPageSetting(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("Write an _Inbox.md index page")
+      .setDesc(
+        "Off by default, and worth leaving off. The page links every arrival, which " +
+          "makes it a hub node in the graph — arrivals cluster around that file instead " +
+          "of around the papers they cite, which is the opposite of the point. Your " +
+          "inbox folder sorted by date is already the list.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.inboxPageEnabled).onChange(async (value) => {
+          this.plugin.settings.inboxPageEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+  }
+
   private renderNoteContent(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("What goes in a note").setHeading();
     containerEl.createEl("p", {

@@ -13,6 +13,7 @@ import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
+import { RateLimitError } from "./core/http";
 import { backfillDois, fetchFeed, newestItem } from "./core/rss";
 import { effective, migrateFeedList, withinWindow } from "./core/feeds";
 import { titlesMatch, normalizeTitle } from "./core/ids";
@@ -73,10 +74,31 @@ const LIBRARY_SEED_LIMIT = 50;
  */
 const ADJACENCY_ANCHOR_LIMIT = 100;
 
+/**
+ * Turn a fetch failure into something the user can act on.
+ *
+ * A rate limit is the one failure with an actual remedy — OpenAlex runs a
+ * faster "polite pool" for anyone who supplies an email — so say so, rather
+ * than showing a raw HTTP 429 and a URL nobody can do anything with.
+ */
+function describeFetchError(error: unknown, fetched: number, mailto: string): string {
+  const gathered = fetched > 0 ? ` Kept the ${fetched} already fetched.` : "";
+  if (error instanceof RateLimitError) {
+    const advice = mailto.trim()
+      ? "Wait a minute and run it again."
+      : "Adding your email under Network and integrations puts you in OpenAlex's " +
+        "faster pool and makes this far less likely.";
+    return `OpenAlex asked us to slow down.${gathered} ${advice}`;
+  }
+  return `OpenAlex fetch failed: ${String(error)}.${gathered}`;
+}
+
 export default class LiteratureInboxPlugin extends Plugin {
   override settings: LiteratureInboxSettings = { ...DEFAULT_SETTINGS };
   private inbox: InboxRecord[] = [];
   private running = false;
+  /** The OpenAlex client for the run in progress, if any — see openAlex(). */
+  private runClient?: OpenAlexClient;
   /** Papers in the kept folder, refreshed on load and after a kernel run —
    * shown in settings so the plugin's state is legible at a glance. */
   private keptCount = 0;
@@ -98,7 +120,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     });
     this.addCommand({
       id: "build-kernel",
-      name: "Build starting graph",
+      name: "Add papers to your graph",
       callback: () => void this.buildKernel(),
     });
     this.addCommand({
@@ -213,10 +235,35 @@ export default class LiteratureInboxPlugin extends Plugin {
    * that the result is incomplete.
    */
   private openAlex(onPartial?: (error: unknown, fetched: number) => void): OpenAlexClient {
+    // Reuse the run's client when there is one. A fresh client means a fresh
+    // RateLimiter, and a limiter that only paces the calls made through one
+    // short-lived instance paces nothing at all — which is how a single update
+    // managed to burst past OpenAlex's ceiling and earn a 429.
+    if (this.runClient) return this.runClient;
     return new OpenAlexClient(this.transport(), {
       mailto: this.settings.mailto || undefined,
       onPartialFetch: onPartial,
     });
+  }
+
+  /**
+   * Run one body of work against a single OpenAlex client, so every request it
+   * makes shares one rate limiter and one "we have been told to back off"
+   * latch.
+   */
+  private async withSharedClient<T>(
+    onPartial: (error: unknown, fetched: number) => void,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    this.runClient = new OpenAlexClient(this.transport(), {
+      mailto: this.settings.mailto || undefined,
+      onPartialFetch: onPartial,
+    });
+    try {
+      return await body();
+    } finally {
+      this.runClient = undefined;
+    }
   }
 
   private adapter(): ObsidianVaultAdapter {
@@ -254,6 +301,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
       subjects: this.subjectOptions(),
+      inboxPageEnabled: this.settings.inboxPageEnabled,
     };
   }
 
@@ -319,14 +367,7 @@ export default class LiteratureInboxPlugin extends Plugin {
               "against — build a starting graph first",
           });
         } else {
-          works.push(
-            ...(await this.openAlex((error, fetched) => {
-              report.sourceErrors.push({
-                source: "Papers citing your library",
-                message: `stopped after ${fetched} — ${String(error)}`,
-              });
-            }).worksCitingSince(anchors, since, perSource)),
-          );
+          works.push(...(await this.openAlex().worksCitingSince(anchors, since, perSource)));
         }
       } catch (error) {
         report.sourceErrors.push({
@@ -343,12 +384,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     ) {
       try {
         works.push(
-          ...(await this.openAlex((error, fetched) => {
-            report.sourceErrors.push({
-              source: "OpenAlex topic",
-              message: `stopped after ${fetched} — ${String(error)}`,
-            });
-          }).worksSince(this.settings.openAlexTopic, since, perSource)),
+          ...(await this.openAlex().worksSince(this.settings.openAlexTopic, since, perSource)),
         );
       } catch (error) {
         report.sourceErrors.push({ source: "OpenAlex topic", message: String(error) });
@@ -643,8 +679,13 @@ export default class LiteratureInboxPlugin extends Plugin {
     }
 
     this.running = true;
+    const problems: string[] = [];
     try {
-      const works = await this.gatherKernelWorks();
+      const works = await this.withSharedClient(
+        (error, fetched) => problems.push(describeFetchError(error, fetched, this.settings.mailto)),
+        () => this.gatherKernelWorks(),
+      );
+      for (const problem of problems) notify(problem);
       if (works === undefined) return;
       if (works.length === 0) {
         notify("No papers found. Try a broader query, or a different starting point.");
@@ -669,9 +710,9 @@ export default class LiteratureInboxPlugin extends Plugin {
       const parts = [`${report.written.length} papers added to ${this.settings.papersFolder}/`];
       if (report.totalEdges) parts.push(`${report.totalEdges} citation links between them`);
       if (report.skipped) parts.push(`${report.skipped} you already had`);
-      notify(`Starting graph built: ${parts.join(", ")}.`);
+      notify(`Added to your graph: ${parts.join(", ")}.`);
     } catch (error) {
-      notify(`Could not build the starting graph: ${String(error)}`);
+      notify(`Could not add papers: ${String(error)}`);
     } finally {
       this.running = false;
     }
@@ -698,7 +739,14 @@ export default class LiteratureInboxPlugin extends Plugin {
       // you keep, and so does the dedup pass.
       const vault = await this.vaultIndex();
       const preliminary: UpdateReport = { arrived: [], skipped: [], sourceErrors: [] };
-      const fetched = await this.fetchAll(preliminary, vault);
+      const fetched = await this.withSharedClient(
+        (error, fetched) =>
+          preliminary.sourceErrors.push({
+            source: "OpenAlex",
+            message: describeFetchError(error, fetched, this.settings.mailto),
+          }),
+        () => this.fetchAll(preliminary, vault),
+      );
 
       const { report, inbox } = await runUpdate({
         fetched,
@@ -936,6 +984,40 @@ export default class LiteratureInboxPlugin extends Plugin {
         });
       } catch (error) {
         results.push({ url, count: 0, error: String(error) });
+      }
+    }
+    new FeedTestModal(this.app, results).open();
+  }
+
+  /**
+   * Fetch each arXiv category once and report what came back.
+   *
+   * A misspelled category is not an error at arXiv's end — `quant-ph` works,
+   * `quantph` simply returns an empty feed. Without a check that is
+   * indistinguishable from a quiet week.
+   */
+  async testArxivCategories(): Promise<void> {
+    const categories = splitList(this.settings.arxivCategories);
+    if (categories.length === 0) {
+      notify("Enter at least one arXiv category first, e.g. quant-ph.");
+      return;
+    }
+
+    notify(`Testing ${categories.length} categor(y/ies)…`);
+    const client = new ArxivClient(this.transport());
+    const results: FeedTestResult[] = [];
+    for (const category of categories) {
+      try {
+        const works = await client.categoryFeed(category, 5);
+        const newest = newestItem(works);
+        results.push({
+          url: category,
+          count: works.length,
+          newestTitle: newest?.title,
+          newestDate: newest?.date,
+        });
+      } catch (error) {
+        results.push({ url: category, count: 0, error: String(error) });
       }
     }
     new FeedTestModal(this.app, results).open();
