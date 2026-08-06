@@ -14,6 +14,7 @@ import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
 import { backfillDois, fetchFeed, newestItem } from "./core/rss";
+import { effective, migrateFeedList, withinWindow } from "./core/feeds";
 import { titlesMatch, normalizeTitle } from "./core/ids";
 import {
   EMPTY_STATE,
@@ -83,7 +84,7 @@ export default class LiteratureInboxPlugin extends Plugin {
   override async onload(): Promise<void> {
     await this.loadPersisted();
     // Cheap, local, and no network: just counts what's on disk.
-    this.keptCount = (await this.adapter().list(this.settings.papersFolder)).length;
+    await this.refreshKeptCount();
     this.addSettingTab(new LiteratureInboxSettingTab(this.app, this));
 
     // One-click access to the action people run most; everything else lives
@@ -97,7 +98,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     });
     this.addCommand({
       id: "build-kernel",
-      name: "Build starting graph (top-cited papers on your topic)",
+      name: "Build starting graph",
       callback: () => void this.buildKernel(),
     });
     this.addCommand({
@@ -184,6 +185,11 @@ export default class LiteratureInboxPlugin extends Plugin {
   private async loadPersisted(): Promise<void> {
     const data = (await this.loadData()) as Partial<PersistedData> | null;
     this.settings = { ...DEFAULT_SETTINGS, ...(data?.settings ?? {}) };
+    // Feeds used to be one newline-separated string. Convert once, then drop
+    // the old key — silently losing someone's feeds on upgrade would be a
+    // poor welcome.
+    this.settings.feeds = migrateFeedList(this.settings.rssFeeds, this.settings.feeds);
+    delete this.settings.rssFeeds;
     this.inbox = Array.isArray(data?.inbox) ? (data?.inbox as InboxRecord[]) : [];
   }
 
@@ -353,7 +359,9 @@ export default class LiteratureInboxPlugin extends Plugin {
       const client = new ArxivClient(this.transport());
       for (const category of splitList(this.settings.arxivCategories)) {
         try {
-          works.push(...(await client.categoryFeed(category, perSource)));
+          // arXiv has no date filter, so the window is applied to what comes
+          // back. Without this, "new means 7 days" governed only OpenAlex.
+          works.push(...withinWindow(await client.categoryFeed(category, perSource), since));
         } catch (error) {
           report.sourceErrors.push({ source: `arXiv ${category}`, message: String(error) });
         }
@@ -362,11 +370,15 @@ export default class LiteratureInboxPlugin extends Plugin {
 
     if (this.settings.rssEnabled) {
       const feedWorks: Work[] = [];
-      for (const url of splitList(this.settings.rssFeeds)) {
+      for (const feed of this.settings.feeds) {
+        if (!feed.enabled || !feed.url.trim()) continue;
         try {
-          feedWorks.push(...(await fetchFeed(this.transport(), url)));
+          const items = await fetchFeed(this.transport(), feed.url);
+          const feedSince = isoDaysAgo(effective(feed.windowDays, this.settings.newWindowDays));
+          const cap = effective(feed.maxPerRun, perSource);
+          feedWorks.push(...withinWindow(items, feedSince).slice(0, cap));
         } catch (error) {
-          report.sourceErrors.push({ source: url, message: String(error) });
+          report.sourceErrors.push({ source: feed.url, message: String(error) });
         }
       }
       // Give feed items a DOI (and a reference list) where we can, so they
@@ -450,6 +462,11 @@ export default class LiteratureInboxPlugin extends Plugin {
 
     if (connected > 0) await this.persist();
     return connected;
+  }
+
+  /** Re-read the papers folder. Cheap, local, and no network. */
+  private async refreshKeptCount(): Promise<void> {
+    this.keptCount = (await this.adapter().list(this.settings.papersFolder)).length;
   }
 
   /** Counts shown at the top of the settings page, so the plugin's state is
@@ -597,11 +614,16 @@ export default class LiteratureInboxPlugin extends Plugin {
         worksCiting: (ids, limit) => client.worksCiting(ids, limit),
       },
       limit: size,
+      // One notice per phase, so a minute-long expansion doesn't read as a
+      // hang. The totals are repeated in the summary, not announced twice.
+      onProgress: (phase, found) =>
+        notify(
+          phase === "references"
+            ? `Found ${found} cited paper(s), now looking for citing papers…`
+            : `Found ${found} citing paper(s).`,
+        ),
     });
     for (const error of report.errors) notify(`Part of the expansion failed — ${error}`);
-    notify(
-      `Found ${report.referenceCount} cited paper(s) and ${report.citerCount} citing paper(s).`,
-    );
     return report.works;
   }
 
@@ -636,6 +658,11 @@ export default class LiteratureInboxPlugin extends Plugin {
         adapter: this.adapter(),
         today: todayIso(),
         subjects: this.subjectOptions(),
+        onProgress: (written, total) => {
+          // Every 25, not every note: a Notice per paper would bury the
+          // screen, and silence for a minute reads as a hang.
+          if (written % 25 === 0 && written < total) notify(`Writing ${written} of ${total}…`);
+        },
       });
 
       this.keptCount += report.written.length;
@@ -697,6 +724,14 @@ export default class LiteratureInboxPlugin extends Plugin {
       if (report.cappedAt) parts.push(`capped at ${report.cappedAt}`);
       if (report.sourceErrors.length) parts.push(`${report.sourceErrors.length} source error(s)`);
       notify(`Literature Inbox: ${parts.join(", ")}.`);
+
+      // A notice can't say *which* papers arrived or how connected they are,
+      // and that is the whole triage question. Shown only when there is
+      // something to look at or something went wrong — a quiet successful run
+      // should stay quiet.
+      if (report.arrived.length > 0 || report.sourceErrors.length > 0) {
+        new RunReportModal(this.app, report, backfilled).open();
+      }
     } catch (error) {
       notify(`Literature Inbox failed: ${String(error)}`);
     } finally {
@@ -716,6 +751,10 @@ export default class LiteratureInboxPlugin extends Plugin {
     this.inbox = this.inbox.filter((record) => record.notePath !== file.path);
     await this.persist();
     await writeInboxPage(this.inbox, this.updateSettings(), this.adapter());
+    // Recount rather than increment: papers also arrive in this folder by
+    // being dragged there, by zot2vault, or by a kernel run, so a counter
+    // nudged only on this path drifts out of step with the folder.
+    await this.refreshKeptCount();
     notify(`Kept — moved to ${this.settings.papersFolder}/.`);
   }
 
@@ -870,8 +909,10 @@ export default class LiteratureInboxPlugin extends Plugin {
    * the whole value. Deliberately ignores the RSS toggle: testing a feed
    * before switching the source on is the normal order.
    */
-  async testFeeds(): Promise<void> {
-    const urls = splitList(this.settings.rssFeeds);
+  async testFeeds(onlyUrl?: string): Promise<void> {
+    const urls = (onlyUrl ? [onlyUrl] : this.settings.feeds.map((feed) => feed.url))
+      .map((url) => url.trim())
+      .filter(Boolean);
     if (urls.length === 0) {
       notify("Add at least one feed URL first.");
       return;
@@ -912,6 +953,81 @@ export default class LiteratureInboxPlugin extends Plugin {
     } catch (error) {
       notify(`Preview failed: ${String(error)}`);
     }
+  }
+}
+
+/**
+ * What a run actually did, in a form you can read.
+ *
+ * Arrivals are listed most-connected first, because that is the order you want
+ * to triage in — a paper wired to five of your papers deserves attention
+ * before one wired to none.
+ */
+class RunReportModal extends Modal {
+  constructor(
+    app: App,
+    private readonly report: UpdateReport,
+    private readonly backfilled: number,
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    this.titleEl.setText("Update report");
+    const { report } = this;
+
+    if (report.arrived.length === 0) {
+      this.contentEl.createEl("p", {
+        text:
+          report.skipped.length > 0
+            ? `Nothing new — all ${report.skipped.length} paper(s) found are already in your vault.`
+            : "Nothing new this run.",
+      });
+    } else {
+      this.contentEl.createEl("p", {
+        text: `${report.arrived.length} new paper(s), most connected first.`,
+      });
+      const list = this.contentEl.createEl("ol");
+      const sorted = [...report.arrived].sort((a, b) => b.edgeCount - a.edgeCount);
+      for (const arrival of sorted.slice(0, 50)) {
+        const noun = arrival.edgeCount === 1 ? "link" : "links";
+        list.createEl("li", {
+          text:
+            arrival.edgeCount > 0
+              ? `${arrival.title} — ${arrival.edgeCount} ${noun} into your library`
+              : `${arrival.title} — no links yet`,
+        });
+      }
+      if (sorted.length > 50) {
+        this.contentEl.createEl("p", { text: `…and ${sorted.length - 50} more.` });
+      }
+    }
+
+    const notes: string[] = [];
+    if (report.skipped.length > 0 && report.arrived.length > 0) {
+      notes.push(`${report.skipped.length} already in your vault, skipped.`);
+    }
+    if (this.backfilled > 0) {
+      notes.push(`${this.backfilled} earlier arrival(s) gained citation links.`);
+    }
+    if (report.cappedAt) {
+      notes.push(`Capped at ${report.cappedAt} — raise "maximum arrivals per run" for more.`);
+    }
+    for (const note of notes) {
+      this.contentEl.createEl("p", { cls: "setting-item-description", text: note });
+    }
+
+    if (report.sourceErrors.length > 0) {
+      this.contentEl.createEl("p", { text: "Sources that had trouble:" });
+      const errors = this.contentEl.createEl("ul");
+      for (const error of report.sourceErrors) {
+        errors.createEl("li", { text: `${error.source} — ${error.message}` });
+      }
+    }
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
   }
 }
 

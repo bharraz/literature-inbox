@@ -222,6 +222,16 @@ consumers must **YAML-parse, not string-match**.
 Plugin-written notes should additionally record fetch provenance (source, fetch
 date, and the ids the work arrived with).
 
+**Subject terms.** literature-inbox can record OpenAlex subject terms, either
+under an optional `subjects` key or folded into `tags`. Both are legal under §1
+(a new optional key is not breaking, and readers ignore unknown keys), but note
+what happens on an upgrade-in-place (§7.2): zot2vault regenerates frontmatter
+from Zotero, so it will **drop `subjects` and replace `tags` with Zotero's
+tags**. That is acceptable degradation — the note is still correct and still
+one file — but it means subject terms are not durable on a paper that later
+enters a Zotero library. A tool wanting them to survive should treat `subjects`
+as pass-through rather than regenerating it away.
+
 ### 5.3 Filename allocation
 
 Both tools must allocate identically, or the same paper lands in two

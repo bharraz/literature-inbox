@@ -349,8 +349,13 @@ export class TextComponent extends BaseComponent {
 
 export class ToggleComponent extends BaseComponent {
   value = false;
+  tooltip = "";
   setValue(value: boolean): this {
     this.value = value;
+    return this;
+  }
+  setTooltip(tooltip: string): this {
+    this.tooltip = tooltip;
     return this;
   }
   getValue(): boolean {

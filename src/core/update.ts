@@ -27,6 +27,15 @@ export interface InboxRecord {
   contentHash: string;
   /** Manual adds are intentional and never auto-pruned. */
   manual?: boolean;
+  /**
+   * How many vault papers this arrival cites, recorded at arrival.
+   *
+   * Stored on the record rather than recomputed, because `_Inbox.md` is
+   * regenerated after a keep and after a cleanup too — and neither of those
+   * has a citation index to hand. Without this the count would appear on one
+   * run and silently vanish on the next.
+   */
+  edgeCount?: number;
 }
 
 /** The minimum this module needs from Obsidian, kept narrow so tests can
@@ -208,6 +217,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
       title: entry.work.title,
       arrivedOn: today,
       contentHash: contentHash(content),
+      edgeCount: cites.length,
     });
     report.arrived.push({
       title: entry.work.title ?? entry.work.key,
@@ -220,12 +230,16 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
   return { report, inbox };
 }
 
-/** Regenerate `_Inbox.md` from the current record set. */
+/**
+ * Regenerate `_Inbox.md` from the current record set.
+ *
+ * Edge counts come off the records themselves, so the front page says the same
+ * thing whether it was rebuilt by an update, a keep, or a cleanup.
+ */
 export async function writeInboxPage(
   inbox: readonly InboxRecord[],
   settings: UpdateSettings,
   adapter: VaultAdapter,
-  edgeCounts: Map<string, number> = new Map(),
 ): Promise<void> {
   const entries: InboxEntry[] = inbox.map((record) => {
     const base = record.notePath.split("/").pop() ?? record.notePath;
@@ -234,7 +248,7 @@ export async function writeInboxPage(
       filename,
       date: record.arrivedOn,
       label: record.title && record.title !== filename ? record.title : undefined,
-      edgeCount: edgeCounts.get(filename),
+      edgeCount: record.edgeCount,
     };
   });
   await adapter.write(`${settings.inboxFolder}/_Inbox.md`, renderInboxPage(entries));

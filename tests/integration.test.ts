@@ -894,6 +894,137 @@ describe("choosing arrivals by citation adjacency", () => {
   });
 });
 
+describe("the inbox front page", () => {
+  it("shows how connected each arrival is", async () => {
+    // The signal that makes the page worth reading. It is computed at arrival
+    // and stored on the record, so it survives later regenerations.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+
+    await plugin.updateInbox();
+
+    const page = app.vault.files.get("Inbox/_Inbox.md") as string;
+    expect(page).toContain("1 link into your library");
+  });
+
+  it("keeps those counts when the page is rebuilt after a keep", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    const file = app.vault.getAbstractFileByPath("Inbox/A Paper About Attention.md");
+    await plugin.keepActiveNote(file as never);
+
+    const page = app.vault.files.get("Inbox/_Inbox.md") as string;
+    expect(page).toContain("1 link into your library");
+  });
+
+  it("keeps the library count in step when a paper is kept", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+    expect(plugin.status().keptCount).toBe(0);
+
+    const file = app.vault.getAbstractFileByPath("Inbox/A Paper About Attention.md");
+    await plugin.keepActiveNote(file as never);
+
+    expect(plugin.status().keptCount).toBe(1);
+    expect(plugin.status().inboxCount).toBe(1);
+  });
+});
+
+describe("per-feed settings", () => {
+  const feedItem = (title: string, date: string) =>
+    `<item><title>${title}</title><link>https://example.org/${title}</link>` +
+    `<pubDate>${date}</pubDate></item>`;
+  const feedXml = (items: string) =>
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>A Journal</title>` +
+    `${items}</channel></rss>`;
+
+  it("applies each feed's own window", async () => {
+    respondWith(
+      feedXml(
+        feedItem("Recent Paper", "Mon, 03 Aug 2026 00:00:00 GMT") +
+          feedItem("Ancient Paper", "Mon, 01 Jan 2024 00:00:00 GMT"),
+      ),
+    );
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.openAlexEnabled = false;
+      p.settings.rssEnabled = true;
+      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true, windowDays: 7 }];
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/Recent Paper.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Ancient Paper.md")).toBe(false);
+  });
+
+  it("honours a per-feed cap", async () => {
+    respondWith(
+      feedXml(
+        feedItem("First Paper", "Mon, 03 Aug 2026 00:00:00 GMT") +
+          feedItem("Second Paper", "Mon, 03 Aug 2026 00:00:00 GMT"),
+      ),
+    );
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.openAlexEnabled = false;
+      p.settings.rssEnabled = true;
+      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true, maxPerRun: 1 }];
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/First Paper.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Second Paper.md")).toBe(false);
+  });
+
+  it("skips a disabled row without deleting its settings", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.openAlexEnabled = false;
+      p.settings.rssEnabled = true;
+      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: false, windowDays: 7 }];
+    });
+
+    await plugin.updateInbox();
+
+    expect(requestedUrls).toHaveLength(0);
+    expect(plugin.settings.feeds[0]?.windowDays).toBe(7);
+  });
+
+  it("migrates a pre-rows settings file instead of losing the feeds", async () => {
+    const app = new App();
+    const plugin = new LiteratureInboxPlugin(app as never, {} as never);
+    await plugin.saveData({
+      settings: { ...plugin.settings, rssFeeds: "https://old.example/f.xml" },
+      inbox: [],
+    });
+
+    await plugin.onload();
+
+    expect(plugin.settings.feeds).toEqual([{ url: "https://old.example/f.xml", enabled: true }]);
+    expect(plugin.settings.rssFeeds).toBeUndefined();
+  });
+
+  it("renders a row per feed with its own controls", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.feeds = [
+        { url: "https://a.example/f.xml", enabled: true },
+        { url: "https://b.example/f.xml", enabled: true },
+      ];
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const rows = allSettings.filter((s: Setting) => s.name.startsWith("Feed "));
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.texts[0]?.value).toBe("https://a.example/f.xml");
+    // URL, window, cap — plus enable, test, and remove.
+    expect(rows[0]?.texts).toHaveLength(3);
+    expect(rows[0]?.buttons).toHaveLength(2);
+    expect(rows[0]?.toggles).toHaveLength(1);
+  });
+});
+
 describe("what counts as new", () => {
   it("asks OpenAlex for the window the user configured", async () => {
     respondWith(DEFAULT_RESPONSE);
@@ -934,7 +1065,10 @@ describe("testing feeds before trusting them", () => {
     respondWith(feedXml("A Recent Paper"));
     const { plugin } = await bootPlugin((p) => {
       p.settings.rssEnabled = false;
-      p.settings.rssFeeds = "https://example.org/one.xml\nhttps://example.org/two.xml";
+      p.settings.feeds = [
+        { url: "https://example.org/one.xml", enabled: true },
+        { url: "https://example.org/two.xml", enabled: true },
+      ];
     });
 
     await plugin.testFeeds();
@@ -950,7 +1084,7 @@ describe("testing feeds before trusting them", () => {
       throw new Error("ENOTFOUND");
     });
     const { plugin } = await bootPlugin((p) => {
-      p.settings.rssFeeds = "https://example.org/dead.xml";
+      p.settings.feeds = [{ url: "https://example.org/dead.xml", enabled: true }];
     });
 
     await expect(plugin.testFeeds()).resolves.toBeUndefined();

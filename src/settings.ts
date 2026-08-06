@@ -1,5 +1,6 @@
 import { PluginSettingTab, Setting, type App } from "obsidian";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
+import { emptyFeed, type FeedConfig } from "./core/feeds";
 import type LiteratureInboxPlugin from "./main";
 
 /**
@@ -44,7 +45,10 @@ export interface LiteratureInboxSettings {
   arxivEnabled: boolean;
   arxivCategories: string;
   rssEnabled: boolean;
-  rssFeeds: string;
+  /** One row per feed, each able to override the global window and cap. */
+  feeds: FeedConfig[];
+  /** Pre-rows format, read once on load and migrated into `feeds`. */
+  rssFeeds?: string;
 
   /** How many top-cited papers the kernel run seeds the papers folder with. */
   kernelSize: number;
@@ -98,7 +102,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   arxivEnabled: false,
   arxivCategories: "",
   rssEnabled: false,
-  rssFeeds: "",
+  feeds: [],
   kernelSize: 100,
   kernelMode: "topic",
   kernelSeeds: "",
@@ -457,25 +461,115 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         }),
       );
 
+    this.renderFeedRows(containerEl);
+  }
+
+  /**
+   * One row per feed, rather than one textarea of URLs.
+   *
+   * Feeds are genuinely heterogeneous — a weekly journal table of contents and
+   * a daily preprint firehose want different windows and different caps — so
+   * the per-feed overrides have somewhere to live. Both are blank by default
+   * and inherit the global settings, so a user who doesn't care sees only a
+   * URL box and never fills anything else in.
+   */
+  private renderFeedRows(containerEl: HTMLElement): void {
+    const feeds = this.plugin.settings.feeds;
+
+    if (feeds.length === 0) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text: "No feeds yet. Add one below — a journal's table of contents is a good start.",
+      });
+    }
+
+    feeds.forEach((feed, index) => {
+      const row = new Setting(containerEl)
+        .setName(`Feed ${index + 1}`)
+        .addToggle((toggle) =>
+          toggle
+            .setValue(feed.enabled)
+            .setTooltip("Fetch this feed on an update")
+            .onChange(async (value) => {
+              feed.enabled = value;
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("https://example.org/journal/feed.xml")
+            .setValue(feed.url)
+            .onChange(async (value) => {
+              feed.url = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(`${this.plugin.settings.newWindowDays}d`)
+            .setValue(feed.windowDays === undefined ? "" : String(feed.windowDays))
+            .onChange(async (value) => {
+              const parsed = Number.parseInt(value, 10);
+              feed.windowDays =
+                value.trim() === "" || !Number.isFinite(parsed) || parsed < 0
+                  ? undefined
+                  : parsed;
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder(`max ${this.plugin.settings.maxArrivalsPerRun}`)
+            .setValue(feed.maxPerRun === undefined ? "" : String(feed.maxPerRun))
+            .onChange(async (value) => {
+              const parsed = Number.parseInt(value, 10);
+              feed.maxPerRun =
+                value.trim() === "" || !Number.isFinite(parsed) || parsed < 1
+                  ? undefined
+                  : parsed;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      row
+        .addButton((button) =>
+          button
+            .setButtonText("Test")
+            .setTooltip("Fetch this feed once and report what came back")
+            .onClick(() => void this.plugin.testFeeds(feed.url)),
+        )
+        .addButton((button) =>
+          button
+            .setButtonText("Remove")
+            .setWarning()
+            .onClick(async () => {
+              this.plugin.settings.feeds.splice(index, 1);
+              await this.plugin.saveSettings();
+              this.display();
+            }),
+        );
+
+      row.setDesc(
+        index === 0
+          ? "URL, then how many days back count as new for this feed, then its cap " +
+              "per run. Leave the last two blank to inherit the global settings."
+          : "",
+      );
+    });
+
     new Setting(containerEl)
-      .setName("Feed URLs")
-      .setDesc(
-        "One per line. Test them after pasting — a dead or mistyped feed is otherwise " +
-          "indistinguishable from a quiet one.",
-      )
-      .addTextArea((text) =>
-        text
-          .setPlaceholder("https://example.org/journal/feed.xml")
-          .setValue(this.plugin.settings.rssFeeds)
-          .onChange(async (value) => {
-            this.plugin.settings.rssFeeds = value;
-            await this.plugin.saveSettings();
-          }),
+      .addButton((button) =>
+        button.setButtonText("Add feed").onClick(async () => {
+          this.plugin.settings.feeds.push(emptyFeed());
+          await this.plugin.saveSettings();
+          this.display();
+        }),
       )
       .addButton((button) =>
         button
-          .setButtonText("Test feeds")
-          .setTooltip("Fetch each feed once and report what came back")
+          .setButtonText("Test all")
+          .setTooltip("Fetch every feed once — a dead feed is otherwise indistinguishable " +
+            "from a quiet one")
           .onClick(() => void this.plugin.testFeeds()),
       );
   }
@@ -567,7 +661,9 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       .setDesc(
         "OpenAlex labels each paper with subject terms. As a property they are " +
           "searchable and stay out of the way; as tags they appear in the tag pane and " +
-          "the graph, which gets noisy fast across a few hundred papers.",
+          "the graph, which gets noisy fast across a few hundred papers. If you also " +
+          "use zot2vault, note that these terms are dropped when a kept note is later " +
+          "upgraded from your Zotero library.",
       )
       .addDropdown((dropdown) => {
         dropdown
