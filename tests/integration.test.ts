@@ -769,6 +769,131 @@ describe("adding papers by hand", () => {
   });
 });
 
+describe("choosing arrivals by citation adjacency", () => {
+  /** A vault with one kept paper, which is what adjacency anchors on. */
+  async function vaultWithKeptPaper(
+    configure?: (plugin: LiteratureInboxPlugin) => void,
+    originId = "openalex:W1",
+  ) {
+    const booted = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      configure?.(p);
+    });
+    await booted.app.vault.createFolder("Papers");
+    await booted.app.vault.create(
+      "Papers/An Existing Paper.md",
+      keptNoteContent("An Existing Paper", originId),
+    );
+    return booted;
+  }
+
+  it("asks what has cited the papers you keep", async () => {
+    respondWith(openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]));
+    const { app, plugin } = await vaultWithKeptPaper((p) => {
+      p.settings.arrivalSelection = "adjacent";
+    });
+
+    await plugin.updateInbox();
+
+    expect(requestedUrls[0]).toContain("cites%3AW1");
+    expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
+  });
+
+  it("wires the arrival to the paper it cited, so the why-line fires", async () => {
+    // The entire point: an arrival chosen this way is connected by
+    // construction rather than by hoping an edge exists.
+    respondWith(openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]));
+    const { app, plugin } = await vaultWithKeptPaper((p) => {
+      p.settings.arrivalSelection = "adjacent";
+    });
+
+    await plugin.updateInbox();
+
+    const arrival = app.vault.files.get("Inbox/A Paper Citing Yours.md") as string;
+    expect(arrival).toContain("Why you're seeing this");
+    expect(arrival).toContain("[[An Existing Paper]]");
+  });
+
+  it("resolves a DOI-only library into anchors rather than skipping it", async () => {
+    // A zot2vault library often records DOIs and no OpenAlex id. Without this
+    // lookup, adjacency would silently find nothing for those users.
+    let call = 0;
+    setRequestResponder((url) => {
+      call += 1;
+      if (call === 1) {
+        expect(url).toContain("doi%3A10.1234%2Fkept");
+        return { status: 200, text: openAlexPage([openAlexWork("W1", "An Existing Paper")]) };
+      }
+      return {
+        status: 200,
+        text: openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"])]),
+      };
+    });
+    const { app, plugin } = await vaultWithKeptPaper(
+      (p) => {
+        p.settings.arrivalSelection = "adjacent";
+      },
+      "doi:10.1234/kept",
+    );
+
+    await plugin.updateInbox();
+
+    expect(requestedUrls[1]).toContain("cites%3AW1");
+    expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
+  });
+
+  it("says the library is empty instead of reporting a normal quiet run", async () => {
+    respondWith(openAlexPage([]));
+    const { plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.arrivalSelection = "adjacent";
+    });
+
+    await plugin.updateInbox();
+
+    expect(notices.some((n) => n.includes("source error"))).toBe(true);
+  });
+
+  it("puts citing papers ahead of topic matches, so the cap keeps the better ones", async () => {
+    // When maxArrivalsPerRun bites, order decides what survives. A paper
+    // citing your library beats one that merely matched your topic string.
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]),
+        };
+      }
+      return {
+        status: 200,
+        text: openAlexPage([openAlexWork("W8", "A Topic Match", [], "10.1234/eight")]),
+      };
+    });
+    const { app, plugin } = await vaultWithKeptPaper((p) => {
+      p.settings.arrivalSelection = "both";
+      p.settings.maxArrivalsPerRun = 1;
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/A Topic Match.md")).toBe(false);
+  });
+
+  it("skips the adjacency query entirely in topic-only mode", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await vaultWithKeptPaper((p) => {
+      p.settings.arrivalSelection = "topic";
+    });
+
+    await plugin.updateInbox();
+
+    expect(requestedUrls.every((url) => !url.includes("cites"))).toBe(true);
+  });
+});
+
 describe("what counts as new", () => {
   it("asks OpenAlex for the window the user configured", async () => {
     respondWith(DEFAULT_RESPONSE);

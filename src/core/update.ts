@@ -10,7 +10,7 @@ import { CitationIndex, resolveCitations, type CitationEdge } from "./citations"
 import { FilenameAllocator } from "./filenames";
 import { contentHash } from "./hash";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds } from "./ids";
-import { renderInboxNote } from "./notes";
+import { renderInboxNote, type SubjectOptions } from "./notes";
 import { renderInboxPage, type InboxEntry } from "./inbox-page";
 import { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
@@ -44,6 +44,7 @@ export interface UpdateSettings {
   inboxFolder: string;
   papersFolder: string;
   maxArrivalsPerRun: number;
+  subjects?: SubjectOptions;
 }
 
 export type SkipReason = "already-in-vault" | "already-in-inbox" | "duplicate-in-batch";
@@ -198,6 +199,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
       arrivedOn: today,
       originIds: entry.ids,
       connectedKept: cites.filter((name) => keptNames.has(name)),
+      subjects: settings.subjects,
     });
     await adapter.write(notePath, content);
     inbox.push({

@@ -211,6 +211,99 @@ describe("queries the starting-graph modes depend on", () => {
   });
 });
 
+describe("adjacency selection", () => {
+  const page = (results: unknown[]) => JSON.stringify({ results, meta: { next_cursor: null } });
+  const record = (id: string) => ({
+    id: `https://openalex.org/${id}`,
+    title: id,
+    type: "article",
+    publication_date: "2026-01-01",
+  });
+
+  it("asks for recent citers, newest first", async () => {
+    // The opposite question from worksCiting: what has cited my library
+    // lately, not what cited it most influentially.
+    const { client, transport } = clientWith([page([record("W9")])]);
+    await client.worksCitingSince(["W1", "W2"], "2026-07-01", 25);
+
+    const query = queryOf(transport.requested[0] as string);
+    expect(query.filter).toContain("cites:W1|W2");
+    expect(query.filter).toContain("from_created_date:2026-07-01");
+    expect(query.sort).toBe("publication_date:desc");
+  });
+
+  it("makes no request without anchors, so an empty library is silent not noisy", async () => {
+    const { client, transport } = clientWith([]);
+    expect(await client.worksCitingSince([], "2026-07-01", 25)).toEqual([]);
+    expect(transport.requested).toHaveLength(0);
+  });
+
+  it("batches anchors and de-duplicates papers citing more than one", async () => {
+    const anchors = Array.from({ length: 30 }, (_, i) => `W${i}`);
+    const { client, transport } = clientWith([page([record("X1")]), page([record("X1")])]);
+
+    const works = await client.worksCitingSince(anchors, "2026-07-01", 25);
+
+    expect(transport.requested).toHaveLength(2); // 25 anchors per batch
+    expect(works).toHaveLength(1);
+  });
+});
+
+describe("partial fetches", () => {
+  const page = (results: unknown[], cursor: string | null = null) =>
+    JSON.stringify({ results, meta: { next_cursor: cursor } });
+  const record = (id: string) => ({
+    id: `https://openalex.org/${id}`,
+    title: id,
+    type: "article",
+    publication_date: "2026-01-01",
+  });
+
+  it("keeps what it gathered when a later page fails", async () => {
+    // A 400-paper kernel build that dies on page three is otherwise a total
+    // loss, and 380 papers is a perfectly good starting graph.
+    const partials: { fetched: number }[] = [];
+    const transport = new SequenceTransport([
+      page([record("W1"), record("W2")], "next"),
+      { status: 500, text: "upstream is having a day" },
+    ]);
+    const client = new OpenAlexClient(transport, {
+      sleep: noSleep,
+      maxRetries: 0,
+      onPartialFetch: (_error, fetched) => partials.push({ fetched }),
+    });
+
+    const works = await client.topWorks("anything", 100);
+
+    expect(works).toHaveLength(2);
+    expect(partials).toEqual([{ fetched: 2 }]);
+  });
+
+  it("still throws when no partial handler is configured", async () => {
+    const { client } = clientWith([{ status: 500, text: "boom" }]);
+    await expect(client.topWorks("anything", 10)).rejects.toThrow();
+  });
+
+  it("keeps earlier batches when a later batch fails", async () => {
+    const partials: number[] = [];
+    const transport = new SequenceTransport([
+      page([record("W1")]),
+      { status: 500, text: "boom" },
+    ]);
+    const client = new OpenAlexClient(transport, {
+      sleep: noSleep,
+      maxRetries: 0,
+      onPartialFetch: (_error, fetched) => partials.push(fetched),
+    });
+
+    const ids = Array.from({ length: 60 }, (_, i) => `W${i}`); // two chunks of 50
+    const works = await client.worksByIds(ids);
+
+    expect(works).toHaveLength(1);
+    expect(partials).toEqual([1]);
+  });
+});
+
 describe("junk filtering against real bad data", () => {
   it("drops entries with implausible future publication dates", async () => {
     // This fixture holds five REAL OpenAlex records dated 2027-2050, plus one

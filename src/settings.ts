@@ -16,6 +16,15 @@ export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
   library: "Expand outward from papers I already have",
 };
 
+/** Which question an update asks OpenAlex. */
+export type ArrivalSelection = "both" | "adjacent" | "topic";
+
+export const ARRIVAL_SELECTION_LABELS: Record<ArrivalSelection, string> = {
+  both: "Both (recommended)",
+  adjacent: "Papers citing my library",
+  topic: "Papers matching my topic",
+};
+
 export interface LiteratureInboxSettings {
   /** Where arrivals land. Keeping them in one folder is what makes "moving a
    * note out" a usable keep signal. */
@@ -26,6 +35,12 @@ export interface LiteratureInboxSettings {
 
   openAlexEnabled: boolean;
   openAlexTopic: string;
+  /**
+   * How OpenAlex arrivals are chosen. `adjacent` asks what recently cited the
+   * papers you keep, so every arrival is connected by construction; `topic`
+   * matches a query and hopes an edge exists.
+   */
+  arrivalSelection: ArrivalSelection;
   arxivEnabled: boolean;
   arxivCategories: string;
   rssEnabled: boolean;
@@ -53,6 +68,13 @@ export interface LiteratureInboxSettings {
   newWindowDays: number;
 
   maxArrivalsPerRun: number;
+
+  /** Where OpenAlex's subject terms go in a generated note, if anywhere. */
+  subjectPlacement: "off" | "property" | "tags";
+  subjectTopics: boolean;
+  subjectKeywords: boolean;
+  subjectConcepts: boolean;
+
   keepWindowDays: number;
   /** Off by default: nothing is ever removed until you say so. */
   pruneEnabled: boolean;
@@ -72,6 +94,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   papersFolder: "Papers",
   openAlexEnabled: true,
   openAlexTopic: "",
+  arrivalSelection: "both",
   arxivEnabled: false,
   arxivCategories: "",
   rssEnabled: false,
@@ -82,6 +105,14 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   kernelAuthor: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 25,
+  // Terms as a property by default, never as tags: tags show up in the tag
+  // pane and the graph, and a vault-wide dump of machine-assigned subject
+  // terms is exactly the clutter people rightly fear. Concepts stays off for
+  // the same reason — it is the broadest and noisiest of the three.
+  subjectPlacement: "property",
+  subjectTopics: true,
+  subjectKeywords: true,
+  subjectConcepts: false,
   keepWindowDays: 30,
   pruneEnabled: false,
   mailto: "",
@@ -119,6 +150,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     this.renderFolders(containerEl);
     this.renderSources(containerEl);
     this.renderArrivals(containerEl);
+    this.renderNoteContent(containerEl);
     this.renderAddByHand(containerEl);
     this.renderCleanup(containerEl);
     this.renderIntegrations(containerEl);
@@ -354,10 +386,30 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Which papers OpenAlex should look for")
+      .setDesc(
+        '"Papers citing my library" asks what has recently cited the papers in ' +
+          `${this.plugin.settings.papersFolder}/ — so every arrival is connected to ` +
+          "something you kept, rather than merely matching a query. It needs a starting " +
+          "graph to work from. Topic search covers the rest of the field, including work " +
+          "that has not cited you yet. Both is usually right; when the per-run cap bites, " +
+          "citing papers are kept first.",
+      )
+      .addDropdown((dropdown) => {
+        for (const [value, label] of Object.entries(ARRIVAL_SELECTION_LABELS)) {
+          dropdown.addOption(value, label);
+        }
+        dropdown.setValue(this.plugin.settings.arrivalSelection).onChange(async (value) => {
+          this.plugin.settings.arrivalSelection = value as ArrivalSelection;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
       .setName("OpenAlex")
       .setDesc(
-        "Recent papers on your topic. The best source for citation edges, because " +
-          "OpenAlex publishes reference lists.",
+        "The best source for citation edges, because OpenAlex publishes reference " +
+          "lists. Turning this off disables both selections above.",
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.openAlexEnabled).onChange(async (value) => {
@@ -491,6 +543,68 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           .setButtonText("Add")
           .onClick(() => void this.plugin.addByIds(this.manualAdd, this.manualAddTarget)),
       );
+  }
+
+  /**
+   * What a generated note contains beyond the essentials.
+   *
+   * Deliberately a fixed set of switches rather than a template. The
+   * generated-section markers and frontmatter conventions are a contract with
+   * zot2vault (`docs/interop-spec.md` §5) — an arbitrary template would break
+   * upgrade-in-place and turn a kept note into a competing duplicate.
+   */
+  private renderNoteContent(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("What goes in a note").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Authors are always recorded as a note property, never as tags — author tags " +
+        "clutter a vault badly and add nothing to the graph.",
+    });
+
+    new Setting(containerEl)
+      .setName("Subject terms")
+      .setDesc(
+        "OpenAlex labels each paper with subject terms. As a property they are " +
+          "searchable and stay out of the way; as tags they appear in the tag pane and " +
+          "the graph, which gets noisy fast across a few hundred papers.",
+      )
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("property", "As a note property")
+          .addOption("tags", "As tags")
+          .addOption("off", "Don't include them")
+          .setValue(this.plugin.settings.subjectPlacement)
+          .onChange(async (value) => {
+            this.plugin.settings.subjectPlacement = value as "off" | "property" | "tags";
+            await this.plugin.saveSettings();
+            this.display();
+          });
+      });
+
+    if (this.plugin.settings.subjectPlacement === "off") return;
+
+    const vocabularies: [keyof LiteratureInboxSettings, string, string][] = [
+      ["subjectTopics", "Topics", "A small curated set — the most useful of the three."],
+      ["subjectKeywords", "Keywords", "Close to what an author would write themselves."],
+      [
+        "subjectConcepts",
+        "Concepts",
+        "A large machine-assigned hierarchy. Goes broad fast — expect terms like " +
+          '"Physics" alongside the specific ones.',
+      ],
+    ];
+    for (const [key, name, description] of vocabularies) {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(description)
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.settings[key] as boolean).onChange(async (value) => {
+            (this.plugin.settings[key] as boolean) = value;
+            await this.plugin.saveSettings();
+          }),
+        );
+    }
   }
 
   private renderCleanup(containerEl: HTMLElement): void {

@@ -28,7 +28,7 @@ import { runUpdate, writeInboxPage, type InboxRecord, type UpdateReport } from "
 import { applyPrune, planPrune } from "./core/prune";
 import { backfillReferences, type BackfillCandidate } from "./core/backfill";
 import { CitationIndex } from "./core/citations";
-import { appendCitations } from "./core/notes";
+import { appendCitations, type SubjectOptions } from "./core/notes";
 import { contentHash } from "./core/hash";
 import { runExecutable, type Spawner } from "./core/launcher";
 import { runKernel } from "./core/kernel";
@@ -64,6 +64,13 @@ function todayIso(): string {
  * and once the core is dense the marginal seed adds almost nothing.
  */
 const LIBRARY_SEED_LIMIT = 50;
+
+/**
+ * How many kept papers anchor an adjacency query. Higher than the snowball
+ * limit because coverage matters more here — a paper citing *any* of your
+ * library is a hit — and the cost is one request per 25 anchors.
+ */
+const ADJACENCY_ANCHOR_LIMIT = 100;
 
 export default class LiteratureInboxPlugin extends Plugin {
   override settings: LiteratureInboxSettings = { ...DEFAULT_SETTINGS };
@@ -194,8 +201,16 @@ export default class LiteratureInboxPlugin extends Plugin {
     return new ObsidianTransport();
   }
 
-  private openAlex(): OpenAlexClient {
-    return new OpenAlexClient(this.transport(), { mailto: this.settings.mailto || undefined });
+  /**
+   * An OpenAlex client. Pass `onPartial` for long fetches where returning what
+   * was gathered beats losing the run — the caller then owns telling the user
+   * that the result is incomplete.
+   */
+  private openAlex(onPartial?: (error: unknown, fetched: number) => void): OpenAlexClient {
+    return new OpenAlexClient(this.transport(), {
+      mailto: this.settings.mailto || undefined,
+      onPartialFetch: onPartial,
+    });
   }
 
   private adapter(): ObsidianVaultAdapter {
@@ -232,31 +247,105 @@ export default class LiteratureInboxPlugin extends Plugin {
       inboxFolder: this.settings.inboxFolder,
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
+      subjects: this.subjectOptions(),
+    };
+  }
+
+  private subjectOptions(): SubjectOptions {
+    return {
+      placement: this.settings.subjectPlacement,
+      topics: this.settings.subjectTopics,
+      keywords: this.settings.subjectKeywords,
+      concepts: this.settings.subjectConcepts,
     };
   }
 
   // --- fetching ------------------------------------------------------------
 
-  private async fetchAll(report: UpdateReport): Promise<Work[]> {
+  /**
+   * OpenAlex ids for the papers the user keeps, to anchor an adjacency query.
+   *
+   * `cites:` only accepts OpenAlex ids, so notes carrying only a DOI would
+   * otherwise be unable to anchor anything — which would silently exclude an
+   * entire zot2vault library. One batched DOI lookup converts them, and is
+   * worth the request.
+   */
+  private async adjacencyAnchors(vault: VaultIndex): Promise<string[]> {
+    const { openAlexIds, dois } = seedsFromOriginIds(
+      [...vault.entriesForIndex()].map((entry) => entry.originIds),
+      ADJACENCY_ANCHOR_LIMIT,
+    );
+    const anchors = [...openAlexIds];
+    if (dois.length > 0) {
+      for (const work of await this.openAlex().worksByDois(dois)) {
+        for (const id of work.ids) {
+          if (id.namespace === "openalex" && !anchors.includes(id.value)) anchors.push(id.value);
+        }
+      }
+    }
+    return anchors;
+  }
+
+  private async fetchAll(report: UpdateReport, vault: VaultIndex): Promise<Work[]> {
     const works: Work[] = [];
     const perSource = this.settings.maxArrivalsPerRun;
+    // The user's window back from today, never `topWorks` and never "since you
+    // last ran". `topWorks` returns the most-cited papers on the topic —
+    // exactly what a kernel run just seeded — so using it here reported
+    // "0 new" on every first update, guaranteed. And anchoring on `lastUpdate`
+    // narrows the window to nothing on a second run the same day. The window
+    // overlaps previous runs on purpose: dedup is exact and cheap, so
+    // re-seeing a paper costs nothing and missing one is permanent.
+    const since = isoDaysAgo(this.settings.newWindowDays);
+    const selection = this.settings.arrivalSelection;
 
-    if (this.settings.openAlexEnabled && this.settings.openAlexTopic.trim()) {
+    // Adjacency first, deliberately. When the per-run cap bites, whatever is
+    // at the front of this list survives — and a paper that cites your library
+    // is a better arrival than one that merely matches your topic string.
+    if (this.settings.openAlexEnabled && selection !== "topic") {
       try {
-        // The user's window back from today, never `topWorks` and never "since
-        // you last ran". `topWorks` returns the most-cited papers on the topic
-        // — exactly what a kernel run just seeded — so using it here reported
-        // "0 new" on every first update, guaranteed. And anchoring on
-        // `lastUpdate` narrows the window to nothing on a second run the same
-        // day. The window overlaps previous runs on purpose: dedup is exact
-        // and cheap, so re-seeing a paper costs nothing and missing one is
-        // permanent.
-        const since = isoDaysAgo(this.settings.newWindowDays);
+        const anchors = await this.adjacencyAnchors(vault);
+        if (anchors.length === 0) {
+          report.sourceErrors.push({
+            source: "Papers citing your library",
+            message:
+              `no papers in ${this.settings.papersFolder}/ have an identifier to match ` +
+              "against — build a starting graph first",
+          });
+        } else {
+          works.push(
+            ...(await this.openAlex((error, fetched) => {
+              report.sourceErrors.push({
+                source: "Papers citing your library",
+                message: `stopped after ${fetched} — ${String(error)}`,
+              });
+            }).worksCitingSince(anchors, since, perSource)),
+          );
+        }
+      } catch (error) {
+        report.sourceErrors.push({
+          source: "Papers citing your library",
+          message: String(error),
+        });
+      }
+    }
+
+    if (
+      this.settings.openAlexEnabled &&
+      selection !== "adjacent" &&
+      this.settings.openAlexTopic.trim()
+    ) {
+      try {
         works.push(
-          ...(await this.openAlex().worksSince(this.settings.openAlexTopic, since, perSource)),
+          ...(await this.openAlex((error, fetched) => {
+            report.sourceErrors.push({
+              source: "OpenAlex topic",
+              message: `stopped after ${fetched} — ${String(error)}`,
+            });
+          }).worksSince(this.settings.openAlexTopic, since, perSource)),
         );
       } catch (error) {
-        report.sourceErrors.push({ source: "OpenAlex", message: String(error) });
+        report.sourceErrors.push({ source: "OpenAlex topic", message: String(error) });
       }
     }
 
@@ -546,6 +635,7 @@ export default class LiteratureInboxPlugin extends Plugin {
         papersFolder: this.settings.papersFolder,
         adapter: this.adapter(),
         today: todayIso(),
+        subjects: this.subjectOptions(),
       });
 
       this.keptCount += report.written.length;
@@ -577,12 +667,15 @@ export default class LiteratureInboxPlugin extends Plugin {
     this.running = true;
     notify("Literature Inbox: fetching…");
     try {
+      // One scan of the vault, shared: adjacency selection needs to know what
+      // you keep, and so does the dedup pass.
+      const vault = await this.vaultIndex();
       const preliminary: UpdateReport = { arrived: [], skipped: [], sourceErrors: [] };
-      const fetched = await this.fetchAll(preliminary);
+      const fetched = await this.fetchAll(preliminary, vault);
 
       const { report, inbox } = await runUpdate({
         fetched,
-        vault: await this.vaultIndex(),
+        vault,
         inbox: this.inbox,
         settings: this.updateSettings(),
         adapter: this.adapter(),

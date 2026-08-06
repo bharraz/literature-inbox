@@ -70,6 +70,48 @@ export interface InboxNoteOptions {
    * look; one connected only to other unread arrivals is not.
    */
   connectedKept?: string[];
+  /** How subject terms reach the note, if at all. */
+  subjects?: SubjectOptions;
+}
+
+/** Where subject terms go, and which vocabularies they come from. */
+export interface SubjectOptions {
+  placement: "off" | "property" | "tags";
+  topics?: boolean;
+  keywords?: boolean;
+  concepts?: boolean;
+}
+
+/**
+ * Fold a subject term into something usable as an Obsidian tag.
+ *
+ * Tags cannot contain spaces, and a tag that is entirely numeric is not a
+ * valid tag either. Terms that survive neither rule are dropped rather than
+ * mangled into nonsense.
+ */
+export function tagify(term: string): string | undefined {
+  const slug = term
+    .trim()
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9/-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug) return undefined;
+  if (/^[\d/-]+$/.test(slug)) return undefined; // a purely numeric tag is invalid
+  return slug;
+}
+
+/** The chosen vocabularies, in the order most-curated first, de-duplicated. */
+export function collectSubjects(work: Work, options: SubjectOptions): string[] {
+  const terms: string[] = [];
+  const push = (list: string[]) => {
+    for (const term of list) if (!terms.includes(term)) terms.push(term);
+  };
+  if (options.topics) push(work.topics);
+  if (options.keywords) push(work.keywords);
+  if (options.concepts) push(work.concepts);
+  return terms;
 }
 
 function renderCitations(cites: string[], citedBy: string[]): string {
@@ -107,6 +149,13 @@ export function renderInboxNote(options: InboxNoteOptions): string {
   const cites = options.cites ?? [];
   const citedBy = options.citedBy ?? [];
 
+  const subjects = options.subjects ?? { placement: "off" };
+  const terms = subjects.placement === "off" ? [] : collectSubjects(work, subjects);
+  const asTags =
+    subjects.placement === "tags"
+      ? terms.map(tagify).filter((tag): tag is string => Boolean(tag))
+      : [];
+
   const frontmatter = renderFrontmatter([
     ["title", work.title],
     ["authors", work.authors.map(fullName).filter(Boolean)],
@@ -120,6 +169,8 @@ export function renderInboxNote(options: InboxNoteOptions): string {
     ["source", work.source],
     ["fetched", arrivedOn],
     ["origin-ids", originIds],
+    ["subjects", subjects.placement === "property" ? terms : undefined],
+    ["tags", asTags.length > 0 ? asTags : undefined],
     // Deliberately no `inbox`/`kept` tag. The folder is the source of truth
     // for whether a paper is kept, and a tag written at generation time cannot
     // track a file the user drags by hand — so it went stale the moment

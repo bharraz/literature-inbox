@@ -35,13 +35,32 @@ export interface Work {
   publication?: string;
   authors: Author[];
   references: WorkId[];
+  /**
+   * Subject terms, kept separate by vocabulary because they behave
+   * differently: `topics` is a small curated set, `keywords` is close to what
+   * an author would write, and `concepts` is a large machine-assigned
+   * hierarchy that goes broad fast ("Physics"). The user chooses which of
+   * them, if any, reach their notes.
+   */
+  topics: string[];
+  keywords: string[];
+  concepts: string[];
   /** Which source this arrived from, recorded in note frontmatter so a note
    * always says where it came from (the suite's transparency principle). */
   source?: string;
 }
 
 export function emptyWork(key: string): Work {
-  return { key, itemType: "journalArticle", ids: [], authors: [], references: [] };
+  return {
+    key,
+    itemType: "journalArticle",
+    ids: [],
+    authors: [],
+    references: [],
+    topics: [],
+    keywords: [],
+    concepts: [],
+  };
 }
 
 /** Publication year, derived from `date` rather than stored separately so the

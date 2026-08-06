@@ -20,7 +20,7 @@
 import { CitationIndex, resolveCitations } from "./citations";
 import { FilenameAllocator } from "./filenames";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds } from "./ids";
-import { renderInboxNote } from "./notes";
+import { renderInboxNote, type SubjectOptions } from "./notes";
 import type { VaultAdapter } from "./update";
 import type { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
@@ -38,6 +38,7 @@ export interface KernelRunInput {
   papersFolder: string;
   adapter: VaultAdapter;
   today: string;
+  subjects?: SubjectOptions;
   /** Called as notes are written, so a long run can show progress. */
   onProgress?: (written: number, total: number) => void;
 }
@@ -113,6 +114,7 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       citedBy,
       arrivedOn: today,
       originIds: entry.ids,
+      subjects: input.subjects,
     });
     await adapter.write(notePath, content);
     report.written.push({

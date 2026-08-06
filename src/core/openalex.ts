@@ -84,6 +84,28 @@ export function passesSanityFilters(data: any, maxFutureDays = 60, today = new D
   return true;
 }
 
+/**
+ * Display names from one of OpenAlex's subject-term lists.
+ *
+ * Capped, because `concepts` in particular runs long and tails off into terms
+ * so broad they say nothing ("Physics", "Computer science"). OpenAlex returns
+ * these ranked, so taking the head keeps the useful ones.
+ */
+const MAX_SUBJECT_TERMS = 8;
+
+function subjectTerms(list: unknown): string[] {
+  if (!Array.isArray(list)) return [];
+  const names: string[] = [];
+  for (const entry of list) {
+    const name = (entry as any)?.display_name;
+    if (typeof name !== "string" || !name.trim()) continue;
+    if (names.includes(name)) continue;
+    names.push(name);
+    if (names.length >= MAX_SUBJECT_TERMS) break;
+  }
+  return names;
+}
+
 export function workFromOpenAlex(data: any): Work {
   const openAlexId = bareOpenAlexId(String(data.id));
   const doi = normalizeDoi(data.doi);
@@ -106,6 +128,9 @@ export function workFromOpenAlex(data: any): Work {
   work.references = (data.referenced_works ?? []).map((reference: string) =>
     makeId(OPENALEX, bareOpenAlexId(reference)),
   );
+  work.topics = subjectTerms(data.topics);
+  work.keywords = subjectTerms(data.keywords);
+  work.concepts = subjectTerms(data.concepts);
   work.source = "openalex";
   return work;
 }
@@ -141,6 +166,17 @@ export interface OpenAlexOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injected in tests so "future date" filtering is deterministic. */
   today?: () => Date;
+  /**
+   * Called when a multi-page or multi-batch fetch fails partway.
+   *
+   * When set, such a fetch returns what it already has instead of throwing.
+   * A 400-paper kernel build that dies on page three is otherwise a total
+   * loss, and 380 papers is a perfectly good starting graph. Supplying this
+   * is how a caller says "partial is better than nothing, and I will tell the
+   * user what happened" — without it the old throwing behaviour stands, so a
+   * single-shot lookup still fails loudly.
+   */
+  onPartialFetch?: (error: unknown, fetched: number) => void;
 }
 
 export class OpenAlexClient {
@@ -177,31 +213,51 @@ export class OpenAlexClient {
     return buildUrl(base, { ...params, mailto: this.options.mailto });
   }
 
+  /**
+   * Run *work*, and if `onPartialFetch` is configured, treat a failure as the
+   * end of the fetch rather than the end of the run — reporting how much had
+   * already been gathered. Without it, the error propagates as before.
+   */
+  private async tolerant<T>(collected: T[], work: () => Promise<void>): Promise<T[]> {
+    const onPartial = this.options.onPartialFetch;
+    if (!onPartial) {
+      await work();
+      return collected;
+    }
+    try {
+      await work();
+    } catch (error) {
+      onPartial(error, collected.length);
+    }
+    return collected;
+  }
+
   /** Cursor-paginated fetch, junk-filtered, stopping at `limit`. */
   private async paginated(filter: string, sort: string, limit: number): Promise<Work[]> {
     const results: Work[] = [];
-    let cursor: string | undefined = "*";
     const today = this.options.today?.() ?? new Date();
 
-    while (cursor && results.length < limit) {
-      const perPage = Math.min(200, limit - results.length);
-      const url: string = this.buildUrl(OPENALEX_BASE_URL, {
-        filter,
-        sort,
-        "per-page": String(perPage),
-        cursor,
-      });
-      const data = await this.getJson(url);
-      const page: any[] = data.results ?? [];
-      for (const item of page) {
-        if (results.length >= limit) break;
-        if (!passesSanityFilters(item, 60, today)) continue;
-        results.push(workFromOpenAlex(item));
+    return this.tolerant(results, async () => {
+      let cursor: string | undefined = "*";
+      while (cursor && results.length < limit) {
+        const perPage = Math.min(200, limit - results.length);
+        const url: string = this.buildUrl(OPENALEX_BASE_URL, {
+          filter,
+          sort,
+          "per-page": String(perPage),
+          cursor,
+        });
+        const data = await this.getJson(url);
+        const page: any[] = data.results ?? [];
+        for (const item of page) {
+          if (results.length >= limit) break;
+          if (!passesSanityFilters(item, 60, today)) continue;
+          results.push(workFromOpenAlex(item));
+        }
+        cursor = data.meta?.next_cursor ?? undefined;
+        if (page.length === 0) break;
       }
-      cursor = data.meta?.next_cursor ?? undefined;
-      if (page.length === 0) break;
-    }
-    return results;
+    });
   }
 
   /** The N most-cited works matching *topic*. */
@@ -277,15 +333,56 @@ export class OpenAlexClient {
       .map((doi) => normalizeDoi(doi))
       .filter((doi): doi is string => Boolean(doi));
     const results: Work[] = [];
-    for (const chunk of chunked(normalized, 50)) {
-      const url = this.buildUrl(OPENALEX_BASE_URL, {
-        filter: `doi:${chunk.join("|")}`,
-        "per-page": String(chunk.length),
-      });
-      const data = await this.getJson(url);
-      for (const item of data.results ?? []) results.push(workFromOpenAlex(item));
-    }
-    return results;
+    return this.tolerant(results, async () => {
+      for (const chunk of chunked(normalized, 50)) {
+        const url = this.buildUrl(OPENALEX_BASE_URL, {
+          filter: `doi:${chunk.join("|")}`,
+          "per-page": String(chunk.length),
+        });
+        const data = await this.getJson(url);
+        for (const item of data.results ?? []) results.push(workFromOpenAlex(item));
+      }
+    });
+  }
+
+  /**
+   * Recent works citing any of *ids* — the selection mode that makes an
+   * arrival connected *by construction*.
+   *
+   * A topic search finds papers about roughly the right subject and then hopes
+   * an edge exists. This asks the opposite question: what has recently cited
+   * the papers I already keep? Every result is guaranteed to wire into the
+   * user's library, which is the entire premise of the plugin.
+   *
+   * Sorted newest-first, unlike `worksCiting`, which wants influence.
+   */
+  async worksCitingSince(
+    ids: string[],
+    since: string,
+    limit: number,
+    basis: RecencyBasis = "created",
+  ): Promise<Work[]> {
+    if (ids.length === 0 || limit <= 0) return [];
+    const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
+    const results: Work[] = [];
+    const seen = new Set<string>();
+
+    return this.tolerant(results, async () => {
+      for (const chunk of chunked(ids, 25)) {
+        if (results.length >= limit) break;
+        const filter = [
+          `cites:${chunk.join("|")}`,
+          this.typeFilter(),
+          `${dateFilter}:${since}`,
+        ].join(",");
+        for (const work of await this.paginated(filter, "publication_date:desc", limit)) {
+          if (seen.has(work.key)) continue;
+          seen.add(work.key);
+          results.push(work);
+          if (results.length >= limit) break;
+        }
+      }
+    });
   }
 
   /**
@@ -343,14 +440,15 @@ export class OpenAlexClient {
    */
   async worksByIds(ids: string[]): Promise<Work[]> {
     const results: Work[] = [];
-    for (const chunk of chunked(ids, 50)) {
-      const url = this.buildUrl(OPENALEX_BASE_URL, {
-        filter: `openalex_id:${chunk.join("|")}`,
-        "per-page": String(chunk.length),
-      });
-      const data = await this.getJson(url);
-      for (const item of data.results ?? []) results.push(workFromOpenAlex(item));
-    }
-    return results;
+    return this.tolerant(results, async () => {
+      for (const chunk of chunked(ids, 50)) {
+        const url = this.buildUrl(OPENALEX_BASE_URL, {
+          filter: `openalex_id:${chunk.join("|")}`,
+          "per-page": String(chunk.length),
+        });
+        const data = await this.getJson(url);
+        for (const item of data.results ?? []) results.push(workFromOpenAlex(item));
+      }
+    });
   }
 }
