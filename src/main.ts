@@ -14,7 +14,7 @@ import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient, OPENALEX_BASE_URL } from "./core/openalex";
 import { PlanRequiredError, RateLimitError } from "./core/http";
-import { backfillDois, fetchFeed, newestItem } from "./core/rss";
+import { fetchFeed, newestItem } from "./core/rss";
 import {
   arxivCategoryFeedUrl,
   effective,
@@ -43,6 +43,7 @@ import {
 import {
   emptyBudget,
   gauge,
+  recordReported,
   recordRequests,
   utcDay,
   type BudgetGauge,
@@ -106,11 +107,11 @@ const UNINDEXED_NOTICE =
 /**
  * Turn a fetch failure into something the user can act on.
  *
- * A rate limit is the one failure with an actual remedy — OpenAlex runs a
- * faster "polite pool" for anyone who supplies an email — so say so, rather
- * than showing a raw HTTP 429 and a URL nobody can do anything with.
+ * A spent allowance is the one failure with an actual remedy — a free API key
+ * raises it roughly tenfold — so say so, rather than showing a raw HTTP 429
+ * and a URL nobody can do anything with.
  */
-function describeFetchError(error: unknown, fetched: number, mailto: string): string {
+function describeFetchError(error: unknown, fetched: number, hasKey: boolean): string {
   const gathered = fetched > 0 ? ` Kept the ${fetched} already fetched.` : "";
   if (error instanceof PlanRequiredError) {
     return `OpenAlex needs a paid plan for that query, so it was skipped.${gathered}`;
@@ -120,15 +121,15 @@ function describeFetchError(error: unknown, fetched: number, mailto: string): st
     if (hours >= 1) {
       // OpenAlex's free tier is a daily spend allowance, not a rate limit.
       return (
-        `OpenAlex's free daily budget is used up — it resets at midnight UTC, in about ` +
-        `${hours} hour(s).${gathered} Smaller starting graphs and fewer runs per day ` +
-        `stretch it further.`
+        `OpenAlex's daily allowance is used up — it resets at midnight UTC, in about ` +
+        `${hours} hour(s).${gathered}` +
+        (hasKey ? "" : " A free API key raises it tenfold — see Network and integrations.")
       );
     }
-    const advice = mailto.trim()
+    const advice = hasKey
       ? "Wait a minute and run it again."
-      : "Adding your email under Network and integrations puts you in OpenAlex's " +
-        "faster pool and makes this far less likely.";
+      : "A free OpenAlex API key raises the daily allowance tenfold — see " +
+        "Network and integrations.";
     return `OpenAlex asked us to slow down.${gathered} ${advice}`;
   }
   return `OpenAlex fetch failed: ${String(error)}.${gathered}`;
@@ -281,10 +282,16 @@ export default class LiteratureInboxPlugin extends Plugin {
     const inner = new ObsidianTransport();
     return {
       get: async (url: string) => {
+        const response = await inner.get(url);
         if (url.startsWith(OPENALEX_BASE_URL)) {
           this.budget = recordRequests(this.budget, 1);
+          if (response.rateLimit) {
+            // OpenAlex reports the real figures on every response, so the
+            // gauge is measured rather than guessed.
+            this.budget = recordReported(this.budget, response.rateLimit);
+          }
         }
-        return inner.get(url);
+        return response;
       },
     };
   }
@@ -306,7 +313,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     // managed to burst past OpenAlex's ceiling and earn a 429.
     if (this.runClient) return this.runClient;
     return new OpenAlexClient(this.transport(), {
-      mailto: this.settings.mailto || undefined,
+      apiKey: this.settings.openAlexApiKey || undefined,
       onPartialFetch: onPartial,
     });
   }
@@ -321,7 +328,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     body: () => Promise<T>,
   ): Promise<T> {
     this.runClient = new OpenAlexClient(this.transport(), {
-      mailto: this.settings.mailto || undefined,
+      apiKey: this.settings.openAlexApiKey || undefined,
       onPartialFetch: onPartial,
     });
     try {
@@ -510,15 +517,18 @@ export default class LiteratureInboxPlugin extends Plugin {
           report.sourceErrors.push({ source: source.label, message: String(error) });
         }
       }
-      // Give feed items a DOI (and a reference list) where we can, so they
-      // arrive wired into the graph instead of as isolated dots.
-      if (feedWorks.length > 0) {
-        try {
-          await backfillDois(feedWorks, this.openAlex(), titlesMatch);
-        } catch {
-          // Backfill is a bonus; shallow arrivals are still arrivals.
-        }
-      }
+      // Deliberately *not* resolving DOIs by title here.
+      //
+      // A feed item has no DOI, so the only route to one is a title search —
+      // and a title search is the most expensive call OpenAlex sells, ten
+      // times a filter. Worse, at fetch time it is near-certain to miss: these
+      // are preprints published hours ago, and OpenAlex has not indexed them
+      // yet. Measured live: 25 arrivals, 25 searches, 0 resolved.
+      //
+      // The scheduled backfill does the same lookup later (next run, ~4 days,
+      // ~30 days), by which time OpenAlex plausibly has the paper — same
+      // outcome, a tenth of the cost, and it gives up instead of retrying
+      // forever. See docs/openalex-dependency.md.
       works.push(...feedWorks);
     }
     return works;
@@ -819,7 +829,7 @@ ${content.slice(marker)}`;
     const problems: string[] = [];
     try {
       const works = await this.withSharedClient(
-        (error, fetched) => problems.push(describeFetchError(error, fetched, this.settings.mailto)),
+        (error, fetched) => problems.push(describeFetchError(error, fetched, Boolean(this.settings.openAlexApiKey.trim()))),
         () => this.gatherKernelWorks(),
       );
       for (const problem of problems) notify(problem);
@@ -880,7 +890,7 @@ ${content.slice(marker)}`;
         (error, fetched) =>
           preliminary.sourceErrors.push({
             source: "OpenAlex",
-            message: describeFetchError(error, fetched, this.settings.mailto),
+            message: describeFetchError(error, fetched, Boolean(this.settings.openAlexApiKey.trim())),
           }),
         () => this.fetchAll(preliminary, vault),
       );

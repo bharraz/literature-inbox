@@ -11,26 +11,23 @@
  * nothing, and a dollar figure implies a bill that does not exist.
  */
 
-/** Reported by OpenAlex on a refusal, and the basis of the estimate. */
-export const COST_PER_REQUEST_USD = 0.001;
-
 /**
- * Assumed free daily allowance, in requests.
+ * Fallback daily allowance in credits, used only before the first response of
+ * the day has told us the real figure.
  *
- * An estimate, and labelled as one wherever it is shown. OpenAlex reports what
- * remains but not the total, so this is derived from the per-request cost and
- * the observed allowance — replace it the moment a real figure is available
- * from a response.
+ * 1000 credits keyless, measured from `X-RateLimit-Limit`. A key raises it —
+ * we do not assume by how much, we read it.
  */
-export const ESTIMATED_DAILY_REQUESTS = 100;
+export const ASSUMED_DAILY_CREDITS = 1000;
 
 export interface BudgetState {
   /** `YYYY-MM-DD` (UTC) the count belongs to. */
   day: string;
+  /** Requests we made today — the fallback tally, and a sanity check. */
   requests: number;
-  /** Remaining allowance as OpenAlex last reported it, when it has. */
+  /** Credits left, straight from `X-RateLimit-Remaining`. */
   reportedRemaining?: number;
-  /** Total allowance, if a response ever tells us. */
+  /** Daily total, straight from `X-RateLimit-Limit`. */
   reportedTotal?: number;
 }
 
@@ -53,6 +50,26 @@ export function recordRequests(
   const day = utcDay(now);
   if (!state || state.day !== day) return { day, requests: count };
   return { ...state, requests: state.requests + count };
+}
+
+/**
+ * Fold in what OpenAlex just told us.
+ *
+ * Its own figures always win over our tally: the allowance is shared with any
+ * other tool using the same key or address, so a local count can only ever be
+ * a lower bound.
+ */
+export function recordReported(
+  state: BudgetState | undefined,
+  reported: { limit?: number; remaining?: number },
+  now: Date = new Date(),
+): BudgetState {
+  const base = state && state.day === utcDay(now) ? state : emptyBudget(utcDay(now));
+  return {
+    ...base,
+    reportedTotal: reported.limit ?? base.reportedTotal,
+    reportedRemaining: reported.remaining ?? base.reportedRemaining,
+  };
 }
 
 export interface BudgetGauge {
@@ -79,17 +96,17 @@ export function gauge(state: BudgetState | undefined, day: string): BudgetGauge 
       total: current.reportedTotal,
       fraction: clamp(used / current.reportedTotal),
       measured: true,
-      label: `${used} of ${current.reportedTotal} requests used today`,
+      label: `${used} of ${current.reportedTotal} credits used today`,
     };
   }
 
   const used = current?.requests ?? 0;
   return {
     used,
-    total: ESTIMATED_DAILY_REQUESTS,
-    fraction: clamp(used / ESTIMATED_DAILY_REQUESTS),
+    total: ASSUMED_DAILY_CREDITS,
+    fraction: clamp(used / ASSUMED_DAILY_CREDITS),
     measured: false,
-    label: `about ${used} of ~${ESTIMATED_DAILY_REQUESTS} requests used today (estimated)`,
+    label: `about ${used} of ~${ASSUMED_DAILY_CREDITS} credits used today (estimated)`,
   };
 }
 

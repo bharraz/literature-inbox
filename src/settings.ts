@@ -94,9 +94,13 @@ export interface LiteratureInboxSettings {
   /** Off by default: nothing is ever removed until you say so. */
   pruneEnabled: boolean;
 
-  /** Optional OpenAlex polite-pool address. Blank by default — never a
-   * hardcoded developer email. */
-  mailto: string;
+  /**
+   * A free OpenAlex API key. Blank by default — never a hardcoded one.
+   *
+   * Optional, not required: keyless requests still work, on a smaller daily
+   * allowance. See docs/openalex-dependency.md.
+   */
+  openAlexApiKey: string;
   /** Path to a zot2vault executable the user downloaded themselves. Blank by
    * default; the plugin never ships or fetches a binary. */
   zot2vaultPath: string;
@@ -131,7 +135,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   subjectConcepts: false,
   keepWindowDays: 30,
   pruneEnabled: false,
-  mailto: "",
+  openAlexApiKey: "",
   zot2vaultPath: "",
 };
 
@@ -874,17 +878,18 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Network and integrations").setHeading();
 
     new Setting(containerEl)
-      .setName("Email for OpenAlex (optional)")
+      .setName("OpenAlex API key (optional)")
       .setDesc(
-        "OpenAlex needs no account. Supplying an address puts your requests in their " +
-          "faster 'polite pool'. It is sent only to openalex.org.",
+        "The plugin works without one. A free key from openalex.org raises your daily " +
+          "allowance about tenfold, which matters if you build large starting graphs or " +
+          "run updates often. It is sent only to openalex.org, and never shared.",
       )
       .addText((text) =>
         text
-          .setPlaceholder("you@example.com")
-          .setValue(this.plugin.settings.mailto)
+          .setPlaceholder("leave blank to use the free allowance")
+          .setValue(this.plugin.settings.openAlexApiKey)
           .onChange(async (value) => {
-            this.plugin.settings.mailto = value.trim();
+            this.plugin.settings.openAlexApiKey = value.trim();
             await this.plugin.saveSettings();
           }),
       );

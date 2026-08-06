@@ -107,7 +107,7 @@ suite("a real vault, end to end", () => {
         p.settings.openAlexTopic = TOPIC;
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 100;
-        p.settings.mailto = process.env.LIVE_MAILTO ?? "";
+        p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
       });
 
       await plugin.buildKernel();
@@ -141,7 +141,7 @@ suite("a real vault, end to end", () => {
         p.settings.openAlexTopic = TOPIC;
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 120;
-        p.settings.mailto = process.env.LIVE_MAILTO ?? "";
+        p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
         p.settings.arrivalSelection = "both";
         p.settings.maxArrivalsPerRun = 25;
         p.settings.newWindowDays = 30;
@@ -185,7 +185,7 @@ suite("a real vault, end to end", () => {
         p.settings.openAlexTopic = TOPIC;
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 120;
-        p.settings.mailto = process.env.LIVE_MAILTO ?? "";
+        p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
         p.settings.openAlexEnabled = false;
         p.settings.rssEnabled = true;
         p.settings.feeds = [{ url: FEED, enabled: true }];

@@ -112,11 +112,11 @@ async function simulateField(field: string): Promise<FieldResult> {
   const transport = new NodeTransport();
   // Deliberately slower and more patient than the plugin's own default: this
   // harness makes a burst of large queries back to back, which is exactly the
-  // shape that earns a 429. Set LIVE_MAILTO to join OpenAlex's polite pool.
+  // shape that earns a 429. Set LIVE_OPENALEX_KEY for a larger allowance.
   const client = new OpenAlexClient(transport, {
     minIntervalMs: 1200,
     maxRetries: 5,
-    mailto: process.env.LIVE_MAILTO || undefined,
+    apiKey: process.env.LIVE_OPENALEX_KEY || undefined,
   });
 
   // Two live requests per field: the starting graph, and a month of papers.

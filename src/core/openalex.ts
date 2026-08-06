@@ -1,9 +1,10 @@
 /**
- * OpenAlex client. Keyless, with an optional polite-pool `mailto`.
+ * OpenAlex client. Works keyless, with an optional free API key.
  *
- * The `mailto` is a *user setting*, never a hardcoded developer address:
- * shipping one would put every user's traffic under one identity and is
- * exactly the sort of thing plugin review flags.
+ * The key is a *user setting*, never a hardcoded one: shipping a key would put
+ * every user's traffic under one identity and burn one shared allowance, which
+ * is exactly the sort of thing plugin review flags. Keyless still works — see
+ * docs/openalex-dependency.md for what that costs.
  *
  * Junk filtering happens here rather than in callers because OpenAlex has
  * real data-quality problems — records with no title, and publication dates
@@ -180,7 +181,15 @@ function chunked<T>(items: T[], size: number): T[][] {
 export type RecencyBasis = "created" | "publication";
 
 export interface OpenAlexOptions {
-  mailto?: string;
+  /**
+   * A free OpenAlex API key. Optional: without one you get a smaller daily
+   * allowance (1000 credits, measured) rather than no service. Sent as the
+   * `api_key` query parameter, which is how OpenAlex accepts it.
+   *
+   * The `mailto` "polite pool" this replaced no longer exists — it was retired
+   * when keys were introduced in February 2026.
+   */
+  apiKey?: string;
   minIntervalMs?: number;
   maxRetries?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -231,7 +240,7 @@ export class OpenAlexClient {
   }
 
   private buildUrl(base: string, params: Record<string, string | undefined>): string {
-    return buildUrl(base, { ...params, mailto: this.options.mailto });
+    return buildUrl(base, { ...params, api_key: this.options.apiKey });
   }
 
   /**

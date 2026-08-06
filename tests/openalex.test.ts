@@ -40,7 +40,7 @@ const noSleep = async () => {};
 const clientWith = (bodies: CannedResponse[], today?: Date) => {
   const transport = new SequenceTransport(bodies);
   const client = new OpenAlexClient(transport, {
-    mailto: "test@example.com",
+    apiKey: "test-key",
     sleep: noSleep,
     today: today ? () => today : undefined,
   });
@@ -80,10 +80,10 @@ describe("workByDoi against a real recorded response", () => {
     await expect(client.workByDoi("10.1/nope")).resolves.toBeUndefined();
   });
 
-  it("sends the polite-pool mailto", async () => {
+  it("sends the API key when one is configured", async () => {
     const { client, transport } = clientWith([load("openalex_by_doi.json")]);
     await client.workByDoi("10.1109/cvpr.2016.90");
-    expect(queryOf(transport.requested[0] as string).mailto).toBe("test@example.com");
+    expect(queryOf(transport.requested[0] as string).api_key).toBe("test-key");
   });
 });
 

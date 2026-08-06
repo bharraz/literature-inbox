@@ -7,19 +7,20 @@ five papers you care about is visually loud; an isolated dot is easy to ignore.
 You triage by looking at the graph, open what looks interesting, and everything
 you never touched quietly cleans itself out.
 
-> **Status:** the core is built and tested (146 tests, `tsc` clean, builds to
-> `main.js`) but has not yet been run in a real Obsidian vault — that's the
-> first milestone. See `roadmap.md` for the full design context and the path to
-> the community store, and `docs/interop-spec.md` for the on-disk contract this
-> plugin shares with its companion desktop app, zot2vault.
+> **Status:** built and tested (350 hermetic tests, `tsc` clean, plus live
+> harnesses that build a real vault and measure connectivity). Loaded in a real
+> vault; still being shaken out. See `roadmap.md` for design context and the
+> path to the community store, `docs/interop-spec.md` for the on-disk contract
+> shared with the companion desktop app zot2vault, and
+> `docs/openalex-dependency.md` for exactly what this plugin needs from
+> OpenAlex and what would break if that changed.
 
 ## The core loop
 
 1. **Arrive.** On a manual "Update inbox" run (never a background daemon), new
    papers are fetched from your configured sources and land as notes in
    `Inbox/`, each wired via exact citation edges (OpenAlex reference lists — no
-   PDFs, no fuzzy matching) to the papers already in your vault. The `_Inbox.md`
-   front page lists arrivals by date.
+   PDFs, no fuzzy matching) to the papers already in your vault.
 2. **Keep window.** Arrivals sit in `Inbox/` for a configurable window
    (default ~30 days).
 3. **Keep = move it out.** Want to keep a paper? Move the note from `Inbox/`
@@ -70,16 +71,26 @@ Configured in settings, each independently enabled with a per-run arrival cap
 - **OpenAlex topic** — free-text or topic query; settings show a live preview
   of the top ~20 titles ("does this look like your field?") before committing.
   Best edges: OpenAlex provides full reference lists.
-- **arXiv categories** (e.g. `cs.CL`) — the freshest stream for STEM; reference
-  data often lags, so unresolved arrivals get re-queried against OpenAlex on
-  later runs (citation backfill).
+- **arXiv categories** (e.g. `cs.CL`) — the freshest stream for STEM. You type
+  the category; the plugin turns it into arXiv's RSS feed for you.
 - **RSS/Atom feeds (bring your own URL)** — journal TOCs, bioRxiv, Scholar
-  alerts. Identity is the feed item's `guid` (falling back to its link), and
-  the plugin still tries to resolve a **DOI** for each item — from the item's
-  own fields, or by looking the title up on OpenAlex — so RSS arrivals get real
-  citation edges and dedup against the rest of the vault like anything else.
-  Items that resolve to nothing still arrive as shallow, edge-less nodes rather
-  than being dropped.
+  alerts, one row each with its own window and per-run cap. Identity is the
+  item's `guid` (falling back to its link).
+
+Feed items carry no reference list, so they arrive as isolated dots and are
+connected later: a scheduled backfill re-asks OpenAlex on three widening
+attempts (next run, ~4 days, ~30 days) and then says so on the note if the
+paper was never indexed. Resolving them *immediately* would cost OpenAlex's
+most expensive call type for a near-certain miss — see
+`docs/openalex-dependency.md`.
+
+## What this costs you
+
+Nothing, and no account is required. OpenAlex meters a free daily allowance
+(1,000 credits without a key); an ordinary update run costs around 13. A free
+API key raises the allowance roughly tenfold and is worth adding if you build
+large starting graphs — it's an optional setting, and the plugin never ships
+one. The settings page shows a live gauge of what's left today.
 
 **Identity discipline:** the same paper via two sources is one note. A note
 records *every* id it's known by (`doi:`, `openalex:`, `arxiv:`, `zotero:`,
@@ -128,7 +139,7 @@ Flows between the two tools:
   the exe-launcher works on mobile (gate that one behind `Platform.isDesktop`).
 - No bundled or auto-downloaded binaries. The zot2vault launcher runs only an
   executable path the user typed into settings, and the README discloses it.
-- OpenAlex `mailto` (polite pool) is an optional user setting — never ship a
+- The OpenAlex API key is an optional user setting — never ship a
   hardcoded email. Disclose exactly which hosts are contacted and when.
 - Manual runs only. No timers, no network on plugin load.
 - Never destroy user work: hash-guarded cleanup, trash not delete, preview

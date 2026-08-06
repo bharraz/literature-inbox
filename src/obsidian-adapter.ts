@@ -25,8 +25,27 @@ export class ObsidianTransport implements Transport {
     });
     // `Retry-After` is how a 429 tells us how long to wait. Ignoring it and
     // guessing is what turns one rate-limit into a stampede.
-    const retryAfter = response.headers?.["retry-after"] ?? response.headers?.["Retry-After"];
-    return { status: response.status, text: response.text, retryAfter };
+    const header = (name: string): string | undefined =>
+      response.headers?.[name] ?? response.headers?.[name.toLowerCase()];
+    const number = (name: string): number | undefined => {
+      const value = Number(header(name));
+      return Number.isFinite(value) ? value : undefined;
+    };
+
+    const retryAfter = header("Retry-After");
+    return {
+      status: response.status,
+      text: response.text,
+      retryAfter,
+      // Reported on every response, so the budget gauge is measured rather
+      // than estimated — see docs/openalex-dependency.md.
+      rateLimit: {
+        limit: number("X-RateLimit-Limit"),
+        remaining: number("X-RateLimit-Remaining"),
+        creditsUsed: number("X-RateLimit-Credits-Used"),
+        resetSeconds: number("X-RateLimit-Reset"),
+      },
+    };
   }
 }
 

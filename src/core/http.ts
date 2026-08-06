@@ -35,6 +35,20 @@ export interface TransportResponse {
   text: string;
   /** `Retry-After` header, when the server sent one. Seconds, or an HTTP date. */
   retryAfter?: string;
+  /** OpenAlex's `X-RateLimit-*` headers, present on every response. */
+  rateLimit?: RateLimitHeaders;
+}
+
+/** What OpenAlex reports about the daily allowance, on every response. */
+export interface RateLimitHeaders {
+  /** Total credits for the day. */
+  limit?: number;
+  /** Credits left today. */
+  remaining?: number;
+  /** What this request cost. */
+  creditsUsed?: number;
+  /** Seconds until midnight UTC. */
+  resetSeconds?: number;
 }
 
 /** A 429 that the caller should treat as "stop asking", not "try the next
