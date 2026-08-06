@@ -17,13 +17,15 @@ import { CrossrefClient } from "./core/crossref";
 import { doiResolver, titleResolver } from "./core/resolvers";
 import { PlanRequiredError, RateLimitError } from "./core/http";
 import { fetchFeed, newestItem } from "./core/rss";
+import { arxivCategoryFeedUrl, looksLikeArxivCategory } from "./core/feeds";
 import {
-  arxivCategoryFeedUrl,
+  describeSource,
   effective,
-  looksLikeArxivCategory,
-  migrateFeedList,
+  isUsable,
+  migrateSources,
   withinWindow,
-} from "./core/feeds";
+  type SourceConfig,
+} from "./core/sources";
 import { titlesMatch, normalizeTitle } from "./core/ids";
 import {
   EMPTY_STATE,
@@ -69,7 +71,6 @@ import {
 import {
   DEFAULT_SETTINGS,
   LiteratureInboxSettingTab,
-  splitList,
   type LiteratureInboxSettings,
 } from "./settings";
 
@@ -253,11 +254,22 @@ export default class LiteratureInboxPlugin extends Plugin {
   private async loadPersisted(): Promise<void> {
     const data = (await this.loadData()) as Partial<PersistedData> | null;
     this.settings = { ...DEFAULT_SETTINGS, ...(data?.settings ?? {}) };
-    // Feeds used to be one newline-separated string. Convert once, then drop
-    // the old key — silently losing someone's feeds on upgrade would be a
-    // poor welcome.
-    this.settings.feeds = migrateFeedList(this.settings.rssFeeds, this.settings.feeds);
-    delete this.settings.rssFeeds;
+    // Sources used to be three different shapes: a toggle plus a text box for
+    // OpenAlex, a comma-separated string for arXiv, and rows only for feeds.
+    // Convert once, then drop the old keys — silently losing someone's
+    // configured sources on upgrade would be a poor welcome.
+    this.settings.sources = migrateSources(this.settings, this.settings.sources);
+    for (const key of [
+      "openAlexEnabled",
+      "arrivalSelection",
+      "arxivEnabled",
+      "arxivCategories",
+      "rssEnabled",
+      "feeds",
+      "rssFeeds",
+    ] as const) {
+      delete this.settings[key];
+    }
     this.inbox = Array.isArray(data?.inbox) ? (data?.inbox as InboxRecord[]) : [];
     this.budget = data?.budget ?? emptyBudget(utcDay());
     this.openAlexIdByDoi = data?.openAlexIdByDoi ?? {};
@@ -460,104 +472,69 @@ export default class LiteratureInboxPlugin extends Plugin {
     return anchors;
   }
 
+  /**
+   * Consult every enabled source, in the order the user listed them.
+   *
+   * Order is load-bearing: when `maxArrivalsPerRun` bites, whatever is at the
+   * front of this list survives, so a row the user put first genuinely wins.
+   * The default first row is "papers citing my library", whose results are
+   * connected by construction.
+   */
   private async fetchAll(report: UpdateReport, vault: VaultIndex): Promise<Work[]> {
     const works: Work[] = [];
-    const perSource = this.settings.maxArrivalsPerRun;
-    // The user's window back from today, never `topWorks` and never "since you
-    // last ran". `topWorks` returns the most-cited papers on the topic —
-    // exactly what a kernel run just seeded — so using it here reported
-    // "0 new" on every first update, guaranteed. And anchoring on `lastUpdate`
-    // narrows the window to nothing on a second run the same day. The window
-    // overlaps previous runs on purpose: dedup is exact and cheap, so
-    // re-seeing a paper costs nothing and missing one is permanent.
-    const since = isoDaysAgo(this.settings.newWindowDays);
-    const selection = this.settings.arrivalSelection;
+    const globalCap = this.settings.maxArrivalsPerRun;
 
-    // Adjacency first, deliberately. When the per-run cap bites, whatever is
-    // at the front of this list survives — and a paper that cites your library
-    // is a better arrival than one that merely matches your topic string.
-    if (this.settings.openAlexEnabled && selection !== "topic") {
+    for (const source of this.settings.sources) {
+      if (!isUsable(source)) continue;
+      const since = isoDaysAgo(effective(source.windowDays, this.settings.newWindowDays));
+      const cap = effective(source.maxPerRun, globalCap);
       try {
-        const anchors = await this.adjacencyAnchors(vault);
-        if (anchors.length === 0) {
-          report.sourceErrors.push({
-            source: "Papers citing your library",
-            message:
-              `no papers in ${this.settings.papersFolder}/ have an identifier to match ` +
-              "against — build a starting graph first",
-          });
-        } else {
-          works.push(...(await this.openAlex().worksCitingSince(anchors, since, perSource)));
-        }
+        works.push(...(await this.fetchFrom(source, since, cap, vault, report)));
       } catch (error) {
         report.sourceErrors.push({
-          source: "Papers citing your library",
+          source: describeSource(source),
           message: String(error),
         });
       }
     }
-
-    if (
-      this.settings.openAlexEnabled &&
-      selection !== "adjacent" &&
-      this.settings.openAlexTopic.trim()
-    ) {
-      try {
-        works.push(
-          ...(await this.openAlex().worksSince(this.settings.openAlexTopic, since, perSource)),
-        );
-      } catch (error) {
-        report.sourceErrors.push({ source: "OpenAlex topic", message: String(error) });
-      }
-    }
-
-    // arXiv categories and hand-entered feeds are the same mechanism: a
-    // category is just a feed URL the user should not have to know.
-    const feedSources: { label: string; url: string; windowDays?: number; cap?: number }[] = [];
-    if (this.settings.arxivEnabled) {
-      for (const category of splitList(this.settings.arxivCategories)) {
-        feedSources.push({ label: `arXiv ${category}`, url: arxivCategoryFeedUrl(category) });
-      }
-    }
-    if (this.settings.rssEnabled) {
-      for (const feed of this.settings.feeds) {
-        if (!feed.enabled || !feed.url.trim()) continue;
-        feedSources.push({
-          label: feed.url,
-          url: feed.url,
-          windowDays: feed.windowDays,
-          cap: feed.maxPerRun,
-        });
-      }
-    }
-
-    if (feedSources.length > 0) {
-      const feedWorks: Work[] = [];
-      for (const source of feedSources) {
-        try {
-          const items = await fetchFeed(this.transport(), source.url);
-          const feedSince = isoDaysAgo(effective(source.windowDays, this.settings.newWindowDays));
-          const cap = effective(source.cap, perSource);
-          feedWorks.push(...withinWindow(items, feedSince).slice(0, cap));
-        } catch (error) {
-          report.sourceErrors.push({ source: source.label, message: String(error) });
-        }
-      }
-      // Deliberately *not* resolving DOIs by title here.
-      //
-      // A feed item has no DOI, so the only route to one is a title search —
-      // and a title search is the most expensive call OpenAlex sells, ten
-      // times a filter. Worse, at fetch time it is near-certain to miss: these
-      // are preprints published hours ago, and OpenAlex has not indexed them
-      // yet. Measured live: 25 arrivals, 25 searches, 0 resolved.
-      //
-      // The scheduled backfill does the same lookup later (next run, ~4 days,
-      // ~30 days), by which time OpenAlex plausibly has the paper — same
-      // outcome, a tenth of the cost, and it gives up instead of retrying
-      // forever. See docs/openalex-dependency.md.
-      works.push(...feedWorks);
-    }
     return works;
+  }
+
+  /** One source row's worth of candidate papers. */
+  private async fetchFrom(
+    source: SourceConfig,
+    since: string,
+    cap: number,
+    vault: VaultIndex,
+    report: UpdateReport,
+  ): Promise<Work[]> {
+    switch (source.kind) {
+      case "citing": {
+        const anchors = await this.adjacencyAnchors(vault);
+        if (anchors.length === 0) {
+          report.sourceErrors.push({
+            source: describeSource(source),
+            message:
+              `no papers in ${this.settings.papersFolder}/ carry an identifier to match ` +
+              "against — add some papers to your graph first",
+          });
+          return [];
+        }
+        return this.openAlex().worksCitingSince(anchors, since, cap);
+      }
+
+      case "topic":
+        return this.openAlex().worksSince(source.value, since, cap);
+
+      case "arxiv":
+      case "feed": {
+        // A category is just a feed URL the user should not have to know.
+        const url =
+          source.kind === "arxiv" ? arxivCategoryFeedUrl(source.value) : source.value;
+        const items = await fetchFeed(this.transport(), url);
+        return withinWindow(items, since).slice(0, cap);
+      }
+    }
   }
 
   /**
@@ -900,12 +877,8 @@ ${content.slice(marker)}`;
       notify("Literature Inbox is already running.");
       return;
     }
-    if (
-      !this.settings.openAlexEnabled &&
-      !this.settings.arxivEnabled &&
-      !this.settings.rssEnabled
-    ) {
-      notify("No sources are enabled — turn one on in Literature Inbox settings.");
+    if (!this.settings.sources.some(isUsable)) {
+      notify("No sources are switched on — add one in Literature Inbox settings.");
       return;
     }
 
@@ -1124,44 +1097,29 @@ ${content.slice(marker)}`;
   }
 
   /**
-   * Fetch each configured feed once and report what came back.
+   * Fetch a source once and report what came back.
    *
-   * A feed that is dead, mistyped, or not actually a feed is otherwise
-   * indistinguishable from a feed that simply has nothing new — you find out
-   * three empty updates later, if at all. Checking at the point of entry is
-   * the whole value. Deliberately ignores the RSS toggle: testing a feed
-   * before switching the source on is the normal order.
+   * A feed or category that is dead, mistyped, or not actually a feed is
+   * otherwise indistinguishable from one that simply has nothing new — you
+   * find out three empty updates later, if at all. Deliberately ignores the
+   * row's on/off switch: testing before switching a source on is the normal
+   * order.
    */
   async testFeeds(onlyUrl?: string): Promise<void> {
-    const urls = (onlyUrl ? [onlyUrl] : this.settings.feeds.map((feed) => feed.url))
+    const urls = (
+      onlyUrl
+        ? [onlyUrl]
+        : this.settings.sources
+            .filter((source) => source.kind === "feed")
+            .map((source) => source.value)
+    )
       .map((url) => url.trim())
       .filter(Boolean);
     if (urls.length === 0) {
-      notify("Add at least one feed URL first.");
+      notify("Add a feed URL first.");
       return;
     }
-
-    notify(`Testing ${urls.length} feed(s)…`);
-    const results: FeedTestResult[] = [];
-    for (const url of urls) {
-      try {
-        // No retries here, unlike a real update: this is a diagnostic, and a
-        // user waiting on a button wants the answer now. Backing off three
-        // times over a dead URL would sit silent for the better part of a
-        // minute across a few feeds.
-        const works = await fetchFeed(this.transport(), url, { maxRetries: 0 });
-        const newest = newestItem(works);
-        results.push({
-          url,
-          count: works.length,
-          newestTitle: newest?.title,
-          newestDate: newest?.date,
-        });
-      } catch (error) {
-        results.push({ url, count: 0, error: String(error) });
-      }
-    }
-    new FeedTestModal(this.app, results).open();
+    await this.reportSources(urls.map((url) => ({ label: url, url })));
   }
 
   /**
@@ -1171,35 +1129,52 @@ ${content.slice(marker)}`;
    * `quantph` simply returns an empty feed. Without a check that is
    * indistinguishable from a quiet week.
    */
-  async testArxivCategories(): Promise<void> {
-    const categories = splitList(this.settings.arxivCategories);
+  async testArxivCategories(onlyCategory?: string): Promise<void> {
+    const categories = (
+      onlyCategory
+        ? [onlyCategory]
+        : this.settings.sources
+            .filter((source) => source.kind === "arxiv")
+            .map((source) => source.value)
+    )
+      .map((category) => category.trim())
+      .filter(Boolean);
     if (categories.length === 0) {
-      notify("Enter at least one arXiv category first, e.g. quant-ph.");
+      notify("Enter an arXiv category first, e.g. quant-ph.");
       return;
     }
 
-    notify(`Testing ${categories.length} categor(y/ies)…`);
+    const targets = categories.map((category) => ({
+      label: category,
+      url: looksLikeArxivCategory(category) ? arxivCategoryFeedUrl(category) : undefined,
+    }));
+    await this.reportSources(targets);
+  }
+
+  /** Fetch each target once and show what it returned. */
+  private async reportSources(
+    targets: { label: string; url?: string }[],
+  ): Promise<void> {
+    notify(`Testing ${targets.length} source(s)…`);
     const results: FeedTestResult[] = [];
-    for (const category of categories) {
-      if (!looksLikeArxivCategory(category)) {
-        results.push({ url: category, count: 0, error: "not an arXiv category name" });
+    for (const target of targets) {
+      if (!target.url) {
+        results.push({ url: target.label, count: 0, error: "not an arXiv category name" });
         continue;
       }
       try {
-        // Tested through the same path an update uses, so a green test means
-        // the update will work — not that some other endpoint answered.
-        const works = await fetchFeed(this.transport(), arxivCategoryFeedUrl(category), {
-          maxRetries: 0,
-        });
+        // No retries: this is a diagnostic, and a user waiting on a button
+        // wants the answer now rather than three backoffs later.
+        const works = await fetchFeed(this.transport(), target.url, { maxRetries: 0 });
         const newest = newestItem(works);
         results.push({
-          url: category,
+          url: target.label,
           count: works.length,
           newestTitle: newest?.title,
           newestDate: newest?.date,
         });
       } catch (error) {
-        results.push({ url: category, count: 0, error: String(error) });
+        results.push({ url: target.label, count: 0, error: String(error) });
       }
     }
     new FeedTestModal(this.app, results).open();

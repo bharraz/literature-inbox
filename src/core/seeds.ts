@@ -58,9 +58,16 @@ function tokenize(raw: string): string[] {
  * suffix — `2401.12345v3` and `2401.12345` are the same paper. */
 function asArxivId(token: string): string | undefined {
   let value = arxivIdFromDoi(token) ?? token.trim();
-  const urlMatch = value.match(/arxiv\.org\/(?:abs|pdf)\/(\S+)/i);
+  // `abs`, `pdf` and `html` are all real arXiv URL shapes, and people paste
+  // whichever tab they had open. Stopping at `?` or `#` matters: a link copied
+  // from a browser routinely carries `?context=quant-ph` or `#comments`, and
+  // including that in the id makes it match nothing.
+  const urlMatch = value.match(/arxiv\.org\/(?:abs|pdf|html)\/([^\s?#]+)/i);
   if (urlMatch?.[1]) value = urlMatch[1];
-  value = value.replace(/^arxiv:/i, "").replace(/\.pdf$/i, "");
+  value = value
+    .replace(/^arxiv:/i, "")
+    .replace(/\.pdf$/i, "")
+    .replace(/\/+$/, "");
   // Strip the version in place rather than via `bareArxivId`, which also takes
   // the last path segment — that would turn `hep-th/9901001` into `9901001`
   // and lose the archive half of a pre-2007 id.

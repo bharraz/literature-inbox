@@ -124,11 +124,10 @@ function ageBackfillState(plugin: LiteratureInboxPlugin, days: number): void {
   }
 }
 
+/** One topic source row, which is the simplest deterministic configuration. */
 function enableOpenAlex(plugin: LiteratureInboxPlugin, topic = "transformers") {
-  plugin.settings.openAlexEnabled = true;
+  plugin.settings.sources = [{ kind: "topic", value: topic, enabled: true }];
   plugin.settings.openAlexTopic = topic;
-  plugin.settings.arxivEnabled = false;
-  plugin.settings.rssEnabled = false;
 }
 
 beforeEach(() => {
@@ -354,9 +353,7 @@ describe("update inbox", () => {
 describe("degenerate and failure cases", () => {
   it("says so when no sources are enabled, and writes nothing", async () => {
     const { app, plugin } = await bootPlugin((p) => {
-      p.settings.openAlexEnabled = false;
-      p.settings.arxivEnabled = false;
-      p.settings.rssEnabled = false;
+      p.settings.sources = [];
     });
 
     await runCommand(plugin, "update-inbox");
@@ -838,6 +835,7 @@ describe("choosing arrivals by citation adjacency", () => {
   ) {
     const booted = await bootPlugin((p) => {
       enableOpenAlex(p);
+      p.settings.sources = [{ kind: "citing", value: "", enabled: true }];
       configure?.(p);
     });
     await booted.app.vault.createFolder("Papers");
@@ -850,9 +848,7 @@ describe("choosing arrivals by citation adjacency", () => {
 
   it("asks what has cited the papers you keep", async () => {
     respondWith(openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]));
-    const { app, plugin } = await vaultWithKeptPaper((p) => {
-      p.settings.arrivalSelection = "adjacent";
-    });
+    const { app, plugin } = await vaultWithKeptPaper();
 
     await plugin.updateInbox();
 
@@ -864,9 +860,7 @@ describe("choosing arrivals by citation adjacency", () => {
     // The entire point: an arrival chosen this way is connected by
     // construction rather than by hoping an edge exists.
     respondWith(openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]));
-    const { app, plugin } = await vaultWithKeptPaper((p) => {
-      p.settings.arrivalSelection = "adjacent";
-    });
+    const { app, plugin } = await vaultWithKeptPaper();
 
     await plugin.updateInbox();
 
@@ -906,8 +900,7 @@ describe("choosing arrivals by citation adjacency", () => {
   it("says the library is empty instead of reporting a normal quiet run", async () => {
     respondWith(openAlexPage([]));
     const { plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.arrivalSelection = "adjacent";
+      p.settings.sources = [{ kind: "citing", value: "", enabled: true }];
     });
 
     await plugin.updateInbox();
@@ -933,7 +926,10 @@ describe("choosing arrivals by citation adjacency", () => {
       };
     });
     const { app, plugin } = await vaultWithKeptPaper((p) => {
-      p.settings.arrivalSelection = "both";
+      p.settings.sources = [
+        { kind: "citing", value: "", enabled: true },
+        { kind: "topic", value: "transformers", enabled: true },
+      ];
       p.settings.maxArrivalsPerRun = 1;
     });
 
@@ -946,7 +942,7 @@ describe("choosing arrivals by citation adjacency", () => {
   it("skips the adjacency query entirely in topic-only mode", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { plugin } = await vaultWithKeptPaper((p) => {
-      p.settings.arrivalSelection = "topic";
+      p.settings.sources = [{ kind: "topic", value: "transformers", enabled: true }];
     });
 
     await plugin.updateInbox();
@@ -1041,10 +1037,10 @@ describe("Crossref alongside OpenAlex", () => {
     );
 
     const { app, plugin } = await bootPlugin((p) => {
-      p.settings.openAlexEnabled = false;
       p.settings.crossrefEnabled = true;
-      p.settings.rssEnabled = true;
-      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true }];
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/f.xml", enabled: true },
+      ];
     });
     await app.vault.createFolder("Papers");
     await app.vault.create(
@@ -1092,9 +1088,9 @@ describe("per-feed settings", () => {
       ),
     );
     const { app, plugin } = await bootPlugin((p) => {
-      p.settings.openAlexEnabled = false;
-      p.settings.rssEnabled = true;
-      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true, windowDays: 7 }];
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/f.xml", enabled: true, windowDays: 7 },
+      ];
     });
 
     await plugin.updateInbox();
@@ -1111,9 +1107,9 @@ describe("per-feed settings", () => {
       ),
     );
     const { app, plugin } = await bootPlugin((p) => {
-      p.settings.openAlexEnabled = false;
-      p.settings.rssEnabled = true;
-      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true, maxPerRun: 1 }];
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/f.xml", enabled: true, maxPerRun: 1 },
+      ];
     });
 
     await plugin.updateInbox();
@@ -1124,47 +1120,66 @@ describe("per-feed settings", () => {
 
   it("skips a disabled row without deleting its settings", async () => {
     const { plugin } = await bootPlugin((p) => {
-      p.settings.openAlexEnabled = false;
-      p.settings.rssEnabled = true;
-      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: false, windowDays: 7 }];
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/f.xml", enabled: false, windowDays: 7 },
+      ];
     });
 
     await plugin.updateInbox();
 
     expect(requestedUrls).toHaveLength(0);
-    expect(plugin.settings.feeds[0]?.windowDays).toBe(7);
+    expect(plugin.settings.sources[0]?.windowDays).toBe(7);
   });
 
-  it("migrates a pre-rows settings file instead of losing the feeds", async () => {
+  it("migrates a pre-rows settings file instead of losing the sources", async () => {
     const app = new App();
     const plugin = new LiteratureInboxPlugin(app as never, {} as never);
     await plugin.saveData({
-      settings: { ...plugin.settings, rssFeeds: "https://old.example/f.xml" },
+      settings: {
+        ...plugin.settings,
+        // Empty, as a pre-rows settings file would be.
+        sources: [],
+        openAlexEnabled: true,
+        openAlexTopic: "transformers",
+        arrivalSelection: "both",
+        arxivEnabled: true,
+        arxivCategories: "quant-ph",
+        rssEnabled: true,
+        feeds: [{ url: "https://old.example/f.xml", enabled: true }],
+      },
       inbox: [],
     });
 
     await plugin.onload();
 
-    expect(plugin.settings.feeds).toEqual([{ url: "https://old.example/f.xml", enabled: true }]);
-    expect(plugin.settings.rssFeeds).toBeUndefined();
+    expect(plugin.settings.sources.map((s) => `${s.kind}:${s.value}`)).toEqual([
+      "citing:",
+      "topic:transformers",
+      "arxiv:quant-ph",
+      "feed:https://old.example/f.xml",
+    ]);
+    // Old keys are dropped, so migration runs exactly once.
+    expect(plugin.settings.arxivCategories).toBeUndefined();
+    expect(plugin.settings.feeds).toBeUndefined();
   });
 
-  it("renders a row per feed with its own controls", async () => {
+  it("renders one row per source, whatever its kind", async () => {
     const { plugin } = await bootPlugin((p) => {
-      p.settings.feeds = [
-        { url: "https://a.example/f.xml", enabled: true },
-        { url: "https://b.example/f.xml", enabled: true },
+      p.settings.sources = [
+        { kind: "citing", value: "", enabled: true },
+        { kind: "feed", value: "https://a.example/f.xml", enabled: true },
       ];
     });
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
 
-    const rows = allSettings.filter((s: Setting) => s.name.startsWith("Feed "));
+    const rows = allSettings.filter((s: Setting) => s.dropdowns.length === 1 && s.toggles.length === 1);
     expect(rows).toHaveLength(2);
-    expect(rows[0]?.texts[0]?.value).toBe("https://a.example/f.xml");
-    // URL, window, cap — plus enable, test, and remove.
-    expect(rows[0]?.texts).toHaveLength(3);
-    expect(rows[0]?.buttons).toHaveLength(2);
-    expect(rows[0]?.toggles).toHaveLength(1);
+    // "Papers citing my library" has nothing to type, so no value box:
+    // window and cap only.
+    expect(rows[0]?.texts).toHaveLength(2);
+    // A feed adds the URL box, plus a Test button alongside Remove.
+    expect(rows[1]?.texts).toHaveLength(3);
+    expect(rows[1]?.buttons).toHaveLength(2);
   });
 });
 
@@ -1207,10 +1222,9 @@ describe("testing feeds before trusting them", () => {
     // paste a URL, check it works, then turn it on.
     respondWith(feedXml("A Recent Paper"));
     const { plugin } = await bootPlugin((p) => {
-      p.settings.rssEnabled = false;
-      p.settings.feeds = [
-        { url: "https://example.org/one.xml", enabled: true },
-        { url: "https://example.org/two.xml", enabled: true },
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/one.xml", enabled: false },
+        { kind: "feed", value: "https://example.org/two.xml", enabled: false },
       ];
     });
 
@@ -1227,7 +1241,7 @@ describe("testing feeds before trusting them", () => {
       throw new Error("ENOTFOUND");
     });
     const { plugin } = await bootPlugin((p) => {
-      p.settings.feeds = [{ url: "https://example.org/dead.xml", enabled: true }];
+      p.settings.sources = [{ kind: "feed", value: "https://example.org/dead.xml", enabled: true }];
     });
 
     await expect(plugin.testFeeds()).resolves.toBeUndefined();

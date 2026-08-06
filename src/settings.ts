@@ -1,6 +1,14 @@
 import { PluginSettingTab, Setting, type App } from "obsidian";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
-import { emptyFeed, type FeedConfig } from "./core/feeds";
+import { type FeedConfig } from "./core/feeds";
+import {
+  SOURCE_LABELS,
+  SOURCE_PLACEHOLDERS,
+  emptySource,
+  needsValue,
+  type SourceConfig,
+  type SourceKind,
+} from "./core/sources";
 import type LiteratureInboxPlugin from "./main";
 
 /**
@@ -34,20 +42,24 @@ export interface LiteratureInboxSettings {
    * gets upgraded in place if that paper later enters Zotero. */
   papersFolder: string;
 
-  openAlexEnabled: boolean;
-  openAlexTopic: string;
+  /** Every stream that brings in new papers, one row each. */
+  sources: SourceConfig[];
+
   /**
-   * How OpenAlex arrivals are chosen. `adjacent` asks what recently cited the
-   * papers you keep, so every arrival is connected by construction; `topic`
-   * matches a query and hopes an edge exists.
+   * The topic used by the *starting graph*, which is a different thing from a
+   * topic you follow: one seeds a library in a single run, the other watches
+   * a query indefinitely. Kept separate so seeding from one field while
+   * following three others is expressible.
    */
-  arrivalSelection: ArrivalSelection;
-  arxivEnabled: boolean;
-  arxivCategories: string;
-  rssEnabled: boolean;
-  /** One row per feed, each able to override the global window and cap. */
-  feeds: FeedConfig[];
-  /** Pre-rows format, read once on load and migrated into `feeds`. */
+  openAlexTopic: string;
+
+  /** Pre-rows settings, read once on load and migrated into `sources`. */
+  openAlexEnabled?: boolean;
+  arrivalSelection?: ArrivalSelection;
+  arxivEnabled?: boolean;
+  arxivCategories?: string;
+  rssEnabled?: boolean;
+  feeds?: FeedConfig[];
   rssFeeds?: string;
 
   /** How many top-cited papers the kernel run seeds the papers folder with. */
@@ -113,13 +125,10 @@ export interface LiteratureInboxSettings {
 export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   inboxFolder: "Inbox",
   papersFolder: "Papers",
-  openAlexEnabled: true,
+  // One connected stream by default: it needs no typing and every paper it
+  // finds is wired to something the user kept.
+  sources: [{ kind: "citing", value: "", enabled: true }],
   openAlexTopic: "",
-  arrivalSelection: "both",
-  arxivEnabled: false,
-  arxivCategories: "",
-  rssEnabled: false,
-  feeds: [],
   kernelSize: 100,
   kernelMode: "topic",
   kernelSeeds: "",
@@ -148,6 +157,13 @@ export function splitList(value: string): string[] {
     .split(/[\n,]/)
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+/** An optional numeric override: blank or nonsense means "inherit". */
+function parseOptionalCount(value: string, min: number): number | undefined {
+  const parsed = Number.parseInt(value, 10);
+  if (value.trim() === "" || !Number.isFinite(parsed) || parsed < min) return undefined;
+  return parsed;
 }
 
 /** Parse a positive integer setting, falling back rather than storing NaN. */
@@ -486,227 +502,134 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
   }
 
+  /**
+   * Every stream in one table.
+   *
+   * A topic query, "papers citing my library", an arXiv category and a feed
+   * URL are all the same kind of thing — something producing candidate papers
+   * — so they share a shape: on/off, what to watch, how far back counts as
+   * new, and how many per run. Only the first two columns differ by kind.
+   */
   private renderSources(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Where new papers come from").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
-        "Updates only run when you ask for them. Each source is capped per run, so a " +
-          "broad query can't flood your vault.",
+        "Nothing fetches on its own — these are only consulted when you press Update " +
+        "inbox. Leave the window and cap blank to inherit the settings below. When the " +
+        "per-run cap bites, rows higher in this list are kept first.",
     });
 
-    new Setting(containerEl)
-      .setName("What counts as new")
-      .setDesc(
-        "How many days back an update looks. Counted from when a paper was indexed, " +
-          "not when it was published — indexing lags publication by weeks, and a " +
-          "window on publication date silently skips anything indexed late. Runs " +
-          "overlap on purpose; papers you already have are recognised and skipped.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder(String(DEFAULT_RECENCY_WINDOW_DAYS))
-          .setValue(String(this.plugin.settings.newWindowDays))
-          .onChange(async (value) => {
-            this.plugin.settings.newWindowDays = parseCount(
-              value,
-              DEFAULT_SETTINGS.newWindowDays,
-            );
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("What counts as a new paper for you")
-      .setDesc(
-        "Papers that cite your library are guaranteed to connect to something you kept. " +
-          "Papers matching your topic cover the rest of the field, including work that " +
-          "has not cited you yet — but some will arrive unconnected. Both is usually " +
-          "right, and citing papers are kept first if the per-run cap bites.",
-      )
-      .addDropdown((dropdown) => {
-        for (const [value, label] of Object.entries(ARRIVAL_SELECTION_LABELS)) {
-          dropdown.addOption(value, label);
-        }
-        dropdown.setValue(this.plugin.settings.arrivalSelection).onChange(async (value) => {
-          this.plugin.settings.arrivalSelection = value as ArrivalSelection;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName("OpenAlex")
-      .setDesc(
-        "The best source for citation edges, because OpenAlex publishes reference " +
-          "lists. Turning this off disables both selections above.",
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.openAlexEnabled).onChange(async (value) => {
-          this.plugin.settings.openAlexEnabled = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(containerEl)
-      .setName("arXiv categories")
-      .setDesc(
-        "The freshest STEM stream — papers appear here days before OpenAlex indexes " +
-          "them, so they arrive without citations and get connected on a later run. " +
-          "Comma separated, e.g. cs.CL, quant-ph",
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.arxivEnabled).onChange(async (value) => {
-          this.plugin.settings.arxivEnabled = value;
-          await this.plugin.saveSettings();
-        }),
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("cs.CL, quant-ph")
-          .setValue(this.plugin.settings.arxivCategories)
-          .onChange(async (value) => {
-            this.plugin.settings.arxivCategories = value;
-            await this.plugin.saveSettings();
-          }),
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Test categories")
-          .setTooltip("Fetch each category once — a misspelled one returns nothing, silently")
-          .onClick(() => void this.plugin.testArxivCategories()),
-      );
-
-    new Setting(containerEl)
-      .setName("RSS / Atom feeds — the fastest source")
-      .setDesc(
-        "Recommended. Journal tables of contents, bioRxiv, Scholar alerts — any feed " +
-          "URL, one per line. Feeds carry a paper the day it appears, well before " +
-          "OpenAlex indexes it, so this is the quickest way to a non-empty inbox. A " +
-          "DOI is resolved for each item where possible, so feed items still get " +
-          "citation edges instead of arriving as isolated dots.",
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.rssEnabled).onChange(async (value) => {
-          this.plugin.settings.rssEnabled = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    this.renderFeedRows(containerEl);
-  }
-
-  /**
-   * One row per feed, rather than one textarea of URLs.
-   *
-   * Feeds are genuinely heterogeneous — a weekly journal table of contents and
-   * a daily preprint firehose want different windows and different caps — so
-   * the per-feed overrides have somewhere to live. Both are blank by default
-   * and inherit the global settings, so a user who doesn't care sees only a
-   * URL box and never fills anything else in.
-   */
-  private renderFeedRows(containerEl: HTMLElement): void {
-    const feeds = this.plugin.settings.feeds;
-
-    if (feeds.length === 0) {
+    const sources = this.plugin.settings.sources;
+    if (sources.length === 0) {
       containerEl.createEl("p", {
         cls: "setting-item-description",
-        text: "No feeds yet. Add one below — a journal's table of contents is a good start.",
+        text: "No sources yet. Add one below — “Papers citing my library” needs no typing.",
       });
     }
 
-    feeds.forEach((feed, index) => {
-      const row = new Setting(containerEl)
-        .setName(`Feed ${index + 1}`)
-        // Obsidian lays a Setting out as one line; six controls overflow it,
-        // and the overflow visibly escapes the box. This class lets the
-        // controls wrap instead — see styles.css.
-        .setClass("literature-inbox-feed-row")
-        .addToggle((toggle) =>
-          toggle
-            .setValue(feed.enabled)
-            .setTooltip("Fetch this feed on an update")
-            .onChange(async (value) => {
-              feed.enabled = value;
-              await this.plugin.saveSettings();
-            }),
-        )
-        .addText((text) =>
+    sources.forEach((source, index) => {
+      const row = new Setting(containerEl).setClass("literature-inbox-feed-row");
+
+      row.addToggle((toggle) =>
+        toggle
+          .setValue(source.enabled)
+          .setTooltip("Consult this source on an update")
+          .onChange(async (value) => {
+            source.enabled = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+      row.addDropdown((dropdown) => {
+        for (const [kind, label] of Object.entries(SOURCE_LABELS)) dropdown.addOption(kind, label);
+        dropdown.setValue(source.kind).onChange(async (value) => {
+          source.kind = value as SourceKind;
+          if (!needsValue(source.kind)) source.value = "";
+          await this.plugin.saveSettings();
+          this.display(); // the value box appears or disappears with the kind
+        });
+      });
+
+      if (needsValue(source.kind)) {
+        row.addText((text) =>
           text
-            .setPlaceholder("https://example.org/journal/feed.xml")
-            .setValue(feed.url)
+            .setPlaceholder(SOURCE_PLACEHOLDERS[source.kind])
+            .setValue(source.value)
             .onChange(async (value) => {
-              feed.url = value.trim();
+              source.value = value.trim();
               await this.plugin.saveSettings();
             }),
-        )
+        );
+      }
+
+      row
         .addText((text) =>
           text
             .setPlaceholder(`${this.plugin.settings.newWindowDays}d`)
-            .setValue(feed.windowDays === undefined ? "" : String(feed.windowDays))
+            .setValue(source.windowDays === undefined ? "" : String(source.windowDays))
             .onChange(async (value) => {
-              const parsed = Number.parseInt(value, 10);
-              feed.windowDays =
-                value.trim() === "" || !Number.isFinite(parsed) || parsed < 0
-                  ? undefined
-                  : parsed;
+              source.windowDays = parseOptionalCount(value, 0);
               await this.plugin.saveSettings();
             }),
         )
         .addText((text) =>
           text
             .setPlaceholder(`max ${this.plugin.settings.maxArrivalsPerRun}`)
-            .setValue(feed.maxPerRun === undefined ? "" : String(feed.maxPerRun))
+            .setValue(source.maxPerRun === undefined ? "" : String(source.maxPerRun))
             .onChange(async (value) => {
-              const parsed = Number.parseInt(value, 10);
-              feed.maxPerRun =
-                value.trim() === "" || !Number.isFinite(parsed) || parsed < 1
-                  ? undefined
-                  : parsed;
+              source.maxPerRun = parseOptionalCount(value, 1);
               await this.plugin.saveSettings();
             }),
         );
 
-      row
-        .addButton((button) =>
+      if (source.kind === "feed" || source.kind === "arxiv") {
+        row.addButton((button) =>
           button
             .setButtonText("Test")
-            .setTooltip("Fetch this feed once and report what came back")
-            .onClick(() => void this.plugin.testFeeds(feed.url)),
-        )
-        .addButton((button) =>
-          button
-            .setButtonText("Remove")
-            .setWarning()
-            .onClick(async () => {
-              this.plugin.settings.feeds.splice(index, 1);
-              await this.plugin.saveSettings();
-              this.display();
+            .setTooltip("Fetch this once and report what came back")
+            .onClick(() => {
+              if (source.kind === "arxiv") void this.plugin.testArxivCategories(source.value);
+              else void this.plugin.testFeeds(source.value);
             }),
         );
+      }
+
+      row.addButton((button) =>
+        button
+          .setButtonText("Remove")
+          .setWarning()
+          .onClick(async () => {
+            this.plugin.settings.sources.splice(index, 1);
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
 
       row.setDesc(
         index === 0
-          ? "URL, then how many days back count as new for this feed, then its cap " +
-              "per run. Leave the last two blank to inherit the global settings."
+          ? "On/off, what kind, what to watch, days back, and a per-run cap."
           : "",
       );
     });
 
-    new Setting(containerEl)
-      .addButton((button) =>
-        button.setButtonText("Add feed").onClick(async () => {
-          this.plugin.settings.feeds.push(emptyFeed());
-          await this.plugin.saveSettings();
-          this.display();
-        }),
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Test all")
-          .setTooltip("Fetch every feed once — a dead feed is otherwise indistinguishable " +
-            "from a quiet one")
-          .onClick(() => void this.plugin.testFeeds()),
-      );
+    new Setting(containerEl).addButton((button) =>
+      button.setButtonText("Add a source").onClick(async () => {
+        this.plugin.settings.sources.push(emptySource("topic"));
+        await this.plugin.saveSettings();
+        this.display();
+      }),
+    );
+
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "“Papers citing my library” is the one only OpenAlex can answer, and the " +
+        "one where every result is guaranteed to connect to something you kept. Topic " +
+        "search covers work that has not cited you yet. Feeds and arXiv are fastest to " +
+        "publish but carry no reference lists, so those arrive unconnected and are " +
+        "wired up on a later run.",
+    });
   }
 
   private renderArrivals(containerEl: HTMLElement): void {
