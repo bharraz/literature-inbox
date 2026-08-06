@@ -577,7 +577,7 @@ describe("building the starting graph", () => {
     await runCommand(plugin, "update-inbox");
 
     const url = requestedUrls[0] as string;
-    expect(url).toContain("from_created_date");
+    expect(url).toContain("from_publication_date");
     expect(url).not.toContain("cited_by_count");
     expect(notices.some((n) => n.includes("1 new"))).toBe(true);
   });
@@ -1061,7 +1061,7 @@ describe("what counts as new", () => {
     await runCommand(plugin, "update-inbox");
 
     // The colon is percent-encoded in the query string, so match the parts.
-    expect(requestedUrls[0]).toContain("from_created_date");
+    expect(requestedUrls[0]).toContain("from_publication_date");
     expect(requestedUrls[0]).toContain(isoDaysAgo(7));
   });
 

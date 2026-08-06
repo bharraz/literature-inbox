@@ -516,9 +516,13 @@ export interface RequestUrlResponse {
   text: string;
   json: unknown;
   headers: Record<string, string>;
+  retryAfter?: string;
 }
 
-type Responder = (url: string) => { status: number; text: string };
+type ResponderResult = { status: number; text: string; retryAfter?: string };
+/** May be async, so a live harness can point this at the real network while
+ * hermetic tests keep returning canned bytes synchronously. */
+type Responder = (url: string) => ResponderResult | Promise<ResponderResult>;
 
 let responder: Responder = () => {
   throw new Error(
@@ -540,10 +544,11 @@ export function clearRequests(): void {
 export async function requestUrl(param: RequestUrlParam | string): Promise<RequestUrlResponse> {
   const url = typeof param === "string" ? param : param.url;
   requestedUrls.push(url);
-  const { status, text } = responder(url);
+  const { status, text, retryAfter } = await responder(url);
   return {
     status,
     text,
+    retryAfter,
     get json() {
       return JSON.parse(text);
     },

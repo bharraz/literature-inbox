@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && node esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:live": "node scripts/live-api.mjs"
+    "test:live": "node scripts/live-api.mjs",
+    "test:vault": "vitest run tests/live-vault.test.ts"
   },
   "keywords": [
     "obsidian",

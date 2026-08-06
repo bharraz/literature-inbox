@@ -46,6 +46,27 @@ export class RateLimitError extends FetchError {
   }
 }
 
+/**
+ * A 429 that is not rate limiting at all.
+ *
+ * OpenAlex answers a request for a paid-plan feature with status 429 and a
+ * body saying "Plan upgrade required". Retrying and backing off is exactly the
+ * wrong response — waiting will never help — and reporting it as "we are going
+ * too fast" sends the user off tuning something irrelevant. Cost a real
+ * afternoon once; worth its own type.
+ */
+export class PlanRequiredError extends FetchError {
+  constructor(message: string) {
+    super(message, 429);
+    this.name = "PlanRequiredError";
+  }
+}
+
+/** Does a 429 body say this needs a paid plan rather than patience? */
+export function isPlanRequired(body: string): boolean {
+  return /plan upgrade required|requires a premium/i.test(body);
+}
+
 /** Seconds, or an HTTP date, into milliseconds to wait. */
 export function parseRetryAfter(value: string | undefined, now = Date.now()): number | undefined {
   if (!value) return undefined;
@@ -107,6 +128,12 @@ export async function getWithRetry(
       return response.text;
     }
     if (response.status === 429) {
+      if (isPlanRequired(response.text)) {
+        // Never retried: no amount of waiting buys a subscription.
+        throw new PlanRequiredError(
+          `OpenAlex requires a paid plan for this query: ${response.text.slice(0, 200)}`,
+        );
+      }
       // Honour the server's own number when it gives one, rather than our
       // guess — and surface 429 as its own type, so a caller looping over
       // batches can stop instead of hammering a service that just asked it

@@ -125,14 +125,16 @@ describe("topWorks pagination", () => {
 });
 
 describe("worksSince recency basis", () => {
-  it("filters on index date by default, not publication date", async () => {
-    // OpenAlex indexes papers weeks after their publication date. A window on
-    // publication date drops everything indexed late, permanently.
+  it("filters on publication date, the only window the free tier allows", async () => {
+    // `from_created_date` would be the better signal — OpenAlex indexes papers
+    // weeks after publication — but it is a paid-plan filter that answers 429
+    // "Plan upgrade required" for everyone else. Verified live, after it broke
+    // every update for a free-tier user.
     const { client, transport } = clientWith([load("openalex_works_since.json")]);
     await client.worksSince("quantum", "2026-07-01");
     const filter = queryOf(transport.requested[0] as string).filter ?? "";
-    expect(filter).toContain("from_created_date:2026-07-01");
-    expect(filter).not.toContain("from_publication_date");
+    expect(filter).toContain("from_publication_date:2026-07-01");
+    expect(filter).not.toContain("from_created_date");
   });
 
   it("still sorts newest-published first, so a capped run gets recent papers", async () => {
@@ -141,11 +143,11 @@ describe("worksSince recency basis", () => {
     expect(queryOf(transport.requested[0] as string).sort).toBe("publication_date:desc");
   });
 
-  it("uses publication date when asked explicitly", async () => {
+  it("uses index date only when asked explicitly, for anyone with a plan", async () => {
     const { client, transport } = clientWith([load("openalex_works_since.json")]);
-    await client.worksSince("quantum", "2026-07-01", 500, "publication");
+    await client.worksSince("quantum", "2026-07-01", 500, "created");
     expect(queryOf(transport.requested[0] as string).filter).toContain(
-      "from_publication_date:2026-07-01",
+      "from_created_date:2026-07-01",
     );
   });
 });
@@ -230,7 +232,7 @@ describe("adjacency selection", () => {
 
     const query = queryOf(transport.requested[0] as string);
     expect(query.filter).toContain("cites:W1|W2");
-    expect(query.filter).toContain("from_created_date:2026-07-01");
+    expect(query.filter).toContain("from_publication_date:2026-07-01");
     expect(query.sort).toBe("publication_date:desc");
   });
 

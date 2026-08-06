@@ -7,3 +7,4 @@ main.js.map
 # Scratch Obsidian vault for manual testing (TESTING.md). Holds generated
 # notes and local Obsidian config; regenerate it rather than commit it.
 test-vault/
+live-vault/

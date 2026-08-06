@@ -13,7 +13,7 @@ import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient } from "./core/openalex";
-import { RateLimitError } from "./core/http";
+import { PlanRequiredError, RateLimitError } from "./core/http";
 import { backfillDois, fetchFeed, newestItem } from "./core/rss";
 import { effective, migrateFeedList, withinWindow } from "./core/feeds";
 import { titlesMatch, normalizeTitle } from "./core/ids";
@@ -83,6 +83,9 @@ const ADJACENCY_ANCHOR_LIMIT = 100;
  */
 function describeFetchError(error: unknown, fetched: number, mailto: string): string {
   const gathered = fetched > 0 ? ` Kept the ${fetched} already fetched.` : "";
+  if (error instanceof PlanRequiredError) {
+    return `OpenAlex needs a paid plan for that query, so it was skipped.${gathered}`;
+  }
   if (error instanceof RateLimitError) {
     const advice = mailto.trim()
       ? "Wait a minute and run it again."

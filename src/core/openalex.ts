@@ -170,7 +170,13 @@ function chunked<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
-/** Which date a recency window is measured against — see `worksSince`. */
+/**
+ * Which date a recency window is measured against — see `worksSince`.
+ *
+ * `created` (when OpenAlex indexed the record) is a **paid-plan filter**. It is
+ * kept here because it is the better signal for anyone who has a plan, but it
+ * must never be the default: on the free tier it fails every request.
+ */
 export type RecencyBasis = "created" | "publication";
 
 export interface OpenAlexOptions {
@@ -296,24 +302,24 @@ export class OpenAlexClient {
   }
 
   /**
-   * Works matching *topic* that entered the window on/after `since`
-   * (YYYY-MM-DD), newest first.
+   * Works matching *topic* published on/after `since` (YYYY-MM-DD), newest
+   * first.
    *
-   * `basis` defaults to `created` — when OpenAlex *indexed* the record, not
-   * when the paper was published. Publication date is the intuitive choice and
-   * it is a trap: OpenAlex routinely indexes a paper weeks after its
-   * publication date, so a window anchored on publication and advanced on every
-   * run silently and permanently skips everything indexed late. Ingestion date
-   * is the only basis monotonic with what a caller can actually observe.
-   *
-   * Sorting stays on publication date, so a capped run returns the newest
-   * papers rather than an arbitrary slice of the window.
+   * `basis` defaults to `publication`, and **`created` is not usable on the
+   * free tier**: `from_created_date` is a paid-plan filter, and OpenAlex
+   * refuses it with a 429 whose body reads "Plan upgrade required" — which
+   * looks exactly like rate limiting and is not. Indexing date would be the
+   * better signal (OpenAlex indexes papers weeks after publication, so a
+   * publication-date window misses anything indexed late), and the free
+   * substitute is a *wide, overlapping* window: ask for the last N days every
+   * run and let exact dedup absorb the repeats. That is why the window is a
+   * user setting rather than "since you last ran".
    */
   async worksSince(
     topic: string,
     since: string,
     limit = 500,
-    basis: RecencyBasis = "created",
+    basis: RecencyBasis = "publication",
   ): Promise<Work[]> {
     const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
     const filter = [
@@ -389,7 +395,7 @@ export class OpenAlexClient {
     ids: string[],
     since: string,
     limit: number,
-    basis: RecencyBasis = "created",
+    basis: RecencyBasis = "publication",
   ): Promise<Work[]> {
     if (ids.length === 0 || limit <= 0) return [];
     const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
