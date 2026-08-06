@@ -214,8 +214,42 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
 
     this.renderStartingGraph(containerEl);
 
+    new Setting(containerEl).setName("3. Set up the graph (once, 30 seconds)").setHeading();
+    const graph = containerEl.createEl("div", { cls: "setting-item-description" });
+    graph.createEl("p", {
+      text:
+        "The plugin writes notes; Obsidian draws the graph. Out of the box every note in " +
+        "the vault shows up and arrivals look like everything else. In graph view, open " +
+        "its settings (the slider icon) and:",
+    });
+    const steps = graph.createEl("ol");
+    steps.createEl("li", {
+      text:
+        `Filters → search: path:${this.plugin.settings.inboxFolder} OR ` +
+        `path:${this.plugin.settings.papersFolder}`,
+    });
+    steps.createEl("li", {
+      text:
+        `Groups → New group: path:${this.plugin.settings.inboxFolder} in a bright colour, ` +
+        `then a second group for path:${this.plugin.settings.papersFolder} in a muted one.`,
+    });
+    graph.createEl("p", {
+      text:
+        "New papers are then the bright dots and your library is the background they wire " +
+        "into. Colour by path rather than by tag: notes carry no inbox/kept tag on " +
+        "purpose, because a tag written when the note is generated cannot follow a file " +
+        "you later drag into another folder.",
+    });
+    graph.createEl("p", {
+      text:
+        "Once you are reading regularly, a third group is worth adding: tag your own " +
+        "favourites (#favourite, #to-read, whatever you use) and give that group its own " +
+        "colour. Those tags are yours, they follow the note anywhere, and the plugin " +
+        "never touches them.",
+    });
+
     new Setting(containerEl)
-      .setName("3. Fetch new papers")
+      .setName("4. Fetch new papers")
       .setDesc(
         "Run this whenever you like — there is no background fetching. Keep a paper " +
           `by moving its note out of ${this.plugin.settings.inboxFolder}/ into ` +
