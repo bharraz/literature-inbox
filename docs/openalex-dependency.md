@@ -1,13 +1,69 @@
-# What this plugin needs from OpenAlex
+# Data sources, and what we need from OpenAlex
 
-OpenAlex is the only source of **citation edges** in this plugin, and edges are
-the entire product. Everything else — arXiv, RSS — supplies titles. This
-document records exactly what we depend on, what it costs, and what would break
-if OpenAlex changed it.
+**Section 0 is the complete list of sources. It is closed.** Nothing gets added
+without amending this file and stating what it does that the existing ones
+cannot. Written 2026-08-06, after too many ad-hoc "we could also use X"
+detours — the scholarly-metadata world is smaller than it looks, and all of it
+is below.
 
-Written 2026-08-06, after a live run discovered that two of our assumptions
-were already out of date. Verify against the API before trusting it; the
-"verified" column says how each line was established.
+## 0. What exists, and what each thing actually is
+
+**Registries** — where identifiers come from. A publisher deposits metadata
+here when it mints a DOI, so this is the source of record.
+
+| | What it is | Has references? | Cost |
+|---|---|---|---|
+| **Crossref** | The DOI registration agency for scholarly publishing, ~160M records deposited by publishers | Yes, *when the publisher deposited them* — measured at 23 of 49 carrying DOIs | Free, keyless |
+| DataCite | The same, for datasets and software | n/a | — |
+
+**Aggregators** — build a unified graph on top of registries plus other
+sources. This is where a *queryable* citation graph comes from.
+
+| | What it is | Unique capability | Cost |
+|---|---|---|---|
+| **OpenAlex** | Nonprofit (OurResearch) index merging Crossref, PubMed, arXiv and the retired Microsoft Academic Graph, ~250M works | **Inbound citations, filterable by date, 50 anchors per request** | Metered daily allowance |
+| Semantic Scholar | Allen Institute for AI; similar scope plus ML-derived extras | Citation *contexts* — the sentence a citation appears in | Free, key needed in practice |
+| Europe PMC | Biomedical literature only | — | Free |
+| INSPIRE-HEP | High-energy physics only | — | Free |
+
+**Citation-only slices**
+
+| | What it is | Verdict |
+|---|---|---|
+| **OpenCitations (COCI)** | DOI→DOI citation links extracted from open Crossref deposits | Measured: outbound duplicates Crossref; inbound **504'd after 280 s**. Not usable |
+
+**Primary / discovery sources** — where new papers appear first. Titles and
+abstracts only; none of them publish reference lists.
+
+| | What it is |
+|---|---|
+| **arXiv** | Preprint server: RSS feeds per category, plus an Atom query API |
+| bioRxiv / medRxiv | The same for biology and medicine, reachable as ordinary RSS |
+| Journal TOC and Scholar alert feeds | Ordinary RSS, bring your own URL |
+
+That is the field. There is no long tail waiting to be discovered.
+
+### 0.1 What we use, and why
+
+| Source | Role | Why it and not another |
+|---|---|---|
+| **OpenAlex** | Primary: citation edges, topic and author search, adjacency selection | The only source with a **queryable, date-filtered inbound citation index**. That one capability is what makes an arrival connected by construction |
+| **Crossref** | Secondary: title→DOI, and outbound references when OpenAlex cannot answer | Free and unmetered, and the registry of record. Half coverage on references beats none |
+| **arXiv + RSS** | Discovery only | Fastest to publish. Never a metadata authority — items get resolved against the two above |
+
+**Deliberately not used:**
+
+- **Semantic Scholar** — its one unique offering is citation contexts, which
+  are tabled. Adopting it means a second key and a second rate limit for data
+  we already have.
+- **OpenCitations** — measured and rejected above.
+- **Europe PMC, INSPIRE-HEP** — field-specific. Using them makes the plugin
+  behave differently per discipline, which is a design fork, not a feature.
+- **PDF parsing for references** — ruled out at the start: it breaks mobile
+  support and turns exact citation matching into fuzzy matching.
+
+The rest of this document is the deep dive on OpenAlex, because it is the one
+with a budget and the one that can break us.
 
 ---
 
