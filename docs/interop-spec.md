@@ -19,7 +19,10 @@ are the ones most likely to be "simplified" into a bug.
   part of the cross-tool contract). A vault can be moved or synced to another
   machine without invalidating anything here.
 - **`version` is an integer**, currently `1`, stored in `state.json`. Bump it
-  only for a *breaking* change. Adding a new optional key is not breaking.
+  only for a *breaking* change to the file format. Adding a new optional key is
+  not breaking, and neither is a change to how tools *behave* toward a format
+  that has not changed — an out-of-step pair must degrade rather than corrupt.
+  (§7.2's move from filename matching to identity matching is such a change.)
 - **Reader rules:** ignore unknown keys; tolerate missing optional keys; if
   `version` is higher than you understand, you may still read the keys you
   recognize but **must not write the file**.
@@ -175,9 +178,9 @@ its absence or staleness as meaningful.
 ### 5.1 Generated-section markers
 
 ```
-<!-- zot2vault:generated:start -->
+<!-- zot2vault:generated:start -→
 ...regenerated on every run...
-<!-- zot2vault:generated:end -->
+<!-- zot2vault:generated:end -→
 ...anything below the end marker is the user's and is preserved verbatim...
 ```
 
@@ -236,6 +239,10 @@ as pass-through rather than regenerating it away.
 
 Both tools must allocate identically, or the same paper lands in two
 differently-named files (§7.2 turns into a duplicate instead of an upgrade).
+
+Allocation names a **new** note and keeps names unique. It is *not* how an
+existing note is located — see §7.2. A note the user has renamed keeps its
+name; nothing recomputes it.
 
 **Base name**, first non-empty of: `title` → `"<FirstAuthorLastName> <year>"`
 (with `n.d.` when there's no year) → the work key.
@@ -334,12 +341,31 @@ the source of truth**, not a command having been run. Obsidian rewrites inbound
 wikilinks on move, so nothing dangles. The plugin only ever prunes notes still
 in `Inbox/`; a note that has left is no longer its business.
 
-If that paper later enters the user's Zotero library, zot2vault generates the
-same filename at the same path and *upgrades the note in place*: the generated
-block gains real metadata, annotations and citations, and everything the user
-wrote below the end marker survives. **This only works because both tools share
-§5.1 markers and §5.3 filename rules.** Diverge on either and the upgrade
-becomes a second, competing file.
+If that paper later enters the user's Zotero library, zot2vault *upgrades the
+note in place*: the generated block gains real metadata, annotations and
+citations, and everything the user wrote below the end marker survives.
+
+**Finding that note is by identity, never by filename.** Before writing, a tool
+scans the papers folder and reads each note's frontmatter, matching
+`origin_ids` intersection first and normalized `title` second (§3). It writes
+to the note it found; only when there is no match does it use the name §5.3
+allocates.
+
+This replaces an earlier rule where both tools computed the same filename and
+met there. That worked, and it made the filename load-bearing: renaming a note
+— including to the nickname the user actually calls the paper — produced a
+second, competing file on the next run. Identity already travels *inside* the
+note, so the name never needed to carry it. The cost is one file read per note
+per run, which is what a tool reading `origin-ids` out of frontmatter already
+pays anyway.
+
+**§5.1 markers remain load-bearing.** Diverge on those and the upgrade still
+becomes a second file, because there is then no generated block to replace.
+
+*Mixed versions degrade safely.* A tool still matching on filename keeps
+working on notes nobody has renamed, and duplicates one that has been — the
+old behavior, no worse. Nothing is corrupted either way, which is why this
+revision does not bump `version`: `state.json`'s format is unchanged.
 
 ### 7.3 What the plugin must tolerate
 
