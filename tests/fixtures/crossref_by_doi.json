@@ -1,0 +1,109 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message": {
+    "DOI": "10.1109/cvpr.2016.90",
+    "type": "proceedings-article",
+    "title": [
+      "Deep Residual Learning for Image Recognition"
+    ],
+    "subtitle": [],
+    "author": [
+      {
+        "given": "Kaiming",
+        "family": "He",
+        "sequence": "first",
+        "affiliation": [],
+        "role": [
+          {
+            "vocabulary": "crossref",
+            "role": "author"
+          }
+        ]
+      },
+      {
+        "given": "Xiangyu",
+        "family": "Zhang",
+        "sequence": "additional",
+        "affiliation": [],
+        "role": [
+          {
+            "vocabulary": "crossref",
+            "role": "author"
+          }
+        ]
+      },
+      {
+        "given": "Shaoqing",
+        "family": "Ren",
+        "sequence": "additional",
+        "affiliation": [],
+        "role": [
+          {
+            "vocabulary": "crossref",
+            "role": "author"
+          }
+        ]
+      }
+    ],
+    "issued": {
+      "date-parts": [
+        [
+          2016,
+          6
+        ]
+      ]
+    },
+    "published": {
+      "date-parts": [
+        [
+          2016,
+          6
+        ]
+      ]
+    },
+    "container-title": [
+      "2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)"
+    ],
+    "URL": "https://doi.org/10.1109/cvpr.2016.90",
+    "reference-count": 49,
+    "reference": [
+      {
+        "key": "ref39",
+        "article-title": "Overfeat: Integrated recognition, localization and detection using convolutional networks",
+        "author": "sermanet",
+        "year": "2014",
+        "journal-title": "ICLRE"
+      },
+      {
+        "key": "ref38",
+        "doi-asserted-by": "publisher",
+        "DOI": "10.1007/3-540-49430-8_11"
+      },
+      {
+        "key": "ref33",
+        "doi-asserted-by": "publisher",
+        "DOI": "10.1017/CBO9780511812651"
+      },
+      {
+        "key": "ref32",
+        "article-title": "Faster R-CNN: Towards real-time object detection with region proposal networks",
+        "author": "ren",
+        "year": "2015",
+        "journal-title": "NIPS"
+      },
+      {
+        "key": "ref31",
+        "article-title": "Deep learning made easier by linear transformations in perceptrons",
+        "author": "raiko",
+        "year": "2012",
+        "journal-title": "AISTATS"
+      },
+      {
+        "key": "ref30",
+        "doi-asserted-by": "publisher",
+        "DOI": "10.1109/CVPR.2007.383266"
+      }
+    ]
+  }
+}

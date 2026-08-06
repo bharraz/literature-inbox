@@ -1,0 +1,152 @@
+{
+  "status": "ok",
+  "message": {
+    "items": [
+      {
+        "DOI": "10.3390/app12188972",
+        "type": "journal-article",
+        "title": [
+          "Deep Residual Learning for Image Recognition: A Survey"
+        ],
+        "author": [
+          {
+            "given": "Muhammad",
+            "family": "Shafiq",
+            "sequence": "first",
+            "affiliation": [
+              {
+                "name": "Cyberspace Institute of Advanced Technology, Guangzhou University, Guangzhou 510006, China"
+              }
+            ],
+            "role": [
+              {
+                "vocabulary": "crossref",
+                "role": "author"
+              }
+            ]
+          },
+          {
+            "ORCID": "https://orcid.org/0000-0001-7546-852X",
+            "authenticated-orcid": false,
+            "given": "Zhaoquan",
+            "family": "Gu",
+            "sequence": "additional",
+            "affiliation": [
+              {
+                "name": "Department of New Networks, Peng Cheng Laboratory, Shenzhen 518055, China"
+              },
+              {
+                "name": "Department of Computer Science and Technology, Harbin Institute of Technology, Shenzhen 518055, China"
+              }
+            ],
+            "role": [
+              {
+                "vocabulary": "crossref",
+                "role": "author"
+              }
+            ]
+          }
+        ],
+        "issued": {
+          "date-parts": [
+            [
+              2022,
+              9,
+              7
+            ]
+          ]
+        },
+        "container-title": [
+          "Applied Sciences"
+        ],
+        "URL": "https://doi.org/10.3390/app12188972",
+        "reference-count": 94,
+        "reference": [
+          {
+            "key": "ref_1",
+            "doi-asserted-by": "crossref",
+            "unstructured": "He, K., Zhang, X., Ren, S., and Sun, J. (2016, January 27–30). Deep residual learning for image recognition. Proceedings of the 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), Las Vegas, NV, USA.",
+            "DOI": "10.1109/CVPR.2016.90"
+          },
+          {
+            "key": "ref_2",
+            "doi-asserted-by": "crossref",
+            "first-page": "238",
+            "DOI": "10.1016/j.ijar.2017.10.030",
+            "article-title": "A general framework for maximizing likelihood under incomplete data",
+            "volume": "93",
+            "author": "Couso",
+            "year": "2018",
+            "journal-title": "Int. J. Approx. Reason."
+          },
+          {
+            "key": "ref_3",
+            "doi-asserted-by": "crossref",
+            "first-page": "133",
+            "DOI": "10.1016/j.neunet.2021.05.028",
+            "article-title": "A hybrid quantum–classical neural network with deep residual learning",
+            "volume": "143",
+            "author": "Liang",
+            "year": "2021",
+            "journal-title": "Neural Netw."
+          }
+        ]
+      },
+      {
+        "DOI": "10.22541/au.170666177.72403547/v1",
+        "type": "posted-content",
+        "title": [
+          "Multiple butterflies recognition based on deep residual learning and image analyze"
+        ],
+        "author": [
+          {
+            "ORCID": "https://orcid.org/0000-0001-9619-3721",
+            "authenticated-orcid": false,
+            "given": "Tianyu",
+            "family": "Xi",
+            "sequence": "first",
+            "affiliation": [
+              {
+                "name": "University of the Chinese Academy of Sciences"
+              }
+            ],
+            "role": [
+              {
+                "role": "author",
+                "vocabulary": "crossref"
+              }
+            ]
+          },
+          {
+            "given": "Jiangning",
+            "family": "Wang",
+            "sequence": "additional",
+            "affiliation": [
+              {
+                "name": "Institute of Zoology, Chinese Academy of Sciences"
+              }
+            ],
+            "role": [
+              {
+                "role": "author",
+                "vocabulary": "crossref"
+              }
+            ]
+          }
+        ],
+        "issued": {
+          "date-parts": [
+            [
+              2024,
+              1,
+              31
+            ]
+          ]
+        },
+        "URL": "https://doi.org/10.22541/au.170666177.72403547/v1",
+        "reference-count": 0,
+        "reference": []
+      }
+    ]
+  }
+}

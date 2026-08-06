@@ -13,6 +13,8 @@ import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient, OPENALEX_BASE_URL } from "./core/openalex";
+import { CrossrefClient } from "./core/crossref";
+import { doiResolver, titleResolver } from "./core/resolvers";
 import { PlanRequiredError, RateLimitError } from "./core/http";
 import { fetchFeed, newestItem } from "./core/rss";
 import {
@@ -338,6 +340,31 @@ export default class LiteratureInboxPlugin extends Plugin {
     }
   }
 
+  /** Crossref, when the user has it on. Free and unmetered — see
+   * docs/openalex-dependency.md §0. */
+  private crossref(): CrossrefClient | undefined {
+    if (!this.settings.crossrefEnabled) return undefined;
+    return new CrossrefClient(this.transport(), {
+      mailto: this.settings.crossrefMailto || undefined,
+    });
+  }
+
+  /**
+   * The lookup used by backfill, drawing on both sources.
+   *
+   * Titles ask Crossref first (free, where OpenAlex charges its highest rate);
+   * references ask OpenAlex first (inline and fully id-resolvable, where
+   * Crossref only has what publishers deposited).
+   */
+  private referenceResolver() {
+    const openAlex = this.openAlex();
+    const crossref = this.crossref();
+    return {
+      ...doiResolver(openAlex, crossref),
+      ...titleResolver(crossref, openAlex),
+    };
+  }
+
   private adapter(): ObsidianVaultAdapter {
     return new ObsidianVaultAdapter(this.app.vault);
   }
@@ -569,7 +596,7 @@ export default class LiteratureInboxPlugin extends Plugin {
 
     let outcomes;
     try {
-      outcomes = await backfillReferences(candidates, this.openAlex(), titlesMatch);
+      outcomes = await backfillReferences(candidates, this.referenceResolver(), titlesMatch);
     } catch {
       return 0; // backfill is an improvement on what's there, never a blocker
     }

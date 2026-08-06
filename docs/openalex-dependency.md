@@ -62,6 +62,28 @@ That is the field. There is no long tail waiting to be discovered.
 - **PDF parsing for references** — ruled out at the start: it breaks mobile
   support and turns exact citation matching into fuzzy matching.
 
+### 0.2 Crossref's terms, verified 2026-08-06
+
+Checked before building on it, because a second dependency is only worth
+having if it is genuinely unencumbered.
+
+| | |
+|---|---|
+| **Account / key** | None. No signup of any kind |
+| **Cost** | Free. No daily quota, no credits, no metering |
+| **Rate limit** | Measured live: `x-rate-limit-limit: 1`, interval `1s`, concurrency 1 anonymously. Supplying a contact address moves you to the "polite pool" — measured at 3 req/s, concurrency 3 |
+| **Pools** | `public`, `polite` (free), and `plus` (paid, for very high volume — not used) |
+| **Metadata licence** | **CC0.** Explicitly reusable and redistributable, which matters because we write it into the user's notes |
+| **Etiquette** | Identify yourself with a contact address so they can reach you about a problem. Optional, and honoured as a user setting |
+
+Limits are advertised per response in `x-rate-limit-limit` and
+`x-rate-limit-interval`, so the client paces itself rather than assuming: 1.1s
+between requests anonymously, 400ms when a contact address is set.
+
+This is about as lenient as an API gets. The only real constraint is requests
+per second, which matters not at all for a plugin making tens of requests when
+a human presses a button.
+
 The rest of this document is the deep dive on OpenAlex, because it is the one
 with a budget and the one that can break us.
 

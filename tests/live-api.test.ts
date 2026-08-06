@@ -17,6 +17,7 @@
 import { describe, expect, it } from "vitest";
 import { ArxivClient } from "../src/core/arxiv";
 import { OpenAlexClient } from "../src/core/openalex";
+import { CrossrefClient } from "../src/core/crossref";
 import type { Transport, TransportResponse } from "../src/core/http";
 
 const LIVE = process.env.LIVE_API === "1";
@@ -184,6 +185,47 @@ suite("arXiv, live", () => {
       expect(work?.title).toContain("Attention Is All You Need");
       expect(work?.abstract).toBeTruthy();
       expect(work?.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    },
+    TIMEOUT,
+  );
+});
+
+suite("Crossref, live", () => {
+  const client = () => new CrossrefClient(transport, { minIntervalMs: 1200 });
+
+  it(
+    "still returns deposited references for a known DOI",
+    async () => {
+      // The fallback edge source. If this stops carrying DOIs, the fallback
+      // silently becomes useless while every hermetic test stays green.
+      const work = await client().workByDoi("10.1109/cvpr.2016.90");
+      expect(work?.title).toBeTruthy();
+      expect(work?.doi).toBe("10.1109/cvpr.2016.90");
+      expect(work?.references.length).toBeGreaterThan(0);
+      expect(work?.references.every((ref) => ref.namespace === "doi")).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "still matches a title to a DOI",
+    async () => {
+      const work = await client().workByTitle(
+        "Deep Residual Learning for Image Recognition",
+      );
+      expect(work?.doi).toBeTruthy();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "still needs no key",
+    async () => {
+      // Documented as free and keyless; if that changed it would rewrite the
+      // plugin's whole cost model. Goes through the client so its rate
+      // limiter applies — Crossref allows 1 req/s anonymously, and a raw
+      // request here would just measure our own impatience.
+      await expect(client().workByDoi("10.1109/cvpr.2016.90")).resolves.toBeDefined();
     },
     TIMEOUT,
   );

@@ -101,6 +101,18 @@ export interface LiteratureInboxSettings {
    * allowance. See docs/openalex-dependency.md.
    */
   openAlexApiKey: string;
+
+  /**
+   * Use Crossref alongside OpenAlex.
+   *
+   * On by default: it is free, unmetered, needs no account, and its metadata
+   * is CC0. It answers title lookups (which OpenAlex bills at its highest
+   * rate) and supplies reference lists OpenAlex is missing. It cannot do
+   * inbound citations, so adjacency selection is unaffected either way.
+   */
+  crossrefEnabled: boolean;
+  /** Optional contact address for Crossref's polite pool: 3 req/s not 1. */
+  crossrefMailto: string;
   /** Path to a zot2vault executable the user downloaded themselves. Blank by
    * default; the plugin never ships or fetches a binary. */
   zot2vaultPath: string;
@@ -136,6 +148,8 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   keepWindowDays: 30,
   pruneEnabled: false,
   openAlexApiKey: "",
+  crossrefEnabled: true,
+  crossrefMailto: "",
   zot2vaultPath: "",
 };
 
@@ -876,6 +890,38 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
 
   private renderIntegrations(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("Network and integrations").setHeading();
+
+    new Setting(containerEl)
+      .setName("Also use Crossref")
+      .setDesc(
+        "Recommended. Crossref is the registry publishers deposit DOIs with — free, " +
+          "no account, no daily limit. It resolves titles that OpenAlex charges its " +
+          "highest rate for, and fills in reference lists OpenAlex is missing. It " +
+          "cannot provide 'papers citing my library'; only OpenAlex can.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.crossrefEnabled).onChange(async (value) => {
+          this.plugin.settings.crossrefEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Email for Crossref (optional)")
+      .setDesc(
+        "Supplying one triples Crossref's rate limit for you, from 1 to 3 requests a " +
+          "second. It is sent only to crossref.org. Unlike OpenAlex, Crossref's polite " +
+          "pool is current and does something measurable.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("you@example.com")
+          .setValue(this.plugin.settings.crossrefMailto)
+          .onChange(async (value) => {
+            this.plugin.settings.crossrefMailto = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
 
     new Setting(containerEl)
       .setName("OpenAlex API key (optional)")

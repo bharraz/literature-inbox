@@ -928,6 +928,112 @@ describe("choosing arrivals by citation adjacency", () => {
   });
 });
 
+describe("Crossref alongside OpenAlex", () => {
+  const crossrefMessage = (doi: string, title: string, refs: string[]) => ({
+    DOI: doi,
+    type: "journal-article",
+    title: [title],
+    author: [{ given: "Ada", family: "Lovelace" }],
+    issued: { "date-parts": [[2026, 5, 1]] },
+    reference: refs.map((ref) => ({ DOI: ref })),
+  });
+
+  /** Crossref answers a single-record lookup and a search with *different*
+   * shapes — `message` versus `message.items[]`. Serving one for both is the
+   * quickest way to write a test that passes for the wrong reason. */
+  const crossrefFor = (url: string, doi: string, title: string, refs: string[]) =>
+    url.includes("query.bibliographic")
+      ? JSON.stringify({ status: "ok", message: { items: [crossrefMessage(doi, title, refs)] } })
+      : JSON.stringify({ status: "ok", message: crossrefMessage(doi, title, refs) });
+
+  it("falls back to Crossref for references OpenAlex does not have", async () => {
+    // OpenAlex answers the arrival query but has no reference list for it;
+    // Crossref has the publisher's deposit. Half the edges beats none.
+    let openAlexCalls = 0;
+    setRequestResponder((url) => {
+      if (url.startsWith("https://api.crossref.org")) {
+        return { status: 200, text: crossrefFor(url, "10.1234/one", "A Paper", ["10.1234/kept"]) };
+      }
+      openAlexCalls += 1;
+      // The arrival arrives with no reference list of its own.
+      return openAlexCalls === 1
+        ? {
+            status: 200,
+            text: openAlexPage([openAlexWork("W1", "A Paper", [], "10.1234/one")]),
+          }
+        : { status: 200, text: openAlexPage([]) };
+    });
+
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      // Topic-only, so the OpenAlex call order is deterministic.
+      p.settings.arrivalSelection = "topic";
+      p.settings.crossrefEnabled = true;
+    });
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Paper I Kept.md",
+      keptNoteContent("A Paper I Kept", "doi:10.1234/kept"),
+    );
+
+    await plugin.updateInbox();
+    ageBackfillState(plugin, 5);
+    await plugin.updateInbox();
+
+    const arrival = app.vault.files.get("Inbox/A Paper.md") as string;
+    expect(arrival).toContain("[[A Paper I Kept]]");
+  });
+
+  it("never contacts Crossref when the user turns it off", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.crossrefEnabled = false;
+    });
+
+    await plugin.updateInbox();
+    ageBackfillState(plugin, 5);
+    await plugin.updateInbox();
+
+    expect(requestedUrls.some((url) => url.includes("crossref.org"))).toBe(false);
+  });
+
+  it("still works when OpenAlex is switched off entirely", async () => {
+    // Crossref cannot answer "papers citing my library", but it can resolve
+    // and enrich whatever a feed brings in.
+    setRequestResponder((url) =>
+      url.startsWith("https://api.crossref.org")
+        ? { status: 200, text: crossrefFor(url, "10.1234/feed", "A Feed Paper", ["10.1234/kept"]) }
+        : {
+            status: 200,
+            text:
+              `<?xml version="1.0"?><rss version="2.0"><channel><title>J</title>` +
+              `<item><title>A Feed Paper</title><link>https://example.org/a</link></item>` +
+              `</channel></rss>`,
+          },
+    );
+
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.openAlexEnabled = false;
+      p.settings.crossrefEnabled = true;
+      p.settings.rssEnabled = true;
+      p.settings.feeds = [{ url: "https://example.org/f.xml", enabled: true }];
+    });
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Paper I Kept.md",
+      keptNoteContent("A Paper I Kept", "doi:10.1234/kept"),
+    );
+
+    await plugin.updateInbox();
+    ageBackfillState(plugin, 5);
+    await plugin.updateInbox();
+
+    const arrival = app.vault.files.get("Inbox/A Feed Paper.md") as string;
+    expect(arrival).toContain("[[A Paper I Kept]]");
+  });
+});
+
 describe("the inbox front page", () => {
   it("shows how connected each arrival is", async () => {
     // The signal that makes the page worth reading. It is computed at arrival
