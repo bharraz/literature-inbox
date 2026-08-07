@@ -442,9 +442,10 @@ describe("what should I read?", () => {
     expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
   });
 
-  it("keeps the recorded hash in step when it marks a paper read", async () => {
-    // Otherwise the note looks hand-edited and marking it read would silently
-    // exempt it from cleanup forever — the opposite of what the user meant.
+  it("puts a paper you marked read beyond cleanup's reach", async () => {
+    // Saying you have read something is engagement, and cleanup is only for
+    // arrivals nobody looked at. Leaving the recorded hash stale is what makes
+    // the note count as touched, which is exactly the guard we want here.
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin((p) => {
       enableOpenAlex(p);
@@ -457,11 +458,17 @@ describe("what should I read?", () => {
 
     const content = app.vault.files.get(path) as string;
     expect(content).toContain("read-status: read");
+
+    // Cleanup now sees a note that no longer matches what it generated.
+    const { contentHash } = await import("../src/core/hash");
     const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
       .find((r) => r.notePath === path);
-    expect(record?.contentHash).toBe(
-      (await import("../src/core/hash")).contentHash(content),
-    );
+    expect(record?.contentHash).not.toBe(contentHash(content));
+
+    plugin.settings.pruneEnabled = true;
+    plugin.settings.keepWindowDays = 0;
+    await plugin.cleanUp();
+    expect(app.vault.files.has(path)).toBe(true);
   });
 
   it("writes no read-status property unless the feature is on", async () => {
@@ -1186,9 +1193,10 @@ describe("what should I read?", () => {
     expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
   });
 
-  it("keeps the recorded hash in step when it marks a paper read", async () => {
-    // Otherwise the note looks hand-edited and marking it read would silently
-    // exempt it from cleanup forever — the opposite of what the user meant.
+  it("puts a paper you marked read beyond cleanup's reach", async () => {
+    // Saying you have read something is engagement, and cleanup is only for
+    // arrivals nobody looked at. Leaving the recorded hash stale is what makes
+    // the note count as touched, which is exactly the guard we want here.
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin((p) => {
       enableOpenAlex(p);
@@ -1201,11 +1209,17 @@ describe("what should I read?", () => {
 
     const content = app.vault.files.get(path) as string;
     expect(content).toContain("read-status: read");
+
+    // Cleanup now sees a note that no longer matches what it generated.
+    const { contentHash } = await import("../src/core/hash");
     const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
       .find((r) => r.notePath === path);
-    expect(record?.contentHash).toBe(
-      (await import("../src/core/hash")).contentHash(content),
-    );
+    expect(record?.contentHash).not.toBe(contentHash(content));
+
+    plugin.settings.pruneEnabled = true;
+    plugin.settings.keepWindowDays = 0;
+    await plugin.cleanUp();
+    expect(app.vault.files.has(path)).toBe(true);
   });
 
   it("writes no read-status property unless the feature is on", async () => {

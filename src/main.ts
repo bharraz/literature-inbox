@@ -1248,11 +1248,14 @@ ${content.slice(marker)}`;
   }
 
   /**
-   * Write a read status onto a note, keeping its recorded hash in step.
+   * Write a read status onto a note.
    *
-   * Without the hash update the note would look hand-edited to cleanup, and
-   * marking a paper "read" would silently exempt it from ever being tidied
-   * away — the opposite of what the user meant.
+   * The recorded hash is deliberately **not** updated, which makes the note
+   * count as touched and takes it out of cleanup's reach for good. That is the
+   * point: saying you have read something is engagement, and a paper you
+   * engaged with should stay in the graph. Cleanup exists to clear out
+   * arrivals you never looked at, not ones you triaged. Deleting a paper you
+   * are actually done with stays a manual act.
    */
   async setReadStatus(notePath: string, status: ReadStatus): Promise<void> {
     const adapter = this.adapter();
@@ -1262,12 +1265,7 @@ ${content.slice(marker)}`;
     if (updated === content) return;
 
     await adapter.write(notePath, updated);
-    const record = this.inbox.find((entry) => entry.notePath === notePath);
-    if (record && record.contentHash === contentHash(content)) {
-      record.contentHash = contentHash(updated);
-      await this.persist();
-    }
-    notify(`Marked as ${status}.`);
+    notify(`Marked as ${status}. It will stay in your graph.`);
   }
 
   async previewTopic(): Promise<void> {
