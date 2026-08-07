@@ -39,6 +39,7 @@ export interface KernelRunInput {
   adapter: VaultAdapter;
   today: string;
   subjects?: SubjectOptions;
+  readStatus?: string;
   /** Called as notes are written, so a long run can show progress. */
   onProgress?: (written: number, total: number) => void;
 }
@@ -115,6 +116,7 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       arrivedOn: today,
       originIds: entry.ids,
       subjects: input.subjects,
+      readStatus: input.readStatus,
     });
     await adapter.write(notePath, content);
     report.written.push({

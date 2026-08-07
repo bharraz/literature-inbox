@@ -92,6 +92,16 @@ export interface LiteratureInboxSettings {
   subjectKeywords: boolean;
   subjectConcepts: boolean;
 
+  /**
+   * Track a read-status property on each paper note.
+   *
+   * Off by default: an unused property in every note is clutter, and this only
+   * earns its place once you are reading regularly. When on, notes gain
+   * `read-status: to-read`, and "What should I read?" skips anything marked
+   * read or reference.
+   */
+  readStatusEnabled: boolean;
+
   keepWindowDays: number;
   /** Off by default: nothing is ever removed until you say so. */
   pruneEnabled: boolean;
@@ -143,6 +153,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   subjectTopics: true,
   subjectKeywords: true,
   subjectConcepts: false,
+  readStatusEnabled: false,
   keepWindowDays: 30,
   pruneEnabled: false,
   openAlexApiKey: "",
@@ -687,6 +698,22 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
             this.display();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Track whether you have read a paper")
+      .setDesc(
+        "Adds a read-status property — to-read, read, or reference — which " +
+          '"What should I read?" uses to skip what you are done with. Obsidian has no ' +
+          "select property type, so it is a text field, but it autocompletes the values " +
+          "it has already seen. Off by default: an unused property in every note is " +
+          "clutter.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.readStatusEnabled).onChange(async (value) => {
+          this.plugin.settings.readStatusEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
 
     if (this.plugin.settings.subjectPlacement === "off") return;
 

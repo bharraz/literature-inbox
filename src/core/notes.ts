@@ -72,6 +72,11 @@ export interface InboxNoteOptions {
   connectedKept?: string[];
   /** How subject terms reach the note, if at all. */
   subjects?: SubjectOptions;
+  /**
+   * Seed the note with a read-status property. Off unless the user turned the
+   * feature on — an unused property in every note is just clutter.
+   */
+  readStatus?: string;
 }
 
 /** Where subject terms go, and which vocabularies they come from. */
@@ -169,6 +174,7 @@ export function renderInboxNote(options: InboxNoteOptions): string {
     ["source", work.source],
     ["fetched", arrivedOn],
     ["origin-ids", originIds],
+    ["read-status", options.readStatus],
     ["subjects", subjects.placement === "property" ? terms : undefined],
     ["tags", asTags.length > 0 ? asTags : undefined],
     // Deliberately no `inbox`/`kept` tag. The folder is the source of truth

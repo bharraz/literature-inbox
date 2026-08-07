@@ -59,6 +59,14 @@ import { contentHash } from "./core/hash";
 import { runExecutable, type Spawner } from "./core/launcher";
 import { runKernel } from "./core/kernel";
 import { parseSeedList, seedsFromOriginIds } from "./core/seeds";
+import {
+  explain,
+  readStatusOf,
+  suggest,
+  withReadStatus,
+  type Candidate,
+  type ReadStatus,
+} from "./core/suggest";
 import { snowball } from "./core/snowball";
 import type { Work } from "./core/types";
 import {
@@ -185,6 +193,11 @@ export default class LiteratureInboxPlugin extends Plugin {
       id: "add-by-doi",
       name: "Add a paper by DOI or arXiv id",
       callback: () => new AddByIdModal(this.app, (value) => void this.addById(value)).open(),
+    });
+    this.addCommand({
+      id: "suggest-paper",
+      name: "What should I read?",
+      callback: () => void this.suggestPaper(),
     });
     this.addCommand({
       id: "copy-identifier",
@@ -412,6 +425,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
       subjects: this.subjectOptions(),
+      readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
     };
   }
 
@@ -853,6 +867,7 @@ ${content.slice(marker)}`;
         adapter: this.adapter(),
         today: todayIso(),
         subjects: this.subjectOptions(),
+        readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
         onProgress: (written, total) => {
           // Every 25, not every note: a Notice per paper would bury the
           // screen, and silence for a minute reads as a hang.
@@ -1180,6 +1195,81 @@ ${content.slice(marker)}`;
     new FeedTestModal(this.app, results).open();
   }
 
+  /**
+   * Offer one paper to read, from the inbox and the library together.
+   *
+   * The graph answers "what deserves attention" once you are already looking
+   * at it. This is for the other mood — ten minutes, no browsing, just give me
+   * something. Weighted toward well-connected papers rather than uniformly
+   * random, because that is the same judgement the graph makes visually.
+   */
+  async suggestPaper(): Promise<void> {
+    const adapter = this.adapter();
+    const candidates: Candidate[] = [];
+
+    for (const folder of [this.settings.inboxFolder, this.settings.papersFolder]) {
+      const inInbox = folder === this.settings.inboxFolder;
+      for (const path of await adapter.list(folder)) {
+        const content = await adapter.read(path);
+        if (content === undefined) continue;
+        const identity = parseNoteIdentity(content);
+        // Only papers: a note the user wrote themselves has no identity and is
+        // none of this command's business.
+        if (!identity?.originIds.length && !identity?.title) continue;
+        const record = this.inbox.find((entry) => entry.notePath === path);
+        candidates.push({
+          notePath: path,
+          title: identity.title ?? path.split("/").pop()?.replace(/\.md$/, "") ?? path,
+          edgeCount: record?.edgeCount ?? countCitationLinks(content),
+          status: readStatusOf(content),
+          inInbox,
+        });
+      }
+    }
+
+    const choice = suggest(candidates);
+    if (!choice) {
+      notify(
+        candidates.length === 0
+          ? "No papers yet — add some to your graph first."
+          : "Nothing left to suggest: everything is marked read or reference.",
+      );
+      return;
+    }
+
+    new SuggestionModal(
+      this.app,
+      choice,
+      () => void this.suggestPaper(),
+      this.settings.readStatusEnabled
+        ? (status) => void this.setReadStatus(choice.notePath, status)
+        : undefined,
+    ).open();
+  }
+
+  /**
+   * Write a read status onto a note, keeping its recorded hash in step.
+   *
+   * Without the hash update the note would look hand-edited to cleanup, and
+   * marking a paper "read" would silently exempt it from ever being tidied
+   * away — the opposite of what the user meant.
+   */
+  async setReadStatus(notePath: string, status: ReadStatus): Promise<void> {
+    const adapter = this.adapter();
+    const content = await adapter.read(notePath);
+    if (content === undefined) return;
+    const updated = withReadStatus(content, status);
+    if (updated === content) return;
+
+    await adapter.write(notePath, updated);
+    const record = this.inbox.find((entry) => entry.notePath === notePath);
+    if (record && record.contentHash === contentHash(content)) {
+      record.contentHash = contentHash(updated);
+      await this.persist();
+    }
+    notify(`Marked as ${status}.`);
+  }
+
   async previewTopic(): Promise<void> {
     const topic = this.settings.openAlexTopic.trim();
     if (!topic) {
@@ -1261,6 +1351,66 @@ class RunReportModal extends Modal {
       const errors = this.contentEl.createEl("ul");
       for (const error of report.sourceErrors) {
         errors.createEl("li", { text: `${error.source} — ${error.message}` });
+      }
+    }
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/** Citation links already written into a note, for papers with no record. */
+function countCitationLinks(content: string): number {
+  const section = content.split("## Citations")[1];
+  return section ? (section.match(/^- \[\[/gm) ?? []).length : 0;
+}
+
+/** One paper, offered. */
+class SuggestionModal extends Modal {
+  constructor(
+    app: App,
+    private readonly choice: Candidate,
+    private readonly again: () => void,
+    private readonly mark?: (status: ReadStatus) => void,
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    this.titleEl.setText("What should I read?");
+    this.contentEl.createEl("h3", { text: this.choice.title });
+    this.contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: explain(this.choice),
+    });
+
+    const buttons = this.contentEl.createDiv();
+    const open = buttons.createEl("button", { text: "Open it" });
+    open.addClass("mod-cta");
+    open.addEventListener("click", () => {
+      const file = this.app.vault.getAbstractFileByPath(this.choice.notePath);
+      this.close();
+      if (file instanceof TFile) void this.app.workspace.getLeaf(false).openFile(file);
+    });
+
+    const another = buttons.createEl("button", { text: "Something else" });
+    another.addEventListener("click", () => {
+      this.close();
+      this.again();
+    });
+
+    if (this.mark) {
+      // Only offered when the user turned read-status on; otherwise these
+      // would write a property they never asked for.
+      for (const status of ["read", "reference"] as const) {
+        const button = buttons.createEl("button", {
+          text: status === "read" ? "Already read" : "Reference only",
+        });
+        button.addEventListener("click", () => {
+          this.close();
+          this.mark?.(status);
+        });
       }
     }
   }

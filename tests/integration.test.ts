@@ -144,6 +144,7 @@ describe("plugin load", () => {
       "build-kernel",
       "keep-paper",
       "add-by-doi",
+      "suggest-paper",
       "copy-identifier",
       "clean-up-inbox",
       "run-zot2vault",
@@ -398,6 +399,92 @@ describe("degenerate and failure cases", () => {
 });
 
 // --- keeping ---------------------------------------------------------------------------
+
+describe("what should I read?", () => {
+  it("suggests a paper from the inbox", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    await plugin.suggestPaper();
+
+    // The modal names a real arrival rather than failing quietly.
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(false);
+  });
+
+  it("says so when there is nothing to suggest", async () => {
+    const { plugin } = await bootPlugin();
+    await plugin.suggestPaper();
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
+  });
+
+  it("ignores notes the user wrote themselves", async () => {
+    // A prose note has no identity and is none of this command's business.
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    await app.vault.create("Papers/My Thoughts.md", "# My Thoughts\n\nprose\n");
+
+    await plugin.suggestPaper();
+
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
+  });
+
+  it("skips papers already marked read", async () => {
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Read Paper.md",
+"---\ntitle: A Read Paper\norigin-ids:\n  - doi:10.1/x\nread-status: read\n---\n\nbody\n",
+    );
+
+    await plugin.suggestPaper();
+
+    expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
+  });
+
+  it("keeps the recorded hash in step when it marks a paper read", async () => {
+    // Otherwise the note looks hand-edited and marking it read would silently
+    // exempt it from cleanup forever — the opposite of what the user meant.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.readStatusEnabled = true;
+    });
+    await plugin.updateInbox();
+
+    const path = "Inbox/A Paper About Transformers.md";
+    await plugin.setReadStatus(path, "read");
+
+    const content = app.vault.files.get(path) as string;
+    expect(content).toContain("read-status: read");
+    const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
+      .find((r) => r.notePath === path);
+    expect(record?.contentHash).toBe(
+      (await import("../src/core/hash")).contentHash(content),
+    );
+  });
+
+  it("writes no read-status property unless the feature is on", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
+    expect(note).not.toContain("read-status");
+  });
+
+  it("seeds the property when the feature is on", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.readStatusEnabled = true;
+    });
+    await plugin.updateInbox();
+
+    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
+    expect(note).toContain("read-status: to-read");
+  });
+});
 
 describe("keeping a paper", () => {
   it("moves the note out of the inbox", async () => {
@@ -1054,6 +1141,92 @@ describe("Crossref alongside OpenAlex", () => {
 
     const arrival = app.vault.files.get("Inbox/A Feed Paper.md") as string;
     expect(arrival).toContain("[[A Paper I Kept]]");
+  });
+});
+
+describe("what should I read?", () => {
+  it("suggests a paper from the inbox", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    await plugin.suggestPaper();
+
+    // The modal names a real arrival rather than failing quietly.
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(false);
+  });
+
+  it("says so when there is nothing to suggest", async () => {
+    const { plugin } = await bootPlugin();
+    await plugin.suggestPaper();
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
+  });
+
+  it("ignores notes the user wrote themselves", async () => {
+    // A prose note has no identity and is none of this command's business.
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    await app.vault.create("Papers/My Thoughts.md", "# My Thoughts\n\nprose\n");
+
+    await plugin.suggestPaper();
+
+    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
+  });
+
+  it("skips papers already marked read", async () => {
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Read Paper.md",
+"---\ntitle: A Read Paper\norigin-ids:\n  - doi:10.1/x\nread-status: read\n---\n\nbody\n",
+    );
+
+    await plugin.suggestPaper();
+
+    expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
+  });
+
+  it("keeps the recorded hash in step when it marks a paper read", async () => {
+    // Otherwise the note looks hand-edited and marking it read would silently
+    // exempt it from cleanup forever — the opposite of what the user meant.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.readStatusEnabled = true;
+    });
+    await plugin.updateInbox();
+
+    const path = "Inbox/A Paper About Transformers.md";
+    await plugin.setReadStatus(path, "read");
+
+    const content = app.vault.files.get(path) as string;
+    expect(content).toContain("read-status: read");
+    const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
+      .find((r) => r.notePath === path);
+    expect(record?.contentHash).toBe(
+      (await import("../src/core/hash")).contentHash(content),
+    );
+  });
+
+  it("writes no read-status property unless the feature is on", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
+    expect(note).not.toContain("read-status");
+  });
+
+  it("seeds the property when the feature is on", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.readStatusEnabled = true;
+    });
+    await plugin.updateInbox();
+
+    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
+    expect(note).toContain("read-status: to-read");
   });
 });
 

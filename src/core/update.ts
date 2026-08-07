@@ -50,6 +50,8 @@ export interface UpdateSettings {
   papersFolder: string;
   maxArrivalsPerRun: number;
   subjects?: SubjectOptions;
+  /** Initial read-status for new notes, when the feature is on. */
+  readStatus?: string;
 }
 
 export type SkipReason = "already-in-vault" | "already-in-inbox" | "duplicate-in-batch";
@@ -205,6 +207,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
       originIds: entry.ids,
       connectedKept: cites.filter((name) => keptNames.has(name)),
       subjects: settings.subjects,
+      readStatus: settings.readStatus,
     });
     await adapter.write(notePath, content);
     inbox.push({
