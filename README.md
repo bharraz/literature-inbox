@@ -7,12 +7,9 @@ five papers you care about is visually loud; an isolated dot is easy to ignore.
 You triage by looking at the graph, open what looks interesting, and everything
 you never touched quietly cleans itself out.
 
-> **Status:** built and tested (468 hermetic tests, `tsc` clean, plus live
-> harnesses that build a real vault and measure connectivity). Loaded in a real
-> vault; still being shaken out. See `roadmap.md` for design context and the
-> path to the community store, `docs/interop-spec.md` for the note-format
-> conventions, and `docs/openalex-dependency.md` for exactly what this plugin
-> needs from OpenAlex and what would break if that changed.
+<!-- Add a screenshot or short GIF of the graph view here, e.g.:
+![Graph view with new arrivals connected to a kept library](docs/screenshot.png)
+-->
 
 ## The core loop
 
@@ -84,6 +81,11 @@ says so if it's still unindexed once that window passes. Resolving these
 immediately in the first place would cost OpenAlex's most expensive call type
 for a near-certain miss — see `docs/openalex-dependency.md`.
 
+A paper that cites — or is cited by — something already in your vault gets
+that link even if the two arrive months apart: each paper's reference list is
+kept once, so a paper kept today can still connect to something that arrives
+next year, without re-fetching anything already on file.
+
 ## What this costs you
 
 Nothing, and no account is required. OpenAlex meters a free daily allowance
@@ -122,22 +124,24 @@ Flows with Zotero:
 - **Add by DOI:** a command to paste a DOI/arXiv id and get a note immediately,
   wired into the graph. Manual adds are intentional, so they aren't pruned.
 
-## Non-negotiables (community review + project principles)
+## Privacy and network access
 
-- `requestUrl()` for all network access, never `fetch()`; Obsidian Vault API for
-  all file access, never Node `fs`. `isDesktopOnly: false`.
+- `requestUrl()` for all network access, never `fetch()`; Obsidian's Vault API
+  for all file access, never Node `fs`. Works on desktop and mobile
+  (`isDesktopOnly: false`).
 - No bundled or auto-downloaded binaries, and no launching of external
   programs at all.
-- The OpenAlex API key is an optional user setting — never ship a
-  hardcoded email. Disclose exactly which hosts are contacted and when:
-  **OpenAlex** (every source, plus citation resolution) and, only when you
-  turn them on, **Crossref** (a fallback for references OpenAlex doesn't
-  have), **arXiv** (`rss.arxiv.org`, when an arXiv category source is
-  configured), and any RSS/Atom feed URL you add yourself. Nothing else is
-  ever contacted, and nothing is sent anywhere without a manual run.
-- Manual runs only. No timers, no network on plugin load.
-- Never destroy user work: hash-guarded cleanup, trash not delete, preview
-  before prune, unknown files untouchable.
+- Every host this plugin ever contacts: **OpenAlex** (every source, plus
+  citation resolution) and, only when you turn them on, **Crossref** (a
+  fallback for references OpenAlex doesn't have), **arXiv**
+  (`rss.arxiv.org`, when an arXiv category source is configured), and any
+  RSS/Atom feed URL you add yourself. Nothing else is ever contacted, and
+  nothing is sent anywhere without a manual run.
+- The optional OpenAlex API key is a plain user setting — never shipped
+  hardcoded, and it's used only to raise your own rate limit.
+- Cleanup never destroys work: hash-guarded, trash not delete, preview before
+  prune, anything you've edited or that the plugin didn't generate is
+  untouchable.
 
 ## Commands
 
@@ -149,7 +153,23 @@ Flows with Zotero:
 | **Copy this paper's identifier** | Puts the DOI/URL on the clipboard for Zotero's *Add by Identifier*. |
 | **Clean up old arrivals** | Preview, confirm, then move untouched expired arrivals to trash. Off until enabled in settings. |
 
-## Building
+Right-click one or more papers in `Papers/` for **Expand outward**, which
+fetches what they cite and what cites them into a chosen folder and count.
+
+## Installing
+
+**From the community plugin store:** search "Literature Inbox" in Obsidian's
+Community plugins browser (once listed).
+
+**Via [BRAT](https://github.com/TfTHacker/obsidian42-brat):** Add beta plugin
+→ `bharraz/literature-inbox`.
+
+**Manually:** download `main.js`, `manifest.json`, and `styles.css` from the
+[latest release](https://github.com/bharraz/literature-inbox/releases/latest)
+into `<vault>/.obsidian/plugins/literature-inbox/`, then enable it under
+Community plugins → Installed plugins.
+
+## Building from source
 
 ```bash
 npm install
@@ -157,11 +177,7 @@ npm test        # vitest, no network — replays recorded API responses
 npm run build   # tsc --noEmit && esbuild -> main.js
 ```
 
-To try it in a real vault, copy `manifest.json` and the built `main.js` into
-`<vault>/.obsidian/plugins/literature-inbox/` and enable it in Community
-plugins → Installed plugins.
-
-## Layout (self-contained — survives extraction as-is)
+## Layout
 
 ```
 literature-inbox/
@@ -177,23 +193,12 @@ literature-inbox/
                          hash, xml, types
   tests/
     fixtures/            real recorded API responses
-    *.test.ts            468 tests
+    *.test.ts            hermetic tests, no network
 ```
 
 The `core/` ⇄ `obsidian-adapter.ts` split is deliberate: policy is testable
 without mocking Obsidian, and there is exactly one place to audit for API use.
 
-## Status
+## License
 
-**Verified:** 468 tests green, including a suite that drives the real plugin
-class end to end through a faked Obsidian API. Typecheck and build clean.
-A live-API suite runs against the real OpenAlex and arXiv endpoints
-(`npm run test:live`), kept out of the default run so the suite stays offline.
-
-**Not yet verified:** nobody has loaded this in Obsidian and judged whether the
-resulting graph is a good triage surface. That's the next step, and it's the
-one thing no test can do — see `roadmap.md` (M1).
-
-Then: screenshots, BRAT testing, and the community-plugin PR. The release
-workflow is in place: push a bare version tag and it builds, tests, and
-attaches the assets.
+MIT — see `LICENSE`.
