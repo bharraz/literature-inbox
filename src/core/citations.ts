@@ -40,6 +40,12 @@ export class CitationIndex {
     return this.byId.get(serializeId(id));
   }
 
+  /** Same lookup, for an id already serialized to `namespace:value` — the
+   * form both `originIds()` and a persisted `ReferenceRecord` use. */
+  lookupRaw(id: string): string | undefined {
+    return this.byId.get(id);
+  }
+
   get size(): number {
     return this.byId.size;
   }
@@ -74,6 +80,72 @@ export function resolveCitations(
     edges.push({ sourceKey: noteName, targetKey: target });
   }
   return { edges, unresolvedCount };
+}
+
+/**
+ * A paper's own reference list, captured once — at the moment its note is
+ * first written — and persisted outside the vault (in plugin data, next to
+ * `previouslyRemoved`). Nothing else remembers this: a note only ever
+ * carries the edges that already resolved *when it was written*, so without
+ * a persisted copy, a paper that arrives later but was actually cited by
+ * something you kept months ago could never be linked back to it — that
+ * would need re-fetching every kept paper's references on every run just to
+ * ask "did any of you cite today's new arrivals?".
+ */
+export interface ReferenceRecord {
+  /** The citing paper's own origin ids, so it can be found in a *future*
+   * index even after this run ends. */
+  ids: string[];
+  /** That paper's references, pre-serialized to the same `namespace:value`
+   * strings origin ids use, so they compare directly with no id object. */
+  references: string[];
+  /** The citing paper's own publication date (`YYYY-MM-DD`), when known —
+   * used only to reject an impossible edge (see `retroactiveEdges`). */
+  date?: string;
+}
+
+/**
+ * Edges from a paper already known (but not re-fetched this run) to a paper
+ * arriving *today* that it turns out to cite — the reverse of the normal
+ * forward pass, which only ever asks "what does today's arrival cite".
+ *
+ * Restricted to targets in `newNoteNames`: an edge between two papers that
+ * were both already known would have been created already, on whichever of
+ * the two arrived second — recomputing the whole persisted set against
+ * itself every run would be pure waste for no new edges.
+ *
+ * A citation can only point backward in time — a paper can't reference
+ * something that didn't exist yet — so an edge is rejected whenever the
+ * arrival's own date is *after* the citing paper's. This is a correctness
+ * check first (an index collision or a mismatched record would otherwise
+ * produce a nonsense edge) and a cheap one to skip early, before either side
+ * is rewritten. Permissive when a date is missing on either side: an absent
+ * date is not evidence of anything, so the edge stands rather than being
+ * dropped on a technicality.
+ */
+export function retroactiveEdges(
+  records: readonly ReferenceRecord[],
+  index: CitationIndex,
+  newNoteNames: ReadonlySet<string>,
+  targetDates: ReadonlyMap<string, string | undefined>,
+): CitationEdge[] {
+  const edges: CitationEdge[] = [];
+  for (const record of records) {
+    let sourceKey: string | undefined;
+    for (const id of record.ids) {
+      sourceKey = index.lookupRaw(id);
+      if (sourceKey) break;
+    }
+    if (!sourceKey) continue; // that paper's note no longer exists — nothing to link from
+    for (const reference of record.references) {
+      const targetKey = index.lookupRaw(reference);
+      if (!targetKey || targetKey === sourceKey || !newNoteNames.has(targetKey)) continue;
+      const targetDate = targetDates.get(targetKey);
+      if (record.date && targetDate && targetDate > record.date) continue; // cites the future
+      edges.push({ sourceKey, targetKey });
+    }
+  }
+  return edges;
 }
 
 /** Invert edges into a per-note "cited by" map, so an existing paper can show

@@ -17,9 +17,9 @@
  * anything already present, so re-running is additive rather than duplicating.
  */
 
-import { CitationIndex, resolveCitations } from "./citations";
+import { CitationIndex, resolveCitations, type ReferenceRecord } from "./citations";
 import { FilenameAllocator } from "./filenames";
-import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds } from "./ids";
+import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
 import { renderInboxNote, type SubjectOptions } from "./notes";
 import type { VaultAdapter } from "./update";
 import type { VaultIndex } from "./vault-state";
@@ -30,6 +30,11 @@ export interface KernelReport {
   skipped: number;
   /** Edges among the seeded papers — the density of the starting graph. */
   totalEdges: number;
+  /** One record per paper written, for the caller to fold into its
+   * persisted `referenceIndex` (see `core/update.ts`) — a kernel-seeded
+   * paper is just as valid a source of a future retroactive edge as any
+   * other kept paper. */
+  newReferenceRecords: ReferenceRecord[];
 }
 
 export interface KernelRunInput {
@@ -119,7 +124,12 @@ function undirectedAdjacency(citesByKey: ReadonlyMap<string, string[]>): Map<str
 
 export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
   const { works, vault, papersFolder, adapter, today } = input;
-  const report: KernelReport = { written: [], skipped: 0, totalEdges: 0 };
+  const report: KernelReport = {
+    written: [],
+    skipped: 0,
+    totalEdges: 0,
+    newReferenceRecords: [],
+  };
 
   const allocator = new FilenameAllocator();
   for (const name of vault.noteBaseNames()) allocator.reserve(name);
@@ -225,6 +235,11 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       edgeCount: cites.length + citedBy.length,
     });
     report.totalEdges += cites.length;
+    report.newReferenceRecords.push({
+      ids: entry.ids,
+      references: entry.work.references.map(serializeId),
+      date: entry.work.date,
+    });
     input.onProgress?.(report.written.length, selected.length);
   }
 

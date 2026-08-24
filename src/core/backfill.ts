@@ -42,20 +42,16 @@ export interface ReferenceResolver {
 }
 
 /**
- * When to re-ask about a paper that had no references last time.
- *
- * Days since the arrival, per attempt: the next day, a few days later, then
- * about a month. A preprint OpenAlex has not indexed within a day is often
- * indexed within a week; one still missing after a month usually never will
- * be. Three widening tries catch the realistic cases without re-querying every
- * isolated dot on every run forever — which is what this replaces, and which
- * cost roughly 25 requests per update indefinitely.
+ * How long a title-only arrival stays on the backfill watchlist, counted
+ * from the day it arrived — tracked entirely via `arrivedOn` and
+ * `lastBackfillOn`, both already persisted on the inbox record, so there is
+ * no separate attempt counter to keep in sync. A preprint OpenAlex hasn't
+ * indexed within a month usually never will be, so the note is marked and
+ * left alone past that point rather than asked about forever.
  */
-export const BACKFILL_SCHEDULE_DAYS = [0, 4, 30];
+export const BACKFILL_WINDOW_DAYS = 30;
 
 export interface BackfillProgress {
-  /** How many lookups have already been spent on this note. */
-  backfillAttempts?: number;
   /** `YYYY-MM-DD` of the last lookup. */
   lastBackfillOn?: string;
 }
@@ -68,27 +64,24 @@ function daysBetween(from: string, to: string): number {
 }
 
 /**
- * Is this note due for another lookup?
- *
- * False once the schedule is exhausted — that is the give-up, and the caller
- * marks the note so the user can see it was tried and failed rather than
- * silently skipped.
+ * Is this note due for another lookup? Once a day, for the first
+ * `BACKFILL_WINDOW_DAYS` days after it arrived — no widening schedule, no
+ * attempt count, just "still within the window and not already asked today".
  */
 export function isDueForBackfill(
   progress: BackfillProgress,
   arrivedOn: string,
   today: string,
 ): boolean {
-  const attempts = progress.backfillAttempts ?? 0;
-  if (attempts >= BACKFILL_SCHEDULE_DAYS.length) return false;
   if (progress.lastBackfillOn === today) return false;
-  const dueAfter = BACKFILL_SCHEDULE_DAYS[attempts] as number;
-  return daysBetween(arrivedOn, today) >= dueAfter;
+  return daysBetween(arrivedOn, today) <= BACKFILL_WINDOW_DAYS;
 }
 
-/** True once every scheduled attempt has been spent. */
-export function hasGivenUp(progress: BackfillProgress): boolean {
-  return (progress.backfillAttempts ?? 0) >= BACKFILL_SCHEDULE_DAYS.length;
+/** True once the window has passed — the give-up, and the caller marks the
+ * note so the user can see it was tried and failed rather than silently
+ * skipped. */
+export function hasGivenUp(arrivedOn: string, today: string): boolean {
+  return daysBetween(arrivedOn, today) > BACKFILL_WINDOW_DAYS;
 }
 
 export interface BackfillCandidate {

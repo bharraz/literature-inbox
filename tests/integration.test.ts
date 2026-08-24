@@ -21,6 +21,7 @@ import {
   clearRequests,
   clearSettings,
   notices,
+  openModals,
   requestedUrls,
   resetFakeObsidian,
   setRequestResponder,
@@ -30,12 +31,18 @@ import { isoDaysAgo } from "../src/core/dates";
 
 // --- canned API payloads -------------------------------------------------------
 
-function openAlexWork(id: string, title: string, refs: string[] = [], doi?: string) {
+function openAlexWork(
+  id: string,
+  title: string,
+  refs: string[] = [],
+  doi?: string,
+  date = "2026-05-01",
+) {
   return {
     id: `https://openalex.org/${id}`,
     title,
     type: "article",
-    publication_date: "2026-05-01",
+    publication_date: date,
     doi: doi ? `https://doi.org/${doi}` : null,
     authorships: [{ author: { display_name: "Ada Lovelace" } }],
     referenced_works: refs.map((r) => `https://openalex.org/${r}`),
@@ -1283,6 +1290,50 @@ describe("Crossref alongside OpenAlex", () => {
   });
 });
 
+describe("run report transparency", () => {
+  it("breaks the arrival count down by source, not just a single total", async () => {
+    setRequestResponder((url) =>
+      url.includes("example.org")
+        ? {
+            status: 200,
+            text:
+              `<?xml version="1.0"?><rss version="2.0"><channel><title>J</title>` +
+              `<item><title>A Feed Paper</title><link>https://example.org/a</link></item>` +
+              `</channel></rss>`,
+          }
+        : {
+            status: 200,
+            text: openAlexPage([
+              openAlexWork("W1", "A Topic Paper", [], "10.1234/topic"),
+            ]),
+          },
+    );
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "topic", value: "transformers", enabled: true },
+        { kind: "feed", value: "https://example.org/f.xml", enabled: true },
+      ];
+    });
+
+    await plugin.updateInbox();
+
+    const modal = openModals[openModals.length - 1];
+    const items = Array.from(modal.contentEl.querySelectorAll("ul li"), (el) => el.textContent);
+    expect(items).toContain("Papers matching a topic: transformers: 1");
+    expect(items).toContain("RSS / Atom feed: https://example.org/f.xml: 1");
+  });
+
+  it("shows no per-source list when only one source is enabled", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+
+    await plugin.updateInbox();
+
+    const modal = openModals[openModals.length - 1];
+    expect(modal.contentEl.querySelectorAll("ul li").length).toBe(0);
+  });
+});
+
 describe("what should I read?", () => {
   it("suggests a paper from the inbox", async () => {
     respondWith(DEFAULT_RESPONSE);
@@ -1941,17 +1992,26 @@ describe("citation backfill", () => {
     expect(requestedUrls.some((url) => url.includes("title.search"))).toBe(false);
   });
 
-  it("gives up after three tries and says so on the note", async () => {
+  it("stays on the watchlist for 30 days, checked every run", async () => {
+    let phase = 0;
+    stagedResponder(() => phase);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    ageBackfillState(plugin, 29);
+    clearRequests();
+    await runCommand(plugin, "update-inbox");
+    expect(requestedUrls.some((url) => url.includes("title.search"))).toBe(true);
+  });
+
+  it("gives up once the 30-day window passes, and says so on the note", async () => {
     let phase = 0;
     stagedResponder(() => phase);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
     await runCommand(plugin, "update-inbox");
 
-    // Three scheduled attempts: the next day, a few days later, then a month.
-    for (const days of [2, 10, 40]) {
-      ageBackfillState(plugin, days);
-      await runCommand(plugin, "update-inbox");
-    }
+    ageBackfillState(plugin, 31);
+    await runCommand(plugin, "update-inbox");
 
     const note = app.vault.files.get("Inbox/An Isolated Preprint Paper.md") as string;
     expect(note).toContain("No citation links found");
@@ -2053,6 +2113,172 @@ describe("citation backfill", () => {
     const note = app.vault.files.get("Inbox/A Fresh Preprint.md") as string;
     expect(note).toContain("## Citations");
     expect(note).toContain("[[Cited Paper]]");
+  });
+});
+
+describe("retroactive citation linking", () => {
+  /**
+   * A paper's reference list is only ever fetched once — the run it first
+   * arrives — and never again. If it cites something that hasn't shown up
+   * yet, that citation can only ever be honoured later by consulting a
+   * *persisted* copy of what it referenced back then, since nothing re-asks
+   * OpenAlex about an old, already-kept paper on every later run.
+   */
+  it("links an already-known paper to something it cited, once that arrives later", async () => {
+    let phase = 0;
+    setRequestResponder(() => {
+      if (phase === 0) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W10", "Paper A Arrives First", ["W20"], "10.1234/a"),
+          ]),
+        };
+      }
+      if (phase === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W20", "Paper B Arrives Later", [], "10.1234/b")]),
+        };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+
+    await runCommand(plugin, "update-inbox");
+    const first = app.vault.files.get("Inbox/Paper A Arrives First.md") as string;
+    expect(first).not.toContain("## Citations"); // W20 doesn't exist yet — unresolved, not an error
+
+    phase = 1;
+    await runCommand(plugin, "update-inbox");
+
+    const oldNote = app.vault.files.get("Inbox/Paper A Arrives First.md") as string;
+    expect(oldNote).toContain("### Cites");
+    expect(oldNote).toContain("[[Paper B Arrives Later]]");
+
+    const newNote = app.vault.files.get("Inbox/Paper B Arrives Later.md") as string;
+    expect(newNote).toContain("### Cited by");
+    expect(newNote).toContain("[[Paper A Arrives First]]");
+  });
+
+  it("never rewrites the older note's tracked hash once the user has edited it", async () => {
+    let phase = 0;
+    setRequestResponder(() => {
+      if (phase === 0) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W10", "Paper A Arrives First", ["W20"], "10.1234/a"),
+          ]),
+        };
+      }
+      if (phase === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W20", "Paper B Arrives Later", [], "10.1234/b")]),
+        };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    const path = "Inbox/Paper A Arrives First.md";
+    const edited = `${app.vault.files.get(path) as string}\n\nMy own notes.\n`;
+    app.vault.files.set(path, edited);
+    const hashBefore = (
+      plugin as never as { inbox: { notePath: string; contentHash: string }[] }
+    ).inbox.find((r) => r.notePath === path)?.contentHash;
+
+    phase = 1;
+    await runCommand(plugin, "update-inbox");
+
+    const updated = app.vault.files.get(path) as string;
+    expect(updated).toContain("[[Paper B Arrives Later]]");
+    expect(updated).toContain("My own notes.");
+    const hashAfter = (
+      plugin as never as { inbox: { notePath: string; contentHash: string }[] }
+    ).inbox.find((r) => r.notePath === path)?.contentHash;
+    expect(hashAfter).toBe(hashBefore);
+  });
+
+  it("never links a paper to something dated after it — a citation can't point at the future", async () => {
+    // W10 is dated *before* W20 below, so the reference in its persisted
+    // record is impossible: nothing could have cited a paper that didn't
+    // exist yet. A mismatched or stale record should surface as "no edge",
+    // not a wrong one.
+    let phase = 0;
+    setRequestResponder(() => {
+      if (phase === 0) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W10", "Paper A Arrives First", ["W20"], "10.1234/a", "2020-01-01"),
+          ]),
+        };
+      }
+      if (phase === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W20", "Paper B Arrives Later", [], "10.1234/b", "2026-01-01"),
+          ]),
+        };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    phase = 1;
+    await runCommand(plugin, "update-inbox");
+
+    const oldNote = app.vault.files.get("Inbox/Paper A Arrives First.md") as string;
+    const newNote = app.vault.files.get("Inbox/Paper B Arrives Later.md") as string;
+    expect(oldNote).not.toContain("## Citations");
+    expect(newNote).not.toContain("## Citations");
+  });
+
+  it("drops a paper's persisted references once its own note is gone, so the store tracks the live library, not everything ever fetched", async () => {
+    let phase = 0;
+    setRequestResponder(() => {
+      if (phase === 0) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W10", "Paper A Arrives First", ["W20"], "10.1234/a"),
+          ]),
+        };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+    const { app, plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.pruneEnabled = true;
+      p.settings.keepWindowDays = 0; // everything is immediately eligible
+    });
+    await runCommand(plugin, "update-inbox");
+
+    const stored = () =>
+      (plugin as never as { referenceIndex: { ids: string[] }[] }).referenceIndex;
+    expect(stored().length).toBe(1);
+
+    // Clean up trashes the untouched arrival and drops its inbox record —
+    // simulating that whole path directly, the same as the cleanup safety
+    // tests above do for other assertions.
+    app.vault.files.delete("Inbox/Paper A Arrives First.md");
+    (plugin as never as { inbox: unknown[] }).inbox = [];
+
+    // Any run that writes at least one note re-merges and prunes the store —
+    // a second arrival is enough to trigger it.
+    phase = 1;
+    setRequestResponder(() => ({
+      status: 200,
+      text: openAlexPage([openAlexWork("W99", "An Unrelated Paper", [], "10.1234/z")]),
+    }));
+    await runCommand(plugin, "update-inbox");
+
+    expect(stored().some((r) => r.ids.includes("doi:10.1234/a"))).toBe(false);
   });
 });
 

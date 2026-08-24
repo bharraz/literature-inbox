@@ -338,6 +338,14 @@ export class PluginSettingTab {
   hide(): void {}
 }
 
+/** Every modal opened, so tests can inspect what one actually rendered —
+ * the plugin never keeps its own reference to a modal it opens. */
+export const openModals: Modal[] = [];
+
+export function clearModals(): void {
+  openModals.length = 0;
+}
+
 export class Modal {
   containerEl: HTMLElement = document.createElement("div");
   titleEl: HTMLElement = document.createElement("div");
@@ -348,6 +356,7 @@ export class Modal {
 
   open(): void {
     this.isOpen = true;
+    openModals.push(this);
     this.onOpen();
   }
   close(): void {
@@ -625,6 +634,7 @@ export function resetFakeObsidian(): void {
   clearNotices();
   clearSettings();
   clearRequests();
+  clearModals();
   Platform.isDesktop = true;
   responder = () => {
     throw new Error("requestUrl was called but no responder is installed");

@@ -7,7 +7,7 @@ five papers you care about is visually loud; an isolated dot is easy to ignore.
 You triage by looking at the graph, open what looks interesting, and everything
 you never touched quietly cleans itself out.
 
-> **Status:** built and tested (461 hermetic tests, `tsc` clean, plus live
+> **Status:** built and tested (463 hermetic tests, `tsc` clean, plus live
 > harnesses that build a real vault and measure connectivity). Loaded in a real
 > vault; still being shaken out. See `roadmap.md` for design context and the
 > path to the community store, `docs/interop-spec.md` for the note-format
@@ -171,7 +171,7 @@ literature-inbox/
                          hash, xml, types
   tests/
     fixtures/            real recorded API responses
-    *.test.ts            461 tests
+    *.test.ts            463 tests
 ```
 
 The `core/` ⇄ `obsidian-adapter.ts` split is deliberate: policy is testable
@@ -179,7 +179,7 @@ without mocking Obsidian, and there is exactly one place to audit for API use.
 
 ## Status
 
-**Verified:** 461 tests green, including a suite that drives the real plugin
+**Verified:** 463 tests green, including a suite that drives the real plugin
 class end to end through a faked Obsidian API. Typecheck and build clean.
 A live-API suite runs against the real OpenAlex and arXiv endpoints
 (`npm run test:live`), kept out of the default run so the suite stays offline.

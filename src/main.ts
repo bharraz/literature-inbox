@@ -27,10 +27,10 @@ import {
   withinWindow,
   type SourceConfig,
 } from "./core/sources";
-import { titlesMatch, normalizeTitle } from "./core/ids";
+import { titlesMatch, normalizeTitle, idsIntersect } from "./core/ids";
 import { VaultIndex, scanFolderIdentities } from "./core/vault-state";
 import { parseNoteIdentity } from "./core/note-identity";
-import { runUpdate, type InboxRecord, type UpdateReport } from "./core/update";
+import { runUpdate, type InboxRecord, type ReferenceRecord, type UpdateReport } from "./core/update";
 import { applyPrune, planPrune } from "./core/prune";
 import {
   backfillReferences,
@@ -104,6 +104,14 @@ interface PersistedData {
    * record leaves nothing anywhere to remember it was ever seen.
    */
   previouslyRemoved?: string[];
+  /**
+   * Every known paper's own reference list, captured once when its note was
+   * first written. The only way a paper that arrives *after* something you
+   * already kept can still be linked back to it, without re-fetching every
+   * kept paper's references on every run — see `core/citations.ts`'s
+   * `ReferenceRecord`. Pruned on load to whatever still has a note.
+   */
+  referenceIndex?: ReferenceRecord[];
 }
 
 function todayIso(): string {
@@ -127,8 +135,8 @@ const ADJACENCY_ANCHOR_LIMIT = 100;
 /** Shown in a note whose references were looked for and never found. */
 const UNINDEXED_NOTICE =
   "> **No citation links found.** OpenAlex has not indexed this paper's " +
-  "references, so it can't be wired into your graph yet. Checked three times " +
-  "over about a month; it won't be checked again.";
+  "references, so it can't be wired into your graph yet. Checked on every " +
+  "run for 30 days after it arrived; it won't be checked again.";
 
 /**
  * Turn a fetch failure into something the user can act on.
@@ -168,6 +176,8 @@ export default class LiteratureInboxPlugin extends Plugin {
   private openAlexIdByDoi: Record<string, string> = {};
   /** Never re-add these — see `PersistedData.previouslyRemoved`. */
   private previouslyRemoved: string[] = [];
+  /** See `PersistedData.referenceIndex`. */
+  private referenceIndex: ReferenceRecord[] = [];
   private running = false;
   /** The OpenAlex client for the run in progress, if any — see openAlex(). */
   private runClient?: OpenAlexClient;
@@ -323,6 +333,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     this.budget = data?.budget ?? emptyBudget(utcDay());
     this.openAlexIdByDoi = data?.openAlexIdByDoi ?? {};
     this.previouslyRemoved = Array.isArray(data?.previouslyRemoved) ? data.previouslyRemoved : [];
+    this.referenceIndex = Array.isArray(data?.referenceIndex) ? data.referenceIndex : [];
   }
 
   private async persist(): Promise<void> {
@@ -332,7 +343,27 @@ export default class LiteratureInboxPlugin extends Plugin {
       budget: this.budget,
       openAlexIdByDoi: this.openAlexIdByDoi,
       previouslyRemoved: this.previouslyRemoved,
+      referenceIndex: this.referenceIndex,
     } satisfies PersistedData);
+  }
+
+  /**
+   * Fold newly-written papers' reference lists into the persisted index, and
+   * drop any existing record whose paper no longer has a note — cleanup (or
+   * a hand-deleted file) removing a note should not leave a permanent,
+   * ever-growing record behind with nothing left for it to link.
+   */
+  private async mergeReferenceRecords(
+    fresh: readonly ReferenceRecord[],
+    vault: VaultIndex,
+  ): Promise<void> {
+    const stillPresent = this.referenceIndex.filter(
+      (record) =>
+        vault.findByOrigin(record.ids) !== undefined ||
+        this.inbox.some((entry) => idsIntersect(entry.originIds, record.ids)),
+    );
+    this.referenceIndex = [...stillPresent, ...fresh];
+    await this.persist();
   }
 
   async saveSettings(): Promise<void> {
@@ -550,15 +581,18 @@ export default class LiteratureInboxPlugin extends Plugin {
    * connected by construction.
    */
   /**
-   * *folderByWork* is populated as a side effect — one entry per fetched
-   * work, mapping it to its source's effective inbox folder (see
-   * `effectiveInboxFolder`) — so the caller can hand `runUpdate` a
-   * `folderFor` that writes each arrival to its own source's folder.
+   * *folderByWork* and *sourceByWork* are populated as a side effect — one
+   * entry per fetched work each, mapping it to its source's effective inbox
+   * folder (see `effectiveInboxFolder`) and its human-readable source label —
+   * so the caller can hand `runUpdate` a `folderFor` and `sourceFor` that
+   * write each arrival to its own source's folder and report where it came
+   * from.
    */
   private async fetchAll(
     report: UpdateReport,
     vault: VaultIndex,
     folderByWork: Map<Work, string>,
+    sourceByWork: Map<Work, string>,
   ): Promise<Work[]> {
     const works: Work[] = [];
     const globalCap = this.settings.maxArrivalsPerRun;
@@ -572,13 +606,17 @@ export default class LiteratureInboxPlugin extends Plugin {
       if (!isUsable(source)) continue;
       const cap = effective(source.maxPerRun, globalCap);
       const folder = effectiveInboxFolder(source, this.settings.inboxFolder);
+      const label = describeSource(source);
       try {
         const fetched = await this.fetchFrom(source, since, cap, vault, report);
-        for (const work of fetched) folderByWork.set(work, folder);
+        for (const work of fetched) {
+          folderByWork.set(work, folder);
+          sourceByWork.set(work, label);
+        }
         works.push(...fetched);
       } catch (error) {
         report.sourceErrors.push({
-          source: describeSource(source),
+          source: label,
           message: String(error),
         });
       }
@@ -653,11 +691,20 @@ export default class LiteratureInboxPlugin extends Plugin {
       const hasEdges = content.includes("## Citations");
       const exact = hasExactIdentifier(record.originIds);
       if (exact) exactIdCandidates.add(record.notePath);
-      // Only ask about notes that are actually due — for a title-only
-      // candidate. Without this, every isolated title-only arrival was
-      // re-queried on every run forever, at the expensive per-item rate.
-      if (!hasEdges && !exact && !isDueForBackfill(record, record.arrivedOn, today)) continue;
-      if (!hasEdges && !exact) due.push(record);
+      if (!hasEdges && !exact) {
+        // A title-only guess past its 30-day watchlist window is marked and
+        // left alone here, on whichever run first notices — it needn't have
+        // been "due" today to have expired; those are different questions.
+        if (hasGivenUp(record.arrivedOn, today)) {
+          await this.markUnindexed(record);
+          continue;
+        }
+        // Only ask about notes that are actually due. Without this, every
+        // isolated title-only arrival was re-queried on every run, at the
+        // expensive per-item rate.
+        if (!isDueForBackfill(record, record.arrivedOn, today)) continue;
+        due.push(record);
+      }
       candidates.push({
         notePath: record.notePath,
         originIds: record.originIds,
@@ -675,17 +722,10 @@ export default class LiteratureInboxPlugin extends Plugin {
     }
 
     const resolvedPaths = new Set(outcomes.map((outcome) => outcome.notePath));
-    // Spend an attempt on every title-only note we asked about, whether or
-    // not it resolved — that is what makes the schedule widen rather than
-    // repeat. Exact-identifier candidates never spend an attempt and never
-    // give up: they're cheap enough to just keep asking about forever.
-    for (const record of due) {
-      record.backfillAttempts = (record.backfillAttempts ?? 0) + 1;
-      record.lastBackfillOn = today;
-      if (!resolvedPaths.has(record.notePath) && hasGivenUp(record)) {
-        await this.markUnindexed(record);
-      }
-    }
+    // Record that a title-only note was asked about today, whether or not it
+    // resolved. Exact-identifier candidates never touch this: they're cheap
+    // enough to just keep asking about forever, with no watchlist to expire.
+    for (const record of due) record.lastBackfillOn = today;
     const stillWaiting = [...exactIdCandidates].filter(
       (path) => !resolvedPaths.has(path) && candidates.some((c) => c.notePath === path && !c.hasEdges),
     ).length;
@@ -1023,9 +1063,10 @@ ${content.slice(marker)}`;
 
       const ranked = [...pool].sort((a, b) => (b.citedByCount ?? 0) - (a.citedByCount ?? 0));
 
+      const vault = await this.vaultIndex();
       const report = await runKernel({
         works: ranked,
-        vault: await this.vaultIndex(),
+        vault,
         papersFolder: targetFolder,
         adapter: this.adapter(),
         today: todayIso(),
@@ -1037,6 +1078,7 @@ ${content.slice(marker)}`;
           if (written % 25 === 0 && written < total) notify(`Writing ${written} of ${total}…`);
         },
       });
+      await this.mergeReferenceRecords(report.newReferenceRecords, vault);
 
       this.keptCount += report.written.length;
       const parts = [`${report.written.length} papers added to ${targetFolder}/`];
@@ -1081,9 +1123,10 @@ ${content.slice(marker)}`;
         return;
       }
 
+      const vault = await this.vaultIndex();
       const report = await runKernel({
         works,
-        vault: await this.vaultIndex(),
+        vault,
         papersFolder: this.settings.papersFolder,
         adapter: this.adapter(),
         today: todayIso(),
@@ -1100,6 +1143,7 @@ ${content.slice(marker)}`;
           if (written % 25 === 0 && written < total) notify(`Writing ${written} of ${total}…`);
         },
       });
+      await this.mergeReferenceRecords(report.newReferenceRecords, vault);
 
       this.keptCount += report.written.length;
       const parts = [`${report.written.length} papers added to ${this.settings.papersFolder}/`];
@@ -1133,16 +1177,17 @@ ${content.slice(marker)}`;
       const vault = await this.vaultIndex();
       const preliminary: UpdateReport = { arrived: [], skipped: [], sourceErrors: [] };
       const folderByWork = new Map<Work, string>();
+      const sourceByWork = new Map<Work, string>();
       const fetched = await this.withSharedClient(
         (error, fetched) =>
           preliminary.sourceErrors.push({
             source: "OpenAlex",
             message: describeFetchError(error, fetched, Boolean(this.settings.openAlexApiKey.trim())),
           }),
-        () => this.fetchAll(preliminary, vault, folderByWork),
+        () => this.fetchAll(preliminary, vault, folderByWork, sourceByWork),
       );
 
-      const { report, inbox } = await runUpdate({
+      const { report, inbox, newReferenceRecords } = await runUpdate({
         fetched,
         vault,
         inbox: this.inbox,
@@ -1151,12 +1196,14 @@ ${content.slice(marker)}`;
         today: todayIso(),
         previouslyRemoved: this.previouslyRemoved,
         folderFor: (work) => folderByWork.get(work) ?? this.settings.inboxFolder,
+        sourceFor: (work) => sourceByWork.get(work) ?? "Unknown source",
+        referenceIndex: this.referenceIndex,
       });
       report.sourceErrors.push(...preliminary.sourceErrors);
 
       this.inbox = inbox;
       this.settings.lastUpdate = todayIso();
-      await this.persist();
+      await this.mergeReferenceRecords(newReferenceRecords, vault);
 
       // arXiv and RSS arrivals land edge-less; OpenAlex usually indexes them
       // within days, so ask again for the ones still isolated.
@@ -1166,6 +1213,9 @@ ${content.slice(marker)}`;
       const parts = [`${report.arrived.length} new`];
       if (report.skipped.length) parts.push(`${report.skipped.length} already known`);
       if (backfilled) parts.push(`${backfilled} newly connected`);
+      if (report.retroConnections) {
+        parts.push(`${report.retroConnections} older paper(s) now link to today's arrivals`);
+      }
       if (report.cappedAt) parts.push(`capped at ${report.cappedAt}`);
       if (report.sourceErrors.length) parts.push(`${report.sourceErrors.length} source error(s)`);
       notify(`Literature Inbox: ${parts.join(", ")}.`);
@@ -1245,13 +1295,15 @@ ${content.slice(marker)}`;
       }
 
       if (target === "papers") {
+        const vault = await this.vaultIndex();
         const report = await runKernel({
           works,
-          vault: await this.vaultIndex(),
+          vault,
           papersFolder: this.settings.papersFolder,
           adapter: this.adapter(),
           today: todayIso(),
         });
+        await this.mergeReferenceRecords(report.newReferenceRecords, vault);
         this.keptCount += report.written.length;
         notify(
           `Added ${report.written.length} paper(s) to ${this.settings.papersFolder}/` +
@@ -1260,13 +1312,15 @@ ${content.slice(marker)}`;
         return;
       }
 
-      const { report, inbox } = await runUpdate({
+      const vault = await this.vaultIndex();
+      const { report, inbox, newReferenceRecords } = await runUpdate({
         fetched: works,
-        vault: await this.vaultIndex(),
+        vault,
         inbox: this.inbox,
         settings: this.updateSettings(),
         adapter: this.adapter(),
         today: todayIso(),
+        referenceIndex: this.referenceIndex,
       });
 
       // For a single add, "you already have this" is the useful answer and
@@ -1287,7 +1341,7 @@ ${content.slice(marker)}`;
           ? { ...record, manual: true }
           : record,
       );
-      await this.persist();
+      await this.mergeReferenceRecords(newReferenceRecords, vault);
       const skipped = report.skipped.length ? `, ${report.skipped.length} already known` : "";
       notify(`Added ${report.arrived.length} paper(s) to ${this.settings.inboxFolder}/${skipped}.`);
     } catch (error) {
@@ -1596,6 +1650,20 @@ class RunReportModal extends Modal {
       this.contentEl.createEl("p", {
         text: `${report.arrived.length} new paper(s), most connected first.`,
       });
+      // A per-source count, so "3 new" doesn't hide that all 3 came from one
+      // row while the other four sources found nothing — worth knowing
+      // before deciding a source is dead versus just quiet this run.
+      const perSource = new Map<string, number>();
+      for (const arrival of report.arrived) {
+        const label = arrival.source ?? "Unknown source";
+        perSource.set(label, (perSource.get(label) ?? 0) + 1);
+      }
+      if (perSource.size > 1) {
+        const bySource = this.contentEl.createEl("ul");
+        for (const [label, count] of perSource) {
+          bySource.createEl("li", { text: `${label}: ${count}` });
+        }
+      }
       const list = this.contentEl.createEl("ol");
       const sorted = [...report.arrived].sort((a, b) => b.edgeCount - a.edgeCount);
       for (const arrival of sorted.slice(0, 50)) {

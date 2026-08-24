@@ -6,13 +6,21 @@
  * adapter and does nothing but plumbing.
  */
 
-import { CitationIndex, resolveCitations, type CitationEdge } from "./citations";
+import {
+  CitationIndex,
+  resolveCitations,
+  retroactiveEdges,
+  type CitationEdge,
+  type ReferenceRecord,
+} from "./citations";
 import { FilenameAllocator } from "./filenames";
 import { contentHash } from "./hash";
-import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds } from "./ids";
-import { renderInboxNote, type SubjectOptions } from "./notes";
+import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
+import { mergeCitations, renderInboxNote, type SubjectOptions } from "./notes";
 import { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
+
+export type { ReferenceRecord } from "./citations";
 
 /** One note this plugin created and is responsible for. */
 export interface InboxRecord {
@@ -29,8 +37,7 @@ export interface InboxRecord {
   /** How many vault papers this arrival cites, recorded at arrival and shown
    * in the run report. */
   edgeCount?: number;
-  /** Backfill attempts spent so far, and when the last one ran. */
-  backfillAttempts?: number;
+  /** `YYYY-MM-DD` the backfill watchlist last checked this note. */
   lastBackfillOn?: string;
 }
 
@@ -61,12 +68,16 @@ export type SkipReason =
   | "previously-removed";
 
 export interface UpdateReport {
-  arrived: { title: string; notePath: string; edgeCount: number }[];
+  arrived: { title: string; notePath: string; edgeCount: number; source?: string }[];
   skipped: { title: string; reason: SkipReason; existingPath?: string }[];
   /** Fetch failures, by source — a source being down is "no update from that
    * source this run", never a failed run. */
   sourceErrors: { source: string; message: string }[];
   cappedAt?: number;
+  /** Already-known papers whose note gained a "Cites" link to one of today's
+   * arrivals, discovered via the persisted reference index rather than a
+   * fresh fetch. */
+  retroConnections?: number;
 }
 
 export function emptyReport(): UpdateReport {
@@ -139,12 +150,27 @@ export interface UpdateRunInput {
    * Omit to write everything into `settings.inboxFolder` directly.
    */
   folderFor?: (work: Work) => string;
+  /**
+   * Every paper's own reference list, as captured the run it was first
+   * written — see `ReferenceRecord`. Omit to skip the retroactive pass
+   * entirely (no persisted records yet, e.g. a fresh install).
+   */
+  referenceIndex?: readonly ReferenceRecord[];
+  /** Which source row a given work came from, for the per-source breakdown
+   * in the run report. Omit to leave `arrived[].source` unset. */
+  sourceFor?: (work: Work) => string;
 }
 
 export interface UpdateRunOutput {
   report: UpdateReport;
   /** The full inbox record set after this run — caller persists it. */
   inbox: InboxRecord[];
+  /**
+   * One record per paper written this run, for the caller to fold into its
+   * persisted `referenceIndex` — the only place a paper's reference list
+   * survives past the run that fetched it.
+   */
+  newReferenceRecords: ReferenceRecord[];
 }
 
 export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput> {
@@ -172,15 +198,24 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
   // nothing, connecting to five papers you deliberately kept is the entire
   // signal.
   const keptNames = new Set<string>();
+  // Name -> path for every note already on disk, so a retroactive edge
+  // (found below, against the persisted reference index) knows which file
+  // to rewrite.
+  const pathByName = new Map<string, string>();
   for (const record of inbox) {
     const base = record.notePath.split("/").pop();
-    if (base?.endsWith(".md")) index.add(record.originIds, base.slice(0, -3));
+    if (base?.endsWith(".md")) {
+      const name = base.slice(0, -3);
+      index.add(record.originIds, name);
+      pathByName.set(name, record.notePath);
+    }
   }
   for (const entry of vault.entriesForIndex()) {
     const base = entry.notePath.split("/").pop();
     if (base?.endsWith(".md")) {
       const name = base.slice(0, -3);
       index.add(entry.originIds, name);
+      pathByName.set(name, entry.notePath);
       if (!entry.notePath.startsWith(`${settings.inboxFolder}/`)) keptNames.add(name);
     }
   }
@@ -249,11 +284,31 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     else citesByNote.set(edge.sourceKey, [edge.targetKey]);
   }
 
+  // The reverse pass: papers already known — kept or still in the inbox —
+  // whose *persisted* reference list turns out to include one of today's
+  // arrivals. Their note never gets re-fetched; the edge comes entirely from
+  // what was recorded when that paper was first written.
+  const newNoteNames = new Set(accepted.map((entry) => entry.noteName));
+  const newNoteDates = new Map(accepted.map((entry) => [entry.noteName, entry.work.date] as const));
+  const retro = retroactiveEdges(input.referenceIndex ?? [], index, newNoteNames, newNoteDates);
+  const retroCitedByNew = new Map<string, string[]>();
+  const retroCitesByOld = new Map<string, string[]>();
+  for (const edge of retro) {
+    const citedByList = retroCitedByNew.get(edge.targetKey);
+    if (citedByList) citedByList.push(edge.sourceKey);
+    else retroCitedByNew.set(edge.targetKey, [edge.sourceKey]);
+    const citesList = retroCitesByOld.get(edge.sourceKey);
+    if (citesList) citesList.push(edge.targetKey);
+    else retroCitesByOld.set(edge.sourceKey, [edge.targetKey]);
+  }
+
   await adapter.ensureFolder(settings.inboxFolder);
   const ensuredFolders = new Set<string>([settings.inboxFolder]);
+  const newReferenceRecords: ReferenceRecord[] = [];
 
   for (const entry of accepted) {
     const cites = citesByNote.get(entry.noteName) ?? [];
+    const citedBy = retroCitedByNew.get(entry.noteName) ?? [];
     const folder = input.folderFor?.(entry.work) ?? settings.inboxFolder;
     if (!ensuredFolders.has(folder)) {
       await adapter.ensureFolder(folder);
@@ -263,9 +318,10 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     const content = renderInboxNote({
       work: entry.work,
       cites,
+      citedBy,
       arrivedOn: today,
       originIds: entry.ids,
-      connectedKept: cites.filter((name) => keptNames.has(name)),
+      connectedKept: [...cites, ...citedBy].filter((name) => keptNames.has(name)),
       subjects: settings.subjects,
       readStatus: settings.readStatus,
     });
@@ -276,15 +332,43 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
       title: entry.work.title,
       arrivedOn: today,
       contentHash: contentHash(content),
-      edgeCount: cites.length,
+      edgeCount: cites.length + citedBy.length,
     });
     report.arrived.push({
       title: entry.work.title ?? entry.work.key,
       notePath,
-      edgeCount: cites.length,
+      edgeCount: cites.length + citedBy.length,
+      source: input.sourceFor?.(entry.work),
+    });
+    newReferenceRecords.push({
+      ids: entry.ids,
+      references: entry.work.references.map(serializeId),
+      date: entry.work.date,
     });
   }
 
-  return { report, inbox };
+  // Rewrite each already-known paper that gained a backward link — additive
+  // only, via the same merge the citation backfill uses, so an edit the user
+  // made is never disturbed and the tracked hash only advances when the note
+  // was still exactly what this plugin generated.
+  let retroConnections = 0;
+  for (const [sourceKey, targets] of retroCitesByOld) {
+    const path = pathByName.get(sourceKey);
+    if (!path) continue;
+    const content = await adapter.read(path);
+    if (content === undefined) continue;
+    const updated = mergeCitations(content, targets, []);
+    if (updated === content) continue;
+    await adapter.write(path, updated);
+    const record = inbox.find((r) => r.notePath === path);
+    if (record) {
+      const wasUnchanged = contentHash(content) === record.contentHash;
+      if (wasUnchanged) record.contentHash = contentHash(updated);
+    }
+    retroConnections += 1;
+  }
+  if (retroConnections > 0) report.retroConnections = retroConnections;
+
+  return { report, inbox, newReferenceRecords };
 }
 
