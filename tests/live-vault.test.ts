@@ -91,8 +91,9 @@ class NodeTransport implements Transport {
 
 /**
  * Find a real citer/cited pair — never hardcoded, since OpenAlex ids are not
- * permanent (see CLAUDE.md). Pulls a batch of well-cited real papers on
- * *topic*, then walks each one's real reference list until one reference
+ * permanent (records get merged or withdrawn, and a pinned one has 404ed on
+ * us before). Pulls a batch of well-cited real papers on *topic*, then walks
+ * each one's real reference list until one reference
  * resolves to a real work with both a title and a DOI (addByIds needs a DOI
  * to look the paper up by).
  */

@@ -10,6 +10,6 @@ test-vault/
 live-vault/
 test-vaults/
 
-# Local Claude Code project settings — machine-specific paths, not part of
-# the plugin.
+# Local editor/tooling settings — machine-specific paths, not part of the
+# plugin.
 .claude/
