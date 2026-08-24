@@ -7,7 +7,7 @@ five papers you care about is visually loud; an isolated dot is easy to ignore.
 You triage by looking at the graph, open what looks interesting, and everything
 you never touched quietly cleans itself out.
 
-> **Status:** built and tested (463 hermetic tests, `tsc` clean, plus live
+> **Status:** built and tested (468 hermetic tests, `tsc` clean, plus live
 > harnesses that build a real vault and measure connectivity). Loaded in a real
 > vault; still being shaken out. See `roadmap.md` for design context and the
 > path to the community store, `docs/interop-spec.md` for the note-format
@@ -77,11 +77,12 @@ Configured in settings, each independently enabled with a per-run arrival cap
   item's `guid` (falling back to its link).
 
 Feed items carry no reference list, so they arrive as isolated dots and are
-connected later: a scheduled backfill re-asks OpenAlex on three widening
-attempts (next run, ~4 days, ~30 days) and then says so on the note if the
-paper was never indexed. Resolving them *immediately* would cost OpenAlex's
-most expensive call type for a near-certain miss — see
-`docs/openalex-dependency.md`.
+connected later. An arXiv arrival resolves through its deterministic OpenAlex
+DOI on the very next run — no waiting. A bare RSS item with neither a DOI nor
+an arXiv id stays on a 30-day watchlist, checked on every run, and the note
+says so if it's still unindexed once that window passes. Resolving these
+immediately in the first place would cost OpenAlex's most expensive call type
+for a near-certain miss — see `docs/openalex-dependency.md`.
 
 ## What this costs you
 
@@ -128,7 +129,12 @@ Flows with Zotero:
 - No bundled or auto-downloaded binaries, and no launching of external
   programs at all.
 - The OpenAlex API key is an optional user setting — never ship a
-  hardcoded email. Disclose exactly which hosts are contacted and when.
+  hardcoded email. Disclose exactly which hosts are contacted and when:
+  **OpenAlex** (every source, plus citation resolution) and, only when you
+  turn them on, **Crossref** (a fallback for references OpenAlex doesn't
+  have), **arXiv** (`rss.arxiv.org`, when an arXiv category source is
+  configured), and any RSS/Atom feed URL you add yourself. Nothing else is
+  ever contacted, and nothing is sent anywhere without a manual run.
 - Manual runs only. No timers, no network on plugin load.
 - Never destroy user work: hash-guarded cleanup, trash not delete, preview
   before prune, unknown files untouchable.
@@ -171,7 +177,7 @@ literature-inbox/
                          hash, xml, types
   tests/
     fixtures/            real recorded API responses
-    *.test.ts            463 tests
+    *.test.ts            468 tests
 ```
 
 The `core/` ⇄ `obsidian-adapter.ts` split is deliberate: policy is testable
@@ -179,7 +185,7 @@ without mocking Obsidian, and there is exactly one place to audit for API use.
 
 ## Status
 
-**Verified:** 463 tests green, including a suite that drives the real plugin
+**Verified:** 468 tests green, including a suite that drives the real plugin
 class end to end through a faked Obsidian API. Typecheck and build clean.
 A live-API suite runs against the real OpenAlex and arXiv endpoints
 (`npm run test:live`), kept out of the default run so the suite stays offline.

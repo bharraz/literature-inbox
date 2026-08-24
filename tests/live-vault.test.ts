@@ -13,6 +13,13 @@
  * What it still cannot judge: whether the resulting graph *looks* like a good
  * triage surface. It writes the vault to disk so a human can open it and
  * decide — but the numbers below are the part that was previously guesswork.
+ *
+ * Order matters here: the reference-index suite runs first, deliberately,
+ * because it is the cheapest (a handful of single-id lookups) and the suite
+ * this file exists to prove out today. The kernel/arrivals/feed suite below
+ * it burns a much larger real request budget and can trip OpenAlex's burst
+ * rate limit if run back to back without a key — running it second means
+ * that risk falls on the least critical tests, not the reference-index ones.
  */
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -20,6 +27,9 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { App, notices, resetFakeObsidian, setRequestResponder } from "./fakes/obsidian";
 import LiteratureInboxPlugin from "../src/main";
+import { OpenAlexClient } from "../src/core/openalex";
+import type { Transport, TransportResponse } from "../src/core/http";
+import type { Work } from "../src/core/types";
 
 const LIVE = process.env.LIVE_VAULT === "1";
 const suite = LIVE ? describe : describe.skip;
@@ -66,6 +76,176 @@ function dumpVault(app: App, label: string): string {
   return root;
 }
 
+function report(label: string, lines: string[]): void {
+  console.log(`\n=== ${label} ===\n${lines.join("\n")}`);
+}
+
+class NodeTransport implements Transport {
+  async get(url: string): Promise<TransportResponse> {
+    const response = await fetch(url, {
+      headers: { "User-Agent": "literature-inbox-livetest/0.1 (contact via GitHub)" },
+    });
+    return { status: response.status, text: await response.text() };
+  }
+}
+
+/**
+ * Find a real citer/cited pair — never hardcoded, since OpenAlex ids are not
+ * permanent (see CLAUDE.md). Pulls a batch of well-cited real papers on
+ * *topic*, then walks each one's real reference list until one reference
+ * resolves to a real work with both a title and a DOI (addByIds needs a DOI
+ * to look the paper up by).
+ */
+async function findRealCitationPair(topic = TOPIC): Promise<{ citer: Work; cited: Work }> {
+  const client = new OpenAlexClient(new NodeTransport(), {
+    apiKey: process.env.LIVE_OPENALEX_KEY || undefined,
+  });
+  const candidates = await client.topWorks(topic, 25);
+  for (const citer of candidates) {
+    if (!citer.doi || citer.references.length === 0) continue;
+    for (const reference of citer.references.slice(0, 8)) {
+      const [cited] = await client.worksByIds([reference.value]);
+      if (cited?.title && cited.doi) return { citer, cited };
+    }
+  }
+  throw new Error(`could not find a real citer/cited pair on topic "${topic}"`);
+}
+
+/**
+ * Note base name (no extension) for the note that *is about* this title —
+ * matched against the generated `# Title` heading specifically, not a bare
+ * content substring, since another note's "Cites"/"Cited by" section also
+ * contains this exact title as link text and would otherwise match first.
+ */
+function noteNameFor(app: App, folder: string, title: string): string | undefined {
+  const heading = `# ${title}`;
+  for (const [path, content] of app.vault.files) {
+    if (!path.startsWith(`${folder}/`) || !path.endsWith(".md")) continue;
+    if (content.split("\n").includes(heading)) return path.slice(folder.length + 1, -3);
+  }
+  return undefined;
+}
+
+suite("retroactive citation linking, on real data", () => {
+  it(
+    "links two real papers regardless of which one arrives first",
+    async () => {
+      const { citer, cited } = await findRealCitationPair();
+      report("real pair found", [
+        `citer: "${citer.title}" (${citer.date}) — doi:${citer.doi}`,
+        `cited: "${cited.title}" (${cited.date}) — doi:${cited.doi}`,
+      ]);
+      // Sanity on the pair itself, independent of the plugin: a citation
+      // can't point at the future.
+      expect((cited.date ?? "") <= (citer.date ?? "9999")).toBe(true);
+
+      // --- Order A: the cited paper is already kept when the citer arrives.
+      // The ordinary forward pass — already covered by hermetic tests, run
+      // here again on real data as a sanity check before the harder case.
+      resetFakeObsidian();
+      useRealNetwork();
+      const forward = await boot((p) => {
+        p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
+      });
+      await forward.plugin.addByIds(cited.doi as string, "papers");
+      await forward.plugin.addByIds(citer.doi as string, "inbox");
+
+      const citerNoteFwd = noteNameFor(forward.app, "Inbox", citer.title ?? "");
+      const citedNoteFwd = noteNameFor(forward.app, "Papers", cited.title ?? "");
+      expect(citerNoteFwd && citedNoteFwd).toBeTruthy();
+      const citerContentFwd = forward.app.vault.files.get(
+        `Inbox/${citerNoteFwd}.md`,
+      ) as string;
+      expect(citerContentFwd).toContain("### Cites");
+      expect(citerContentFwd).toContain(`[[${citedNoteFwd}]]`);
+      dumpVault(forward.app, "reference-index-forward");
+
+      // --- Order B: the citer arrives first, citing a paper that doesn't
+      // exist in the vault yet — the retroactive case this whole feature
+      // exists for. Nothing here is a fresh fetch of the citer's references;
+      // the second call below relies entirely on what got persisted to
+      // plugin.referenceIndex on the *first* call.
+      resetFakeObsidian();
+      useRealNetwork();
+      const retro = await boot((p) => {
+        p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
+      });
+      await retro.plugin.addByIds(citer.doi as string, "inbox");
+
+      const citerNoteRetro = noteNameFor(retro.app, "Inbox", citer.title ?? "");
+      expect(citerNoteRetro).toBeTruthy();
+      const beforeLink = retro.app.vault.files.get(`Inbox/${citerNoteRetro}.md`) as string;
+      // The cited paper doesn't exist in this fresh vault yet, so on arrival
+      // the citer has nothing real to resolve against — no edge yet.
+      const hadNoEdgeYet = !beforeLink.includes(`[[${citedNoteFwd}]]`);
+
+      const persisted = (
+        retro.plugin as never as { referenceIndex: { ids: string[]; references: string[] }[] }
+      ).referenceIndex;
+      report("persisted after the citer's first arrival", [
+        `referenceIndex entries: ${persisted.length}`,
+        `citer's own record present: ${persisted.some((r) => r.ids.includes(`doi:${citer.doi}`))}`,
+      ]);
+      expect(persisted.some((r) => r.ids.includes(`doi:${citer.doi}`))).toBe(true);
+
+      // Now the cited paper shows up, on a completely separate run — the
+      // citer's note is never re-fetched to make this work.
+      await retro.plugin.addByIds(cited.doi as string, "inbox");
+
+      const citedNoteRetro = noteNameFor(retro.app, "Inbox", cited.title ?? "");
+      expect(citedNoteRetro).toBeTruthy();
+      const afterLink = retro.app.vault.files.get(`Inbox/${citerNoteRetro}.md`) as string;
+      const citedContent = retro.app.vault.files.get(`Inbox/${citedNoteRetro}.md`) as string;
+      const path = dumpVault(retro.app, "reference-index-retroactive");
+
+      report("after the cited paper arrives later", [
+        `citer's note gained "### Cites": ${afterLink.includes("### Cites")}`,
+        `cited's note gained "### Cited by": ${citedContent.includes("### Cited by")}`,
+        `vault written to: ${path}`,
+      ]);
+
+      expect(hadNoEdgeYet).toBe(true);
+      expect(afterLink).toContain("### Cites");
+      expect(afterLink).toContain(`[[${citedNoteRetro}]]`);
+      expect(citedContent).toContain("### Cited by");
+      expect(citedContent).toContain(`[[${citerNoteRetro}]]`);
+
+      // --- Growth control: simulate closing and reopening the vault (a
+      // fresh plugin instance loading the same persisted data.json), then
+      // remove the citer's note the way cleanup does, and confirm a further
+      // run prunes its record rather than keeping it forever.
+      const reloaded = new LiteratureInboxPlugin(retro.app as never, {} as never);
+      (reloaded as never as { stored: unknown }).stored = (
+        retro.plugin as never as { stored: unknown }
+      ).stored;
+      await reloaded.onload();
+      const beforePrune = (reloaded as never as { referenceIndex: unknown[] }).referenceIndex
+        .length;
+
+      retro.app.vault.files.delete(`Inbox/${citerNoteRetro}.md`);
+      (reloaded as never as { inbox: { notePath: string }[] }).inbox = (
+        reloaded as never as { inbox: { notePath: string }[] }
+      ).inbox.filter((r) => r.notePath !== `Inbox/${citerNoteRetro}.md`);
+
+      // Any run that writes at least one note re-merges and prunes — add a
+      // third, unrelated real paper (a different topic, so it can't collide
+      // with anything already in this vault) to trigger it.
+      const trigger = await findRealCitationPair("machine translation");
+      await reloaded.addByIds(trigger.cited.doi as string, "inbox");
+      const afterPrune = (reloaded as never as { referenceIndex: { ids: string[] }[] })
+        .referenceIndex;
+
+      report("after reload + cleanup + another run", [
+        `referenceIndex before prune: ${beforePrune}`,
+        `referenceIndex after: ${afterPrune.length}`,
+        `citer's stale record gone: ${!afterPrune.some((r) => r.ids.includes(`doi:${citer.doi}`))}`,
+      ]);
+      expect(afterPrune.some((r) => r.ids.includes(`doi:${citer.doi}`))).toBe(false);
+    },
+    TIMEOUT,
+  );
+});
+
 interface Connectivity {
   arrivals: number;
   withAnyEdge: number;
@@ -91,10 +271,6 @@ function connectivity(app: App, inboxFolder: string): Connectivity {
     if (content.includes("Why you're seeing this")) result.withKeptEdge += 1;
   }
   return result;
-}
-
-function report(label: string, lines: string[]): void {
-  console.log(`\n=== ${label} ===\n${lines.join("\n")}`);
 }
 
 suite("a real vault, end to end", () => {
@@ -142,7 +318,12 @@ suite("a real vault, end to end", () => {
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 120;
         p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
-        p.settings.arrivalSelection = "both";
+        // Both streams on: adjacency ("citing my library") is connected by
+        // construction, topic is the broader, noisier one.
+        p.settings.sources = [
+          { kind: "citing", value: "", enabled: true },
+          { kind: "topic", value: TOPIC, enabled: true },
+        ];
         p.settings.maxArrivalsPerRun = 25;
         p.settings.newWindowDays = 30;
       });
@@ -164,9 +345,9 @@ suite("a real vault, end to end", () => {
         `notices: ${notices.join(" | ")}`,
       ]);
 
-      // The product's claim, asserted rather than hoped: with adjacency
-      // selection on, an arrival is connected *by construction*, so most of
-      // them must carry a why-line. Measured at 25/25 on 2026-08-06.
+      // The product's claim, asserted rather than hoped: with the "citing my
+      // library" source on, an arrival is connected *by construction*, so
+      // most of them must carry a why-line. Measured at 25/25 on 2026-08-06.
       expect(stats.arrivals).toBeGreaterThan(0);
       expect(stats.withKeptEdge / stats.arrivals).toBeGreaterThan(0.5);
     },
@@ -186,16 +367,13 @@ suite("a real vault, end to end", () => {
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 120;
         p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
-        p.settings.openAlexEnabled = false;
-        p.settings.rssEnabled = true;
-        p.settings.feeds = [{ url: FEED, enabled: true }];
         p.settings.maxArrivalsPerRun = 25;
       });
 
-      // Build the library with OpenAlex on, then switch to feed-only arrivals.
-      p_enable(plugin, true);
+      // Build the library with a topic source, then switch to feed-only
+      // arrivals — the source array, not a dead boolean, is what governs this.
       await plugin.buildKernel();
-      p_enable(plugin, false);
+      plugin.settings.sources = [{ kind: "feed", value: FEED, enabled: true }];
 
       await plugin.updateInbox();
       const stats = connectivity(app, "Inbox");
@@ -220,8 +398,3 @@ suite("a real vault, end to end", () => {
     TIMEOUT,
   );
 });
-
-/** The kernel needs OpenAlex even when arrivals come only from a feed. */
-function p_enable(plugin: LiteratureInboxPlugin, enabled: boolean): void {
-  plugin.settings.openAlexEnabled = enabled;
-}
