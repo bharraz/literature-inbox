@@ -1,12 +1,10 @@
 /**
  * A fast, synchronous content hash for "has the user edited this note?".
  *
- * FNV-1a, not SHA-256, deliberately. This hash never leaves the plugin's own
- * `data.json` — it is not the shared manifest hash (that one is zot2vault's,
- * and is SHA-256 per docs/interop-spec.md §4.2). Here the only question is
- * "did these bytes change", the adversary is an accidental keystroke rather
- * than an attacker, and staying synchronous avoids threading `await` through
- * every write path for no benefit. WebCrypto's digest is async-only.
+ * FNV-1a, not SHA-256, deliberately. Here the only question is "did these
+ * bytes change", the adversary is an accidental keystroke rather than an
+ * attacker, and staying synchronous avoids threading `await` through every
+ * write path for no benefit. WebCrypto's digest is async-only.
  *
  * A collision would mean an edited note read as untouched and became eligible
  * for cleanup — which is why cleanup *also* requires the keep window to have

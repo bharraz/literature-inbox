@@ -21,3 +21,24 @@
 .literature-inbox-feed-row .setting-item-control input[type="text"]:first-of-type {
   flex: 1 1 20em;
 }
+
+/* A lightweight legend above the source rows — not a real aligned grid (the
+   rows below wrap their controls at narrow widths, so fixed columns would
+   drift out of alignment with them anyway), but enough to say what each
+   control in a row means without repeating it in every row's description. */
+.literature-inbox-feed-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  padding: 0 0 var(--size-2-1) 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: var(--size-2-2);
+}
+
+.literature-inbox-feed-header span {
+  min-width: 6em;
+}

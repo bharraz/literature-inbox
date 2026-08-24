@@ -15,8 +15,24 @@
  * already there, so any failure just leaves the note as it is.
  */
 
-import { DOI, OPENALEX, makeId, normalizeDoi } from "./ids";
+import { ARXIV, DOI, OPENALEX, makeId, normalizeDoi } from "./ids";
 import type { Work, WorkId } from "./types";
+
+/**
+ * arXiv mints a DOI for every submission, following a fixed pattern —
+ * confirmed live: `2401.12345` resolves in OpenAlex as
+ * `10.48550/arxiv.2401.12345`. An RSS-sourced arrival never carries this DOI
+ * (RSS doesn't provide one), but it's fully computable from the bare arxiv
+ * id alone, so an arxiv-only arrival can use the same cheap, batched DOI
+ * lookup as anything with a real DOI — no per-item title search needed.
+ * List+Filter is priced at roughly a tenth of Search per request (see
+ * docs/openalex-dependency.md §2), and batches up to 50 ids into one request
+ * regardless, so checking these on every run costs one shared credit rather
+ * than one Search call per paper.
+ */
+export function arxivDerivedDoi(arxivId: string): string {
+  return `10.48550/arxiv.${arxivId.toLowerCase()}`;
+}
 
 /** The narrow slice of the OpenAlex client this needs. */
 export interface ReferenceResolver {
@@ -96,6 +112,32 @@ function doiFrom(originIds: readonly string[]): string | undefined {
   return found?.slice(prefix.length);
 }
 
+function arxivFrom(originIds: readonly string[]): string | undefined {
+  const prefix = `${ARXIV}:`;
+  const found = originIds.find((id) => id.startsWith(prefix));
+  return found?.slice(prefix.length);
+}
+
+/** The DOI to look this candidate up by — its real one if it has one,
+ * otherwise its arXiv-derived one. Exact either way, unlike a title guess. */
+function doiToLookUp(originIds: readonly string[]): string | undefined {
+  const real = doiFrom(originIds);
+  if (real) return real;
+  const arxivId = arxivFrom(originIds);
+  return arxivId ? arxivDerivedDoi(arxivId) : undefined;
+}
+
+/**
+ * Whether this candidate has an exact identifier to look up by (a real DOI,
+ * or an arXiv id — see `arxivDerivedDoi`), as opposed to only a title guess.
+ * The caller uses this to skip the widening retry schedule for these: they
+ * resolve through the cheap, batched DOI lookup, so there's no cost reason to
+ * make them wait — only the un-batchable title-search path needs rationing.
+ */
+export function hasExactIdentifier(originIds: readonly string[]): boolean {
+  return doiToLookUp(originIds) !== undefined;
+}
+
 function alreadyKnown(originIds: readonly string[], candidate: string): boolean {
   return originIds.includes(candidate);
 }
@@ -103,13 +145,18 @@ function alreadyKnown(originIds: readonly string[], candidate: string): boolean 
 /**
  * Look up references for edge-less arrivals.
  *
- * Resolution order is deliberate: a DOI is an exact identifier, so it's tried
- * first; a title lookup is a guess and is only accepted when the returned
+ * Resolution order is deliberate: an exact identifier — a real DOI, or an
+ * arXiv id's derived one — is tried first, batched into one cheap request; a
+ * title lookup is a guess, costs an order of magnitude more per item (see
+ * `arxivDerivedDoi`'s doc comment), and is only accepted when the returned
  * title actually matches, since attaching the wrong paper's references would
  * be worse than leaving the note bare.
  *
- * *limit* caps how many lookups one run performs, so a large inbox doesn't
- * turn an update into a hundreds-of-requests crawl.
+ * *limit* caps how many *title* lookups one run performs, since those are
+ * the expensive, un-batchable ones — a large inbox full of DOI-less,
+ * arxiv-less feed items is the one case that could still turn an update into
+ * a many-request crawl. The batched DOI lookup covers everything with an
+ * exact identifier regardless of how many there are.
  */
 export async function backfillReferences(
   candidates: readonly BackfillCandidate[],
@@ -119,15 +166,17 @@ export async function backfillReferences(
 ): Promise<BackfillOutcome[]> {
   const outcomes: BackfillOutcome[] = [];
 
-  // Everything with a DOI resolves in one batched request rather than one
-  // request each — the single biggest saving available here.
-  const withDoi = candidates
-    .filter((candidate) => !candidate.hasEdges && doiFrom(candidate.originIds))
-    .slice(0, limit);
+  // Everything with an exact identifier resolves in one batched request
+  // rather than one request each — the single biggest saving available here,
+  // and unlike the title-search fallback below, not capped by `limit`: it's
+  // one shared credit whether it covers 3 candidates or 50.
+  const withDoi = candidates.filter(
+    (candidate) => !candidate.hasEdges && doiToLookUp(candidate.originIds),
+  );
   const byDoi = new Map<string, Work>();
   if (withDoi.length > 0) {
     try {
-      const dois = withDoi.map((candidate) => doiFrom(candidate.originIds) as string);
+      const dois = withDoi.map((candidate) => doiToLookUp(candidate.originIds) as string);
       for (const work of await resolver.worksByDois(dois)) {
         const doi = normalizeDoi(work.doi);
         if (doi) byDoi.set(doi, work);
@@ -137,17 +186,20 @@ export async function backfillReferences(
     }
   }
 
+  let titleLookups = 0;
   for (const candidate of candidates) {
-    if (outcomes.length >= limit) break;
     if (candidate.hasEdges) continue;
 
     let resolved: Work | undefined;
-    const doi = doiFrom(candidate.originIds);
+    const doi = doiToLookUp(candidate.originIds);
 
     try {
       if (doi) {
+        // Both origin-id DOIs and arXiv-derived ones are already normalized.
         resolved = byDoi.get(doi);
       } else if (candidate.title) {
+        if (titleLookups >= limit) continue;
+        titleLookups += 1;
         const guess = await resolver.workByTitle(candidate.title);
         // Only trust a title lookup when the title genuinely matches.
         resolved = titlesMatchFn(guess?.title, candidate.title) ? guess : undefined;

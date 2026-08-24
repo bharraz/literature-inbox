@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findExisting, runUpdate, type InboxRecord, type VaultAdapter } from "../src/core/update";
-import { VaultIndex, parseVaultState } from "../src/core/vault-state";
+import { VaultIndex, type NoteEntry } from "../src/core/vault-state";
 import { normalizeTitle } from "../src/core/ids";
 import { emptyWork, type Work } from "../src/core/types";
 
@@ -20,11 +20,26 @@ class MemoryVault implements VaultAdapter {
 
 const settings = { inboxFolder: "Inbox", papersFolder: "Papers", maxArrivalsPerRun: 50 };
 
-const vaultWith = (manifest: Record<string, unknown>) =>
-  new VaultIndex(
-    parseVaultState(JSON.stringify({ version: 1, note_manifest: manifest })),
-    normalizeTitle,
-  );
+interface RawEntry {
+  origin_ids?: string[];
+  title?: string;
+  // Accepted and ignored — leftover from when this shape came from a JSON
+  // manifest. Kept so the call sites below don't need editing.
+  content_hash?: string;
+  generated_at?: string;
+}
+
+// Kept in the shape of a real note scan — {path: {origin_ids, title}} — so
+// every test below reads like "here's what's in the vault" regardless of
+// how that got recovered.
+const vaultWith = (notes: Record<string, RawEntry>) => {
+  const entries: NoteEntry[] = Object.entries(notes).map(([notePath, entry]) => ({
+    notePath,
+    originIds: entry.origin_ids ?? [],
+    title: entry.title,
+  }));
+  return new VaultIndex(entries, normalizeTitle);
+};
 
 const emptyVault = () => vaultWith({});
 
@@ -85,6 +100,22 @@ describe("findExisting — never inbox what the vault already has (spec §7.1)",
     const work = paper("W9", "Some Paper Title Here");
     expect(findExisting(work, emptyVault(), inbox)?.reason).toBe("already-in-inbox");
   });
+
+  it("refuses to re-add a paper that was added and later cleaned up", () => {
+    // Cleanup drops the note *and* its tracked record, so without this check
+    // there is nothing left anywhere to say "you already saw this and let it
+    // go" — the same real, still-matching paper would just reappear.
+    const work = paper("W9", "A Paper You Let Lapse");
+    work.doi = "10.1/lapsed";
+    expect(findExisting(work, emptyVault(), [], ["doi:10.1/lapsed"])?.reason).toBe(
+      "previously-removed",
+    );
+  });
+
+  it("does not confuse an unrelated paper for a previously-removed one", () => {
+    const work = paper("W9", "An Unrelated Paper");
+    expect(findExisting(work, emptyVault(), [], ["doi:10.1/something-else"])).toBeUndefined();
+  });
 });
 
 describe("runUpdate", () => {
@@ -104,6 +135,39 @@ describe("runUpdate", () => {
     expect(adapter.files.size).toBe(2);
     expect(inbox).toHaveLength(2);
     expect(inbox[0]?.arrivedOn).toBe(today);
+  });
+
+  it("writes each arrival to folderFor's answer, when supplied", async () => {
+    const adapter = new MemoryVault();
+    const arxivPaper = paper("W1", "From ArXiv");
+    const topicPaper = paper("W2", "From Topic");
+    await runUpdate({
+      fetched: [arxivPaper, topicPaper],
+      vault: emptyVault(),
+      inbox: [],
+      settings,
+      adapter,
+      today,
+      folderFor: (work) => (work === arxivPaper ? "Inbox/ArXiv" : "Inbox"),
+    });
+
+    expect(adapter.files.has("Inbox/ArXiv/From ArXiv.md")).toBe(true);
+    expect(adapter.files.has("Inbox/From Topic.md")).toBe(true);
+    expect(adapter.folders.has("Inbox/ArXiv")).toBe(true);
+  });
+
+  it("falls back to settings.inboxFolder when folderFor is omitted", async () => {
+    const adapter = new MemoryVault();
+    await runUpdate({
+      fetched: [paper("W1", "Plain Arrival")],
+      vault: emptyVault(),
+      inbox: [],
+      settings,
+      adapter,
+      today,
+    });
+
+    expect(adapter.files.has("Inbox/Plain Arrival.md")).toBe(true);
   });
 
   it("skips and reports a paper already in the vault rather than duplicating it", async () => {
@@ -199,6 +263,42 @@ describe("runUpdate", () => {
 
     expect(report.arrived).toHaveLength(1);
     expect(report.skipped[0]?.reason).toBe("duplicate-in-batch");
+  });
+
+  it("keeps the better-connected candidate when the cap bites, regardless of fetch order", async () => {
+    const adapter = new MemoryVault();
+    const vault = vaultWith({
+      "Papers/Kept Paper.md": {
+        content_hash: "abc", generated_at: "x",
+        origin_ids: ["openalex:W99"], title: "Kept Paper",
+      },
+    });
+    const unconnected = paper("W1", "Unconnected Candidate");
+    const connected = paper("W2", "Connected Candidate");
+    connected.references = [{ namespace: "openalex", value: "W99" }];
+
+    // The unconnected one is listed first — order must not be what decides.
+    const { report } = await runUpdate({
+      fetched: [unconnected, connected], vault, inbox: [],
+      settings: { ...settings, maxArrivalsPerRun: 1 }, adapter, today,
+    });
+
+    expect(report.arrived).toHaveLength(1);
+    expect(report.arrived[0]?.title).toBe("Connected Candidate");
+    expect(report.cappedAt).toBe(1);
+  });
+
+  it("breaks a connectivity tie by recency, newest first", async () => {
+    const adapter = new MemoryVault();
+    const older = paper("W1", "Older Equally Connected Paper", { date: "2020-01-01" });
+    const newer = paper("W2", "Newer Equally Connected Paper", { date: "2026-01-01" });
+
+    const { report } = await runUpdate({
+      fetched: [older, newer], vault: emptyVault(), inbox: [],
+      settings: { ...settings, maxArrivalsPerRun: 1 }, adapter, today,
+    });
+
+    expect(report.arrived[0]?.title).toBe("Newer Equally Connected Paper");
   });
 
   it("records every origin id on the arrival, for later dedup", async () => {

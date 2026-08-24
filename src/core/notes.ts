@@ -1,18 +1,35 @@
 /**
  * Inbox note rendering — docs/interop-spec.md §5.
  *
- * The generated-section markers and the frontmatter conventions are shared
- * with zot2vault on purpose. That's what lets a note you move from `Inbox/`
- * into `Papers/` be *upgraded in place* if that paper later enters your
- * Zotero library: zot2vault regenerates the block between the markers and
- * preserves everything you wrote below them. Change these strings and the
- * upgrade silently becomes a duplicate file instead.
+ * Everything between the generated-section markers is this plugin's to
+ * regenerate; everything below the end marker is the user's, preserved
+ * verbatim across a regenerate. These exact strings are an on-disk format,
+ * not an implementation detail — changing them makes every existing note
+ * look unmarked and would silently drop what users wrote below it.
  */
 
 import { workYear, fullName, type Work } from "./types";
 
-export const GENERATED_START = "<!-- zot2vault:generated:start -->";
-export const GENERATED_END = "<!-- zot2vault:generated:end -->";
+export const GENERATED_START = "<!-- literature-inbox:generated:start -->";
+export const GENERATED_END = "<!-- literature-inbox:generated:end -->";
+
+/**
+ * A second, narrower marker pair around just the Citations section.
+ *
+ * The outer generated-section markers guard the *whole* note for cleanup:
+ * edit anything inside them, anywhere, and the note is "touched" and safe
+ * from cleanup forever — exactly what cleanup should do. But that same
+ * all-or-nothing rule would also have frozen the citations list the moment
+ * you wrote so much as a personal tag elsewhere in the note, and keeping the
+ * graph's edges accurate matters independently of that. These markers let
+ * the plugin always find and add to *just this block*, regardless of
+ * anything else going on in the note — additively only: an existing link is
+ * never removed, and anything you add inside the block yourself is left
+ * exactly where it is.
+ */
+export const CITATIONS_START =
+  "<!-- literature-inbox:citations:start — auto-updated, please don't edit inside this block -->";
+export const CITATIONS_END = "<!-- literature-inbox:citations:end -->";
 
 export const NO_ABSTRACT_PLACEHOLDER = "*No abstract available.*";
 
@@ -135,6 +152,13 @@ function renderCitations(cites: string[], citedBy: string[]): string {
   return lines.join("\n").trimEnd() + "\n";
 }
 
+/** The Citations section, wrapped in its own always-findable markers. */
+function renderCitationsBlock(cites: string[], citedBy: string[]): string {
+  const inner = renderCitations(cites, citedBy);
+  if (!inner) return "";
+  return `${CITATIONS_START}\n${inner}${CITATIONS_END}\n`;
+}
+
 /**
  * The "why am I seeing this" line, phrased in terms of the papers the user
  * already kept rather than a raw edge count — a count says nothing about
@@ -192,33 +216,91 @@ export function renderInboxNote(options: InboxNoteOptions): string {
   const why = renderWhy(options.connectedKept ?? []);
   if (why) parts.push(why);
   parts.push(`## Abstract\n\n${work.abstract?.trim() || NO_ABSTRACT_PLACEHOLDER}\n`);
-  const citations = renderCitations(cites, citedBy);
+  const citations = renderCitationsBlock(cites, citedBy);
   if (citations) parts.push(citations);
 
   const body = parts.join("\n");
   return `${frontmatter}\n${GENERATED_START}\n${body}\n${GENERATED_END}\n`;
 }
 
-/**
- * Add a Citations section to an existing note, in place.
- *
- * Used by backfill, when a paper that arrived edge-less turns out to have
- * references after all. The block is inserted *inside* the generated section,
- * immediately before the end marker, so anything the user wrote below it is
- * untouched — and callers only ever pass notes that are still byte-identical
- * to what was generated, so there is nothing above the marker to lose either.
- *
- * A note that somehow already has citations is returned unchanged rather than
- * gaining a second section.
- */
-export function appendCitations(content: string, cites: readonly string[]): string {
-  if (cites.length === 0) return content;
-  if (content.includes("## Citations")) return content;
-  const markerIndex = content.indexOf(GENERATED_END);
-  if (markerIndex === -1) return content;
+/** Every `[[Name]]` link already inside a citations block — under Cites,
+ * under Cited by, or anything the user added by hand. Used only to decide
+ * what's missing; nothing already linked is ever touched or removed. */
+function existingLinks(block: string): Set<string> {
+  const links = new Set<string>();
+  for (const match of block.matchAll(/\[\[([^\]]+)\]\]/g)) links.add(match[1] as string);
+  return links;
+}
 
-  const section = renderCitations([...cites], []);
-  return `${content.slice(0, markerIndex)}${section}\n${content.slice(markerIndex)}`;
+/** Insert `bullets` right after `heading`'s own list, creating the heading
+ * (just before the block's end) if it isn't there yet. */
+function appendUnderHeading(block: string, heading: string, names: readonly string[]): string {
+  const bullets = names.map((name) => `- [[${name}]]`).join("\n");
+  const headingIndex = block.indexOf(heading);
+  const endMarkerIndex = block.indexOf(CITATIONS_END);
+  if (headingIndex === -1) {
+    return `${block.slice(0, endMarkerIndex)}${heading}\n\n${bullets}\n\n${block.slice(endMarkerIndex)}`;
+  }
+  // The end of this heading's section is the next "###" heading, or the
+  // block's own end marker if this is the last section.
+  const nextHeadingIndex = block.indexOf("###", headingIndex + heading.length);
+  const boundary = nextHeadingIndex === -1 ? endMarkerIndex : nextHeadingIndex;
+  // Back up over trailing blank lines so the new bullets land right after the
+  // last existing one, not after a blank line.
+  let cursor = boundary;
+  while (cursor > 0 && block[cursor - 1] === "\n") cursor -= 1;
+  return `${block.slice(0, cursor)}\n${bullets}\n${block.slice(cursor)}`;
+}
+
+/**
+ * Add newly-discovered citation links to a note's citations block, in place —
+ * creating the block if the note has none yet, and appending under the right
+ * heading (creating that heading too, if needed) otherwise.
+ *
+ * Deliberately additive only, and deliberately indifferent to whatever else
+ * has changed in the note: an existing link is never removed, anything else
+ * written inside the block is left exactly where it is, and the rest of the
+ * note — frontmatter, abstract, anything below the generated section — is
+ * never even inspected. Returns the input unchanged if there is nothing new
+ * to add.
+ */
+export function mergeCitations(
+  content: string,
+  cites: readonly string[],
+  citedBy: readonly string[],
+): string {
+  const newCites = cites.filter(Boolean);
+  const newCitedBy = citedBy.filter(Boolean);
+  if (newCites.length === 0 && newCitedBy.length === 0) return content;
+
+  const startIndex = content.indexOf(CITATIONS_START);
+  if (startIndex === -1) {
+    // No block yet — insert one where the note's generated content ends.
+    const markerIndex = content.indexOf(GENERATED_END);
+    if (markerIndex === -1) return content;
+    const section = renderCitationsBlock([...newCites], [...newCitedBy]);
+    if (!section) return content;
+    return `${content.slice(0, markerIndex)}${section}\n${content.slice(markerIndex)}`;
+  }
+
+  const endMarkerIndex = content.indexOf(CITATIONS_END, startIndex);
+  if (endMarkerIndex === -1) return content; // malformed; don't guess
+  const blockEnd = endMarkerIndex + CITATIONS_END.length;
+  const block = content.slice(startIndex, blockEnd);
+
+  const already = existingLinks(block);
+  const missingCites = newCites.filter((name) => !already.has(name));
+  const missingCitedBy = newCitedBy.filter((name) => !already.has(name));
+  if (missingCites.length === 0 && missingCitedBy.length === 0) return content;
+
+  let updatedBlock = block;
+  if (missingCites.length > 0) {
+    updatedBlock = appendUnderHeading(updatedBlock, "### Cites", missingCites);
+  }
+  if (missingCitedBy.length > 0) {
+    updatedBlock = appendUnderHeading(updatedBlock, "### Cited by", missingCitedBy);
+  }
+  return content.slice(0, startIndex) + updatedBlock + content.slice(blockEnd);
 }
 
 /** Whatever the user has written below the end marker. Carried across a

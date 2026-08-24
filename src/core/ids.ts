@@ -1,10 +1,9 @@
 /**
- * Origin ids and title normalization — docs/interop-spec.md §3.
+ * Origin ids and title normalization.
  *
- * This is the identity layer the whole dedup story rests on. The rules here
- * must match zot2vault's byte for byte; the spec, not the Python source, is
- * the reference. `packages/scriptorium/tests/test_interop_spec.py` pins the
- * other side of the same contract.
+ * This is the identity layer the whole dedup story rests on: every fetched
+ * paper is matched against the vault by id first, and only falls back to a
+ * normalized, distinctive title when no id overlaps at all.
  */
 
 import type { Work, WorkId } from "./types";

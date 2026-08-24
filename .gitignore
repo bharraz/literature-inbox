@@ -8,3 +8,4 @@ main.js.map
 # notes and local Obsidian config; regenerate it rather than commit it.
 test-vault/
 live-vault/
+test-vaults/

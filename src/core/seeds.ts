@@ -46,11 +46,17 @@ const ARXIV_DOI = /^10\.48550\/arxiv\.(\S+)$/i;
  * inside a DOI, and splitting on it would quietly corrupt one. A pasted
  * comma-separated list still works, because the separator is almost always
  * ", " and the trailing comma is stripped below.
+ *
+ * A trailing period is stripped too, for the same reason: pasting a
+ * bibliography straight from Zotero's "Create Bibliography from Items" (copy
+ * to clipboard, a style that includes DOIs) ends every entry's DOI URL with
+ * the reference's own closing period — `https://doi.org/10.1234/example.` —
+ * and no real DOI ends in one.
  */
 function tokenize(raw: string): string[] {
   return raw
     .split(/\s+/)
-    .map((token) => token.replace(/[;,]+$/, "").trim())
+    .map((token) => token.replace(/[;,.]+$/, "").trim())
     .filter(Boolean);
 }
 

@@ -91,9 +91,9 @@ with a budget and the one that can break us.
 
 ## 1. The endpoints we use
 
-Everything goes through one host, `https://api.openalex.org/works`. We use no
-other OpenAlex entity — no authors, sources, institutions, or concepts
-endpoints.
+Almost everything goes through one host, `https://api.openalex.org/works`. The
+one exception is `/concepts`, used to resolve a free-text topic before
+searching it — see the topic-search row below.
 
 | Call | Shape | Used by | Billed as |
 |---|---|---|---|
@@ -101,10 +101,21 @@ endpoints.
 | Works by DOI list | `?filter=doi:a\|b\|…` (50/req) | seed resolution, backfill, adjacency anchors | List+Filter |
 | Works by OpenAlex id | `?filter=openalex_id:W1\|W2\|…` (50/req) | snowball references, library seeds | List+Filter |
 | Works citing others | `?filter=cites:W1\|W2\|…` (50/req) | adjacency selection, snowball citers | List+Filter |
-| Topic search | `?filter=default.search:{topic}` | starting graph, topic arrivals | **Search** |
+| Concept lookup | `GET /concepts?search={topic}&per-page=1` | resolves free-text topics before every topic search (skipped for a bare `C…` id) | **Search**, unverified — see §5a |
+| Topic search | `?filter=concepts.id:{id}` (falls back to `default.search:{topic}` if no concept matched) | starting graph, topic arrivals | **Search** |
 | Title search | `?filter=title.search:{title}` | resolving a feed item to a real paper | **Search** |
 | Author's works | `?filter=authorships.author.id:` / `.orcid:` / `raw_author_name.search:` | author starting-graph mode | Filter / **Search** |
 | Recency window | `?filter=from_publication_date:{date}` | every arrival query | (modifier) |
+
+> **Why the concept lookup exists.** `default.search` matches the words
+> anywhere in title/abstract/fulltext, so sorting those hits by citation count
+> surfaces the most-cited paper in the whole corpus that merely contains the
+> word — a quantum-*consciousness* paper for the topic "quantum physics", a
+> phosphor-luminescence paper for "quantum". Scoping to a real OpenAlex
+> concept first makes "most cited" mean "most cited in that field". Diagnosed
+> from a live vault: 56 of 146 kernel papers under "quantum physics" had zero
+> citation edges to the rest, and every orphan was a real, highly-cited paper
+> from an unrelated subfield.
 
 Sorting uses `cited_by_count:desc` and `publication_date:desc`. Pagination is
 cursor-based (`cursor=*` then `meta.next_cursor`), `per-page` up to 200.
@@ -150,6 +161,7 @@ A typical update, keyless (1,000/day):
 | Step | Credits |
 |---|---|
 | Adjacency query (100 anchors, 50/batch) | 2 |
+| Concept lookup (topic mode only, once per run — memoized) | ~1 (unverified) |
 | Topic search | ~10 |
 | Feed fetches (arXiv/RSS) | 0 — not OpenAlex |
 | Scheduled backfill, DOIs batched | 1 |
@@ -158,11 +170,11 @@ A typical update, keyless (1,000/day):
 | Configuration | Credits per run | Runs per keyless day |
 |---|---|---|
 | Adjacency only | ~3 | ~300 |
-| Adjacency + topic (default) | ~13 | ~75 |
-| Topic only | ~11 | ~90 |
+| Adjacency + topic (default) | ~14 | ~70 |
+| Topic only | ~12 | ~80 |
 
-Building a 100-paper starting graph is one search plus a few filters, ~12
-credits.
+Building a 100-paper starting graph is one concept lookup, one search, and a
+few filters — ~13 credits.
 
 **The topic search is now the dominant cost** — the only search-priced call
 left on OpenAlex, and it is one per run rather than one per feed item. Before

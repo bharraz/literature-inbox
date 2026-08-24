@@ -19,6 +19,7 @@ import {
   allSettings,
   clearNotices,
   clearRequests,
+  clearSettings,
   notices,
   requestedUrls,
   resetFakeObsidian,
@@ -58,7 +59,7 @@ function respondWith(body: string, status = 200) {
 
 /**
  * A note for a paper the user kept. It carries its own `origin-ids`, which is
- * what lets the plugin recognise it without any zot2vault manifest present.
+ * what lets the plugin recognise it just by scanning the folder.
  */
 function keptNoteContent(title: string, originId: string): string {
   return [
@@ -87,6 +88,24 @@ function commandIds(plugin: LiteratureInboxPlugin): string[] {
   return (plugin as never as { commands: { id: string }[] }).commands.map((c) => c.id);
 }
 
+/**
+ * Commands (and settings-page buttons) kick off async work without awaiting.
+ * Waiting a fixed couple of ticks used to be enough; now that one rate
+ * limiter paces a whole run — and a topic search costs two requests, not one,
+ * since resolving the topic to a concept id comes first — a multi-request
+ * action genuinely takes time, so wait on the plugin's own busy flag instead
+ * of guessing.
+ */
+async function waitForIdle(plugin: LiteratureInboxPlugin): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const state = plugin as never as { running: boolean };
+  const deadline = Date.now() + 10_000;
+  while (state.running && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 async function runCommand(plugin: LiteratureInboxPlugin, id: string): Promise<void> {
   const command = (
     plugin as never as {
@@ -96,17 +115,7 @@ async function runCommand(plugin: LiteratureInboxPlugin, id: string): Promise<vo
   if (!command) throw new Error(`no such command: ${id}`);
   if (command.callback) command.callback();
   else command.checkCallback?.(false);
-  // Commands kick off async work without awaiting. Waiting a fixed couple of
-  // ticks used to be enough; now that one rate limiter paces a whole run, a
-  // multi-request command genuinely takes time, so wait on the plugin's own
-  // busy flag instead of guessing.
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const state = plugin as never as { running: boolean };
-  const deadline = Date.now() + 10_000;
-  while (state.running && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await waitForIdle(plugin);
 }
 
 /**
@@ -147,7 +156,6 @@ describe("plugin load", () => {
       "suggest-paper",
       "copy-identifier",
       "clean-up-inbox",
-      "run-zot2vault",
     ]);
   });
 
@@ -192,15 +200,15 @@ describe("plugin load", () => {
     expect(allSettings.some((s: Setting) => s.name.includes("How many papers"))).toBe(false);
   });
 
-  it("puts the everyday actions in their own section", async () => {
-    // Fetch and clean-up are what a user presses repeatedly; they used to be
-    // stranded at the end of one-time setup instructions.
+  it("puts the everyday actions where their settings live", async () => {
+    // Fetch lives with the sources it consults; clean-up lives with the
+    // cleanup settings it depends on — not stranded in setup instructions.
     const { plugin } = await bootPlugin();
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
     const fetch = allSettings.find((s: Setting) => s.name === "Fetch new papers");
-    const clean = allSettings.find((s: Setting) => s.name === "Clean up old arrivals");
+    const clean = allSettings.find((s: Setting) => s.name === "Clean up now");
     expect(fetch?.buttons[0]?.text).toBe("Update inbox");
-    expect(clean?.buttons[0]?.text).toBe("Clean up");
+    expect(clean?.buttons[0]?.text).toBe("Preview cleanup");
   });
 });
 
@@ -238,15 +246,15 @@ describe("update inbox", () => {
     expect(app.vault.folders.has("Inbox")).toBe(true);
   });
 
-  it("writes notes with frontmatter and the shared generated markers", async () => {
+  it("writes notes with frontmatter and the generated markers", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
     await runCommand(plugin, "update-inbox");
 
     const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
     expect(note.startsWith("---\n")).toBe(true);
-    expect(note).toContain("<!-- zot2vault:generated:start -->");
-    expect(note).toContain("<!-- zot2vault:generated:end -->");
+    expect(note).toContain("<!-- literature-inbox:generated:start -->");
+    expect(note).toContain("<!-- literature-inbox:generated:end -->");
     expect(note).toContain("doi: 10.1234/one");
     expect(note).toContain("source: openalex");
   });
@@ -298,21 +306,10 @@ describe("update inbox", () => {
   it("skips a paper already present in the vault's papers folder", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
-    // A zot2vault-generated vault that already contains one of these papers.
-    await app.vault.createFolder(".scriptorium");
-    app.vault.files.set(
-      ".scriptorium/state.json",
-      JSON.stringify({
-        version: 1,
-        note_manifest: {
-          "Papers/A Paper About Attention.md": {
-            content_hash: "x",
-            generated_at: "2026-01-01T00:00:00Z",
-            origin_ids: ["doi:10.1234/two"],
-            title: "A Paper About Attention",
-          },
-        },
-      }),
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Paper About Attention.md",
+      keptNoteContent("A Paper About Attention", "doi:10.1234/two"),
     );
 
     await runCommand(plugin, "update-inbox");
@@ -326,20 +323,10 @@ describe("update inbox", () => {
       openAlexPage([openAlexWork("W1", "A Brand New Arrival", ["W99"], "10.1234/new")]),
     );
     const { app, plugin } = await bootPlugin(enableOpenAlex);
-    await app.vault.createFolder(".scriptorium");
-    app.vault.files.set(
-      ".scriptorium/state.json",
-      JSON.stringify({
-        version: 1,
-        note_manifest: {
-          "Papers/An Older Known Paper.md": {
-            content_hash: "x",
-            generated_at: "2026-01-01T00:00:00Z",
-            origin_ids: ["openalex:W99"],
-            title: "An Older Known Paper",
-          },
-        },
-      }),
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/An Older Known Paper.md",
+      keptNoteContent("An Older Known Paper", "openalex:W99"),
     );
 
     await runCommand(plugin, "update-inbox");
@@ -386,11 +373,11 @@ describe("degenerate and failure cases", () => {
     await expect(runCommand(plugin, "update-inbox")).resolves.toBeUndefined();
   });
 
-  it("ignores a corrupt state.json instead of refusing to run", async () => {
+  it("ignores an unparseable note in the papers folder instead of refusing to run", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
-    await app.vault.createFolder(".scriptorium");
-    app.vault.files.set(".scriptorium/state.json", "{{{ corrupt");
+    await app.vault.createFolder("Papers");
+    await app.vault.create("Papers/Corrupt Frontmatter.md", "---\n:::garbage:::\n---\nbody");
 
     await runCommand(plugin, "update-inbox");
 
@@ -673,6 +660,34 @@ describe("building the starting graph", () => {
     expect(app.vault.files.size).toBe(0);
   });
 
+  it("reuses a matching preview's pool instead of fetching it again for Build", async () => {
+    respondWith(KERNEL_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+
+    await plugin.previewTopic();
+    expect(requestedUrls.length).toBeGreaterThan(0);
+
+    clearRequests();
+    await runCommand(plugin, "build-kernel");
+
+    expect(requestedUrls).toHaveLength(0);
+    expect(app.vault.files.has("Papers/The Foundational Paper.md")).toBe(true);
+  });
+
+  it("fetches fresh when Build's topic differs from what was previewed", async () => {
+    respondWith(KERNEL_RESPONSE);
+    const { plugin } = await bootPlugin(enableOpenAlex);
+
+    await plugin.previewTopic();
+    clearRequests();
+
+    plugin.settings.openAlexTopic = "a different topic";
+    respondWith(KERNEL_RESPONSE);
+    await runCommand(plugin, "build-kernel");
+
+    expect(requestedUrls.length).toBeGreaterThan(0);
+  });
+
   it("gives arrivals something to connect to", async () => {
     // The whole reason the kernel exists: without it, the first arrival is an
     // isolated dot and "why you're seeing this" can never fire.
@@ -706,7 +721,9 @@ describe("building the starting graph", () => {
     );
     await runCommand(plugin, "update-inbox");
 
-    const url = requestedUrls[0] as string;
+    // The topic is first resolved to a concept id (a separate, cheap
+    // request), so find the actual works query rather than assuming index 0.
+    const url = requestedUrls.find((u) => u.includes("/works?")) as string;
     expect(url).toContain("from_publication_date");
     expect(url).not.toContain("cited_by_count");
     expect(notices.some((n) => n.includes("1 new"))).toBe(true);
@@ -720,14 +737,14 @@ describe("building the starting graph", () => {
     const { plugin } = await bootPlugin(enableOpenAlex);
 
     await runCommand(plugin, "update-inbox");
-    const first = requestedUrls[0] as string;
+    const first = requestedUrls.find((u) => u.includes("/works?")) as string;
     expect(plugin.settings.lastUpdate).toBeTruthy();
 
     clearRequests();
     respondWith(DEFAULT_RESPONSE);
     await runCommand(plugin, "update-inbox");
 
-    expect(requestedUrls[0]).toBe(first);
+    expect(requestedUrls.find((u) => u.includes("/works?"))).toBe(first);
   });
 });
 
@@ -873,6 +890,113 @@ describe("starting-graph modes", () => {
   });
 });
 
+describe("expanding from a specific selection (context menu)", () => {
+  it("offers the menu item only for a selection that includes a kept paper", async () => {
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    const paper = await app.vault.create(
+      "Papers/An Existing Paper.md",
+      keptNoteContent("An Existing Paper", "openalex:W1"),
+    );
+    await app.vault.createFolder("Inbox");
+    const arrival = await app.vault.create(
+      "Inbox/An Arrival.md",
+      keptNoteContent("An Arrival", "openalex:W9"),
+    );
+
+    const onPaper = app.workspace.triggerFilesMenu([paper]);
+    expect(onPaper.items.some((i) => i.title.includes("Expand outward"))).toBe(true);
+
+    const onArrivalOnly = app.workspace.triggerFilesMenu([arrival]);
+    expect(onArrivalOnly.items.some((i) => i.title.includes("Expand outward"))).toBe(false);
+
+    void plugin; // menu registration happens in onload(), already exercised above
+  });
+
+  it("expands outward from just the selected papers, not the whole library", async () => {
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelSize = 10;
+    });
+    await app.vault.createFolder("Papers");
+    const selected = await app.vault.create(
+      "Papers/Selected Paper.md",
+      keptNoteContent("Selected Paper", "openalex:W1"),
+    );
+    // Present in the library but NOT selected — must play no part in the
+    // expansion, unlike the "library" kernel mode which would include it.
+    await app.vault.create(
+      "Papers/Unrelated Kept Paper.md",
+      keptNoteContent("Unrelated Kept Paper", "openalex:W99"),
+    );
+
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([openAlexWork("W1", "Selected Paper", ["W10"])]),
+        };
+      }
+      if (call === 2) {
+        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Reference")]) };
+      }
+      return { status: 200, text: openAlexPage([openAlexWork("W20", "A Citer", ["W1"])]) };
+    });
+
+    // The context menu opens a modal to confirm count/folder before running —
+    // covered separately — so the expansion itself is driven directly here,
+    // exactly as the modal's submit handler would call it.
+    await plugin.expandFromNotes([selected as never]);
+
+    expect(app.vault.files.has("Papers/A Reference.md")).toBe(true);
+    expect(app.vault.files.has("Papers/A Citer.md")).toBe(true);
+    void plugin;
+  });
+
+  it("writes to a custom folder and count when the modal's choices override the defaults", async () => {
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelSize = 10;
+    });
+    await app.vault.createFolder("Papers");
+    const selected = await app.vault.create(
+      "Papers/Selected Paper.md",
+      keptNoteContent("Selected Paper", "openalex:W1"),
+    );
+
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return { status: 200, text: openAlexPage([openAlexWork("W1", "Selected Paper", ["W10"])]) };
+      }
+      if (call === 2) {
+        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Reference")]) };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+
+    await plugin.expandFromNotes([selected as never], { count: 1, folder: "Papers/Trapped Ions" });
+
+    expect(app.vault.files.has("Papers/Trapped Ions/A Reference.md")).toBe(true);
+    expect(app.vault.files.has("Papers/A Reference.md")).toBe(false);
+  });
+
+  it("says so when nothing in the selection is a usable paper", async () => {
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Inbox");
+    const arrival = await app.vault.create(
+      "Inbox/An Arrival.md",
+      keptNoteContent("An Arrival", "openalex:W9"),
+    );
+
+    await plugin.expandFromNotes([]);
+    expect(notices.some((n) => n.toLowerCase().includes("select papers"))).toBe(true);
+
+    void arrival;
+  });
+});
+
 describe("adding papers by hand", () => {
   it("accepts the DOI URL you copy from a browser", async () => {
     // Regression: the old routing sent anything not starting with "10." to the
@@ -964,8 +1088,9 @@ describe("choosing arrivals by citation adjacency", () => {
   });
 
   it("resolves a DOI-only library into anchors rather than skipping it", async () => {
-    // A zot2vault library often records DOIs and no OpenAlex id. Without this
-    // lookup, adjacency would silently find nothing for those users.
+    // A note with only a DOI and no OpenAlex id is a normal case — a
+    // hand-added paper, say. Without this lookup, adjacency would silently
+    // find nothing for those users.
     let call = 0;
     setRequestResponder((url) => {
       call += 1;
@@ -1003,8 +1128,10 @@ describe("choosing arrivals by citation adjacency", () => {
   });
 
   it("puts citing papers ahead of topic matches, so the cap keeps the better ones", async () => {
-    // When maxArrivalsPerRun bites, order decides what survives. A paper
-    // citing your library beats one that merely matched your topic string.
+    // When maxArrivalsPerRun bites, connectivity to your kept library decides
+    // what survives — not which source listed it first. A paper citing your
+    // library has a real edge; one that merely matched a topic string has
+    // none, so it loses the cap regardless of source order.
     let call = 0;
     setRequestResponder(() => {
       call += 1;
@@ -1070,6 +1197,11 @@ describe("Crossref alongside OpenAlex", () => {
     setRequestResponder((url) => {
       if (url.startsWith("https://api.crossref.org")) {
         return { status: 200, text: crossrefFor(url, "10.1234/one", "A Paper", ["10.1234/kept"]) };
+      }
+      // The topic is resolved to a concept id first; that lookup isn't one
+      // of the "did the search return the arrival" calls being counted.
+      if (url.includes("/concepts")) {
+        return { status: 200, text: JSON.stringify({ results: [] }) };
       }
       openAlexCalls += 1;
       // The arrival arrives with no reference list of its own.
@@ -1267,32 +1399,40 @@ describe("per-feed settings", () => {
     `<?xml version="1.0"?><rss version="2.0"><channel><title>A Journal</title>` +
     `${items}</channel></rss>`;
 
-  it("applies each feed's own window", async () => {
+  it("uses the one global window for every source, ignoring a stale per-row override", async () => {
+    // Regression: a per-source "days back" control used to exist and is now
+    // gone from the UI — recency is why a result is in the inbox at all, so
+    // it isn't a per-row knob anymore. Any leftover `windowDays` from an
+    // older settings file (migrated from the pre-rows feed shape) must not
+    // silently keep acting as an override.
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toUTCString();
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toUTCString();
     respondWith(
       feedXml(
-        feedItem("Recent Paper", "Mon, 03 Aug 2026 00:00:00 GMT") +
-          feedItem("Ancient Paper", "Mon, 01 Jan 2024 00:00:00 GMT"),
+        feedItem("Recent Paper", twoDaysAgo) +
+          feedItem("Outside The Global Window", tenDaysAgo),
       ),
     );
     const { app, plugin } = await bootPlugin((p) => {
+      p.settings.newWindowDays = 7;
       p.settings.sources = [
-        { kind: "feed", value: "https://example.org/f.xml", enabled: true, windowDays: 7 },
+        // windowDays: 30 would have kept both papers under the old per-row
+        // behaviour — it must now be ignored in favour of the 7-day global.
+        { kind: "feed", value: "https://example.org/f.xml", enabled: true, windowDays: 30 },
       ];
     });
 
     await plugin.updateInbox();
 
     expect(app.vault.files.has("Inbox/Recent Paper.md")).toBe(true);
-    expect(app.vault.files.has("Inbox/Ancient Paper.md")).toBe(false);
+    expect(app.vault.files.has("Inbox/Outside The Global Window.md")).toBe(false);
   });
 
   it("honours a per-feed cap", async () => {
-    respondWith(
-      feedXml(
-        feedItem("First Paper", "Mon, 03 Aug 2026 00:00:00 GMT") +
-          feedItem("Second Paper", "Mon, 03 Aug 2026 00:00:00 GMT"),
-      ),
-    );
+    // Relative to whenever the suite actually runs — a hardcoded date drifts
+    // out of the (now 14-day default) window the moment real time catches up.
+    const recently = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toUTCString();
+    respondWith(feedXml(feedItem("First Paper", recently) + feedItem("Second Paper", recently)));
     const { app, plugin } = await bootPlugin((p) => {
       p.settings.sources = [
         { kind: "feed", value: "https://example.org/f.xml", enabled: true, maxPerRun: 1 },
@@ -1359,14 +1499,206 @@ describe("per-feed settings", () => {
     });
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
 
-    const rows = allSettings.filter((s: Setting) => s.dropdowns.length === 1 && s.toggles.length === 1);
+    const rows = allSettings.filter((s: Setting) =>
+      s.settingEl.classList.contains("literature-inbox-feed-row"),
+    );
     expect(rows).toHaveLength(2);
-    // "Papers citing my library" has nothing to type, so no value box:
-    // window and cap only.
+    // "Papers citing my library" has nothing to type, so no value box: papers
+    // per run and folder are the only text fields.
     expect(rows[0]?.texts).toHaveLength(2);
-    // A feed adds the URL box, plus a Test button alongside Remove.
+    // A feed adds the URL box on top of those two.
     expect(rows[1]?.texts).toHaveLength(3);
-    expect(rows[1]?.buttons).toHaveLength(2);
+    // Test only ever shows on the add-source draft now, not an added row.
+    expect(rows[1]?.buttons).toHaveLength(1);
+    expect(rows[1]?.buttons[0]?.text).toBe("Remove");
+  });
+
+  it("the draft add-source row has no toggle or remove button, unlike an added row", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const draft = allSettings.find((s: Setting) => s.name === "Add a source");
+    expect(draft?.toggles).toHaveLength(0);
+    expect(draft?.buttons.some((b) => b.text === "Remove")).toBe(false);
+    expect(draft?.buttons.some((b) => b.text === "Add source")).toBe(true);
+
+    const existingRow = allSettings.find(
+      (s: Setting) => s.settingEl.classList.contains("literature-inbox-feed-row"),
+    );
+    expect(existingRow?.toggles).toHaveLength(1);
+    expect(existingRow?.buttons.some((b) => b.text === "Remove")).toBe(true);
+  });
+
+  it("only ever shows Test on the draft, never on an added row, even for arxiv/feed", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "arxiv", value: "cs.CL", enabled: true },
+        { kind: "feed", value: "https://a.example/f.xml", enabled: true },
+      ];
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const rows = allSettings.filter((s: Setting) =>
+      s.settingEl.classList.contains("literature-inbox-feed-row"),
+    );
+    for (const row of rows) expect(row.buttons.some((b) => b.text === "Test")).toBe(false);
+
+    const draft = allSettings.find((s: Setting) => s.name === "Add a source");
+    // Default draft kind is "topic", which has no Test button either.
+    expect(draft?.buttons.some((b) => b.text === "Test")).toBe(false);
+  });
+
+  it("shows a real per-run default and folder value, not just a greyed hint", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.inboxFolder = "Inbox";
+      p.settings.maxArrivalsPerRun = 3;
+      p.settings.sources = [{ kind: "citing", value: "", enabled: true }];
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const row = allSettings.find((s: Setting) =>
+      s.settingEl.classList.contains("literature-inbox-feed-row"),
+    );
+    // Unset, so both fields show the resolved default as real, editable text.
+    expect(row?.texts[0]?.value).toBe("3");
+    expect(row?.texts[1]?.value).toBe("Inbox");
+  });
+
+  it("has no leftover column-legend text once the header exists", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const row = allSettings.find((s: Setting) =>
+      s.settingEl.classList.contains("literature-inbox-feed-row"),
+    );
+    expect(row?.desc).toBe("");
+    const draft = allSettings.find((s: Setting) => s.name === "Add a source");
+    expect(draft?.desc).toBe("");
+  });
+
+  it("commits the draft into a real, on-by-default row and resets the draft", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [];
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const draftKind = allSettings.find((s: Setting) => s.name === "Add a source");
+    clearSettings(); // the select below re-renders; only the fresh render matters next
+    await draftKind?.dropdowns[0]?.simulateSelect("arxiv");
+
+    const draftAfterKindChange = allSettings.find((s: Setting) => s.name === "Add a source");
+    // arXiv's value control is a category dropdown, not a plain text box.
+    expect(draftAfterKindChange?.dropdowns).toHaveLength(2); // kind + category
+    clearSettings();
+    await draftAfterKindChange?.dropdowns[1]?.simulateSelect("cs.CL");
+
+    const draftAfterCategory = allSettings.find((s: Setting) => s.name === "Add a source");
+    const addButton = draftAfterCategory?.buttons.find((b) => b.text === "Add source");
+    clearSettings();
+    await addButton?.simulateClick();
+
+    expect(plugin.settings.sources).toEqual([{ kind: "arxiv", value: "cs.CL", enabled: true }]);
+
+    // The draft reset back to its default kind, with nothing typed.
+    const draftAfterAdd = allSettings.find((s: Setting) => s.name === "Add a source");
+    expect(draftAfterAdd?.dropdowns[0]?.value).toBe("topic");
+  });
+
+  it("refuses to add a source that needs a value but has none", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [];
+    });
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const draft = allSettings.find((s: Setting) => s.name === "Add a source");
+    await draft?.dropdowns[0]?.simulateSelect("topic"); // needs a value, none typed
+    const addButton = draft?.buttons.find((b) => b.text === "Add source");
+    await addButton?.simulateClick();
+
+    expect(plugin.settings.sources).toEqual([]);
+  });
+});
+
+describe("per-source inbox folders", () => {
+  it("writes an arrival into its source's own subfolder, nested under the parent", async () => {
+    respondWith(openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]));
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "topic", value: "transformers", enabled: true, inboxFolder: "ArXiv" },
+      ];
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/ArXiv/A Topic Paper.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/A Topic Paper.md")).toBe(false);
+  });
+
+  it("cleanup still finds an expired arrival in a per-source subfolder", async () => {
+    // Cleanup trusts one prefix match against the *parent* inbox folder — the
+    // whole point of nesting every source folder under it (see
+    // effectiveInboxFolder) is that this keeps working with no folder-specific
+    // cleanup logic at all.
+    respondWith(openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]));
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "topic", value: "transformers", enabled: true, inboxFolder: "ArXiv" },
+      ];
+      p.settings.pruneEnabled = true;
+      p.settings.keepWindowDays = 1;
+    });
+    await plugin.updateInbox();
+
+    const record = (plugin as never as { inbox: { arrivedOn: string }[] }).inbox[0];
+    if (record) record.arrivedOn = "2020-01-01";
+
+    await plugin.cleanUp();
+
+    // ConfirmPruneModal only opens when there's something prunable — reaching
+    // it at all proves cleanup found the note in its nested subfolder.
+    expect(notices.some((n) => n.includes("Nothing to clean up"))).toBe(false);
+  });
+});
+
+describe("settings page: layout details", () => {
+  it("preserves scroll position across a re-render", async () => {
+    const { plugin } = await bootPlugin();
+    const tab = (plugin as never as { settingTab: { containerEl: HTMLElement; display: () => void } })
+      .settingTab;
+    tab.display();
+    tab.containerEl.scrollTop = 250;
+
+    tab.display();
+
+    expect(tab.containerEl.scrollTop).toBe(250);
+  });
+
+  it("shows the library directory setting with subfolder guidance", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const setting = allSettings.find((s: Setting) => s.name === "Library directory");
+    expect(setting).toBeDefined();
+    expect(setting?.desc.toLowerCase()).toContain("subfolder");
+  });
+
+  it("has no standalone Folders or Everyday section, or a graph-setup section", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    const headings = allSettings.filter((s: Setting) => s.isHeading).map((s: Setting) => s.name);
+    expect(headings).not.toContain("Folders");
+    expect(headings).not.toContain("Everyday");
+    expect(headings.some((h) => h.toLowerCase().includes("set up the graph"))).toBe(false);
+    expect(allSettings.some((s: Setting) => s.name === "Papers folder")).toBe(false);
+    expect(allSettings.some((s: Setting) => s.name === "Maximum arrivals per run")).toBe(false);
+  });
+
+  it("shows one global window setting instead of a per-row one", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+
+    expect(allSettings.some((s: Setting) => s.name === "How far back counts as new")).toBe(true);
   });
 });
 
@@ -1381,13 +1713,15 @@ describe("what counts as new", () => {
     await runCommand(plugin, "update-inbox");
 
     // The colon is percent-encoded in the query string, so match the parts.
-    expect(requestedUrls[0]).toContain("from_publication_date");
-    expect(requestedUrls[0]).toContain(isoDaysAgo(7));
+    // The topic is resolved to a concept id first, via a separate request.
+    const url = requestedUrls.find((u) => u.includes("/works?")) as string;
+    expect(url).toContain("from_publication_date");
+    expect(url).toContain(isoDaysAgo(7));
   });
 
   it("defaults to a window wide enough to return something on day one", async () => {
     const { plugin } = await bootPlugin();
-    expect(plugin.settings.newWindowDays).toBe(30);
+    expect(plugin.settings.newWindowDays).toBe(14);
   });
 });
 
@@ -1453,26 +1787,43 @@ describe("the plugin's visible surface", () => {
     expect(plugin.status().lastUpdate).toBeTruthy();
   });
 
+  it("can ask OpenAlex for today's figures on demand, without a full run", async () => {
+    respondWith(openAlexPage([]));
+    const { plugin } = await bootPlugin();
+
+    await plugin.refreshBudget();
+
+    // The cheapest possible request — a filtered singleton page — not a
+    // search, and not tied to any source being configured.
+    expect(requestedUrls[0]).toContain("per-page=1");
+    expect(requestedUrls[0]).not.toContain("default.search");
+  });
+
   it("renders every settings section without throwing", async () => {
     const { plugin } = await bootPlugin();
     const tab = (plugin as never as { settingTab: { display: () => void } }).settingTab;
     expect(() => tab.display()).not.toThrow();
 
     const headings = allSettings.filter((s: Setting) => s.isHeading).map((s: Setting) => s.name);
-    expect(headings).toContain("Everyday");
-    expect(headings).toContain("Folders");
+    expect(headings).toContain("Update your inbox");
     // The heading itself has to say cleanup never runs on its own — that is
     // the misreading the wording exists to prevent.
-    expect(headings).toContain("Cleanup — manual only");
+    expect(headings).toContain("Clean out your inbox");
+    expect(headings).toContain("What goes in a note");
+    expect(headings).toContain("Network and integrations");
   });
 
   it("puts the add-papers action in front of the user", async () => {
     // Named for a thing you do repeatedly, not a one-off "build": adding to
-    // the graph is meant to be re-run whenever you like.
+    // the graph is meant to be re-run whenever you like. It's its own row at
+    // the bottom of the section, below whichever mode-specific fields are
+    // showing, rather than sharing a row with the mode dropdown.
     const { plugin } = await bootPlugin();
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
-    const kernel = allSettings.find((s: Setting) => s.name.includes("Add papers to your graph"));
-    expect(kernel?.buttons[0]?.text).toBe("Add papers");
+    const button = allSettings.find((s: Setting) =>
+      s.buttons.some((b) => b.text === "Add papers"),
+    );
+    expect(button).toBeDefined();
   });
 
   it("wires the settings buttons to real actions", async () => {
@@ -1482,7 +1833,7 @@ describe("the plugin's visible surface", () => {
 
     const update = allSettings.find((s: Setting) => s.name.includes("Fetch new papers"));
     await update?.buttons[0]?.simulateClick();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitForIdle(plugin);
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
   });
@@ -1606,7 +1957,7 @@ describe("citation backfill", () => {
     expect(note).toContain("No citation links found");
   });
 
-  it("never rewrites a note the user has edited", async () => {
+  it("never rewrites a note the user has edited, when backfill isn't due yet", async () => {
     let phase = 0;
     stagedResponder(() => phase);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
@@ -1621,55 +1972,87 @@ describe("citation backfill", () => {
 
     expect(app.vault.files.get(path)).toBe(edited);
   });
-});
 
-describe("the zot2vault launcher", () => {
-  it("is offered on desktop and hidden on mobile", async () => {
-    const { plugin } = await bootPlugin((p) => {
-      p.settings.zot2vaultPath = "/bin/zot2vault";
-    });
-    const command = (
-      plugin as never as { commands: { id: string; checkCallback: (c: boolean) => boolean }[] }
-    ).commands.find((c) => c.id === "run-zot2vault");
+  it("still adds a newly-found citation link to an edited note, once backfill is due", async () => {
+    // The citations block is additive-only and self-contained, so it's safe
+    // to update even on a note the user has otherwise edited — unlike the
+    // note as a whole, which cleanup must never touch. What "My own notes."
+    // is standing in for here is real work; losing it to a backfill update
+    // would be exactly the kind of destructive surprise this plugin promises
+    // never to cause.
+    let phase = 0;
+    stagedResponder(() => phase);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Paper I Kept.md",
+      keptNoteContent("A Paper I Kept", "openalex:W99"),
+    );
+    await runCommand(plugin, "update-inbox");
 
-    Platform.isDesktop = true;
-    expect(command?.checkCallback(true)).toBe(true);
+    const path = "Inbox/An Isolated Preprint Paper.md";
+    const generated = app.vault.files.get(path) as string;
+    const edited = `${generated}\n\nMy own notes.\n`;
+    app.vault.files.set(path, edited);
 
-    Platform.isDesktop = false;
-    expect(command?.checkCallback(true)).toBe(false);
+    const recordBefore = (
+      plugin as never as { inbox: { notePath: string; contentHash: string }[] }
+    ).inbox.find((r) => r.notePath === path);
+    const hashBefore = recordBefore?.contentHash;
+
+    ageBackfillState(plugin, 5);
+    phase = 1;
+    await runCommand(plugin, "update-inbox");
+
+    const updated = app.vault.files.get(path) as string;
+    expect(updated).toContain("[[A Paper I Kept]]");
+    expect(updated).toContain("My own notes.");
+
+    // Cleanup safety must not weaken: this note was edited before the link
+    // was added, so it must still read as "touched" afterward — the tracked
+    // hash must not be laundered into matching the newly-written content.
+    const recordAfter = (
+      plugin as never as { inbox: { notePath: string; contentHash: string }[] }
+    ).inbox.find((r) => r.notePath === path);
+    expect(recordAfter?.contentHash).toBe(hashBefore);
   });
 
-  it("refuses to run, and never spawns, when no path is configured", async () => {
-    const { plugin } = await bootPlugin();
-    let spawned = false;
-    await plugin.runZot2vault(() => {
-      spawned = true;
-      throw new Error("must not spawn");
-    });
-    expect(spawned).toBe(false);
-    expect(notices.some((n) => n.includes("settings"))).toBe(true);
-  });
-
-  it("runs exactly the configured path and reports the outcome", async () => {
-    const { plugin } = await bootPlugin((p) => {
-      p.settings.zot2vaultPath = "/bin/zot2vault";
-    });
-    let launched: string | undefined;
-    await plugin.runZot2vault(((command: string) => {
-      launched = command;
-      const handlers: Record<string, ((v: unknown) => void)[]> = {};
-      queueMicrotask(() => handlers.close?.forEach((h) => h(0)));
+  it("connects an arXiv arrival through its derived DOI on the very next run", async () => {
+    // Unlike a bare title guess (expensive, un-batchable, hence rationed on
+    // the widening schedule above), an arXiv id resolves through the same
+    // cheap batched DOI lookup as a real DOI — so there's no reason to make
+    // it wait. No `ageBackfillState` here: this connects on the same run.
+    const recent = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toUTCString();
+    setRequestResponder((url) => {
+      if (url.includes("rss.arxiv.org")) {
+        return {
+          status: 200,
+          text:
+            `<?xml version="1.0"?><rss version="2.0"><channel><title>arXiv</title>` +
+            `<item><title>A Fresh Preprint</title>` +
+            `<link>https://arxiv.org/abs/2401.12345</link>` +
+            `<pubDate>${recent}</pubDate></item></channel></rss>`,
+        };
+      }
+      // The backfill's batched DOI lookup, on this same run.
       return {
-        stdout: { on: () => undefined },
-        stderr: { on: () => undefined },
-        on: (event: string, cb: (v: unknown) => void) => {
-          (handlers[event] ??= []).push(cb);
-        },
+        status: 200,
+        text: openAlexPage([
+          openAlexWork("W1", "A Fresh Preprint", ["W99"], "10.48550/arxiv.2401.12345"),
+        ]),
       };
-    }) as never);
+    });
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [{ kind: "arxiv", value: "cs.CL", enabled: true }];
+    });
+    await app.vault.createFolder("Papers");
+    await app.vault.create("Papers/Cited Paper.md", keptNoteContent("Cited Paper", "openalex:W99"));
 
-    expect(launched).toBe("/bin/zot2vault");
-    expect(notices.some((n) => n.includes("finished"))).toBe(true);
+    await runCommand(plugin, "update-inbox");
+
+    const note = app.vault.files.get("Inbox/A Fresh Preprint.md") as string;
+    expect(note).toContain("## Citations");
+    expect(note).toContain("[[Cited Paper]]");
   });
 });
 

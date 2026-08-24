@@ -1,11 +1,5 @@
 /**
- * Filename parity with zot2vault — docs/interop-spec.md §5.3.
- *
- * The expected values here are the *same literals* asserted by
- * `packages/scriptorium/tests/test_interop_spec.py` against the Python
- * implementation. If the two ever disagree, a note moved from Inbox/ into
- * Papers/ stops being upgraded in place and silently becomes a duplicate
- * file — so these are parity assertions, not merely unit tests.
+ * Filename sanitization and collision resolution — docs/interop-spec.md §5.3.
  */
 
 import { describe, expect, it } from "vitest";

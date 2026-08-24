@@ -87,39 +87,83 @@ describe("workByDoi against a real recorded response", () => {
   });
 });
 
+/** A concept-search response: {@link OpenAlexClient} resolves free text to
+ * this before searching, so most topic tests need one queued first. */
+const conceptFound = (id: string) =>
+  JSON.stringify({ results: [{ id: `https://openalex.org/${id}` }] });
+const noConceptMatch = JSON.stringify({ results: [] });
+
 describe("topWorks pagination", () => {
+  it("resolves free text to a concept before searching, so results are field-scoped", async () => {
+    // The bug this guards: `default.search` matches the words anywhere in
+    // title/abstract/fulltext, so sorting those hits by citation count
+    // surfaced the most-cited paper in the whole corpus that merely contained
+    // the word "quantum" — a consciousness-studies paper, a phosphor paper —
+    // regardless of field. concepts.id scopes to an actual field.
+    const { client, transport } = clientWith([
+      conceptFound("C41008148"),
+      load("openalex_top_works_page1.json"),
+    ]);
+    await client.topWorks("machine learning", 3);
+
+    expect(queryOf(transport.requested[0] as string).search).toBe("machine learning");
+    expect(queryOf(transport.requested[1] as string).filter).toContain("concepts.id:C41008148");
+  });
+
+  it("falls back to a quoted full-text phrase when no concept matches", async () => {
+    // Regression: unquoted default.search is an OR across every word, so
+    // "trapped ion quantum simulation" pulled in ~82k works — anything
+    // containing just "simulation" — sorted by raw citation count, surfacing
+    // biomolecular simulation packages and DFT codes as the "top results."
+    // Quoting it as a phrase narrowed that same live query to 347 results,
+    // all genuinely on topic.
+    const { client, transport } = clientWith([
+      noConceptMatch,
+      load("openalex_top_works_page1.json"),
+    ]);
+    await client.topWorks("machine learning", 3);
+
+    expect(queryOf(transport.requested[1] as string).filter).toContain(
+      'default.search:"machine learning"',
+    );
+  });
+
   it("follows the cursor across two real pages", async () => {
     const page1 = load("openalex_top_works_page1.json");
     const page2 = load("openalex_top_works_page2.json");
     const expectedCursor = JSON.parse(page1).meta.next_cursor as string;
 
-    const { client, transport } = clientWith([page1, page2]);
+    const { client, transport } = clientWith([noConceptMatch, page1, page2]);
     const works = await client.topWorks("machine learning", 6); // 3 per fixture page
 
-    expect(transport.requested).toHaveLength(2);
+    expect(transport.requested).toHaveLength(3);
     // Compare the decoded param, not a substring — the cursor is base64 and
     // gets percent-encoded in the URL.
-    expect(queryOf(transport.requested[1] as string).cursor).toBe(expectedCursor);
+    expect(queryOf(transport.requested[2] as string).cursor).toBe(expectedCursor);
     expect(works).toHaveLength(6);
   });
 
   it("stops at the requested limit", async () => {
-    const { client } = clientWith([load("openalex_top_works_page1.json")]);
+    const { client } = clientWith([noConceptMatch, load("openalex_top_works_page1.json")]);
     const works = await client.topWorks("machine learning", 3);
     expect(works).toHaveLength(3);
   });
 
   it("filters to article-like types and sorts by citations", async () => {
-    const { client, transport } = clientWith([load("openalex_top_works_page1.json")]);
+    const { client, transport } = clientWith([
+      noConceptMatch,
+      load("openalex_top_works_page1.json"),
+    ]);
     await client.topWorks("machine learning", 3);
-    const query = queryOf(transport.requested[0] as string);
+    const query = queryOf(transport.requested[1] as string);
     expect(query.filter).toContain("type:");
     expect(query.sort).toBe("cited_by_count:desc");
   });
 
-  it("treats a bare concept id as a concept filter, not free text", async () => {
+  it("treats a bare concept id as a concept filter, not free text, skipping resolution", async () => {
     const { client, transport } = clientWith([load("openalex_top_works_page1.json")]);
     await client.topWorks("C41008148", 3);
+    expect(transport.requested).toHaveLength(1); // no concept-lookup request needed
     expect(queryOf(transport.requested[0] as string).filter).toContain("concepts.id:C41008148");
   });
 });
@@ -130,23 +174,23 @@ describe("worksSince recency basis", () => {
     // weeks after publication — but it is a paid-plan filter that answers 429
     // "Plan upgrade required" for everyone else. Verified live, after it broke
     // every update for a free-tier user.
-    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
     await client.worksSince("quantum", "2026-07-01");
-    const filter = queryOf(transport.requested[0] as string).filter ?? "";
+    const filter = queryOf(transport.requested[1] as string).filter ?? "";
     expect(filter).toContain("from_publication_date:2026-07-01");
     expect(filter).not.toContain("from_created_date");
   });
 
   it("still sorts newest-published first, so a capped run gets recent papers", async () => {
-    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
     await client.worksSince("quantum", "2026-07-01");
-    expect(queryOf(transport.requested[0] as string).sort).toBe("publication_date:desc");
+    expect(queryOf(transport.requested[1] as string).sort).toBe("publication_date:desc");
   });
 
   it("uses index date only when asked explicitly, for anyone with a plan", async () => {
-    const { client, transport } = clientWith([load("openalex_works_since.json")]);
+    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
     await client.worksSince("quantum", "2026-07-01", 500, "created");
-    expect(queryOf(transport.requested[0] as string).filter).toContain(
+    expect(queryOf(transport.requested[1] as string).filter).toContain(
       "from_created_date:2026-07-01",
     );
   });
@@ -268,6 +312,7 @@ describe("partial fetches", () => {
     // loss, and 380 papers is a perfectly good starting graph.
     const partials: { fetched: number }[] = [];
     const transport = new SequenceTransport([
+      noConceptMatch,
       page([record("W1"), record("W2")], "next"),
       { status: 500, text: "upstream is having a day" },
     ]);
@@ -284,7 +329,7 @@ describe("partial fetches", () => {
   });
 
   it("still throws when no partial handler is configured", async () => {
-    const { client } = clientWith([{ status: 500, text: "boom" }]);
+    const { client } = clientWith([noConceptMatch, { status: 500, text: "boom" }]);
     await expect(client.topWorks("anything", 10)).rejects.toThrow();
   });
 
@@ -353,7 +398,8 @@ describe("being rate limited", () => {
     const slept: number[] = [];
     const transport = new SequenceTransport([
       { status: 429, text: "slow down", retryAfter: "7" },
-      page([]),
+      page([]), // the concept lookup succeeds on retry, finding no concept
+      page([]), // the actual works fetch
     ]);
     const client = new OpenAlexClient(transport, {
       sleep: async (ms) => {
@@ -372,7 +418,10 @@ describe("junk filtering against real bad data", () => {
   it("drops entries with implausible future publication dates", async () => {
     // This fixture holds five REAL OpenAlex records dated 2027-2050, plus one
     // hand-added valid control entry. Only the control should survive.
-    const { client } = clientWith([load("openalex_works_since.json")], new Date("2026-07-19"));
+    const { client } = clientWith(
+      [noConceptMatch, load("openalex_works_since.json")],
+      new Date("2026-07-19"),
+    );
     const works = await client.worksSince("quantum", "2026-01-01");
     expect(works).toHaveLength(1);
     expect(works[0]?.title).toBe("A Perfectly Ordinary Control Paper");

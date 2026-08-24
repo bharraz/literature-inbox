@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   describeSource,
   effective,
+  effectiveInboxFolder,
   emptySource,
   isUsable,
   migrateSources,
@@ -126,5 +127,39 @@ describe("windows and caps", () => {
     expect(effective(0, 30)).toBe(0);
     expect(effective(undefined, 30)).toBe(30);
     expect(effective(Number.NaN, 30)).toBe(30);
+  });
+});
+
+describe("effectiveInboxFolder — every source folder nests under the parent", () => {
+  const source = (inboxFolder?: string) => ({
+    kind: "topic" as const,
+    value: "x",
+    enabled: true,
+    inboxFolder,
+  });
+
+  it("uses the parent directly when blank", () => {
+    expect(effectiveInboxFolder(source(undefined), "Inbox")).toBe("Inbox");
+    expect(effectiveInboxFolder(source(""), "Inbox")).toBe("Inbox");
+    expect(effectiveInboxFolder(source("  "), "Inbox")).toBe("Inbox");
+  });
+
+  it("nests a bare subfolder name under the parent", () => {
+    expect(effectiveInboxFolder(source("ArXiv"), "Inbox")).toBe("Inbox/ArXiv");
+  });
+
+  it("leaves an already-nested path alone", () => {
+    expect(effectiveInboxFolder(source("Inbox/ArXiv"), "Inbox")).toBe("Inbox/ArXiv");
+  });
+
+  it("re-nests a path that tried to escape the parent", () => {
+    // This is the actual bound: even an attempt to point elsewhere in the
+    // vault is folded back under the parent, since cleanup and "Keep this
+    // paper" trust a single prefix match against it.
+    expect(effectiveInboxFolder(source("SomewhereElse"), "Inbox")).toBe("Inbox/SomewhereElse");
+  });
+
+  it("tolerates stray leading or trailing slashes", () => {
+    expect(effectiveInboxFolder(source("/ArXiv/"), "Inbox")).toBe("Inbox/ArXiv");
   });
 });

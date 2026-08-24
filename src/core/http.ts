@@ -204,6 +204,13 @@ export async function getWithRetry(
  */
 export class RateLimiter {
   private lastRequestAt = 0;
+  /** Every `wait()` chains onto this, so concurrent callers are serialized
+   * rather than racing: two calls that both read `lastRequestAt` before
+   * either writes it would otherwise both conclude "no need to sleep" and
+   * fire together, silently doubling the real request rate. Nothing in this
+   * codebase currently calls `wait()` concurrently, but the pacing this
+   * class exists to guarantee should not depend on that staying true. */
+  private queue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly minIntervalMs = 150,
@@ -211,12 +218,17 @@ export class RateLimiter {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  async wait(): Promise<void> {
-    const elapsed = this.now() - this.lastRequestAt;
-    if (this.lastRequestAt > 0 && elapsed < this.minIntervalMs) {
-      await this.sleep(this.minIntervalMs - elapsed);
-    }
-    this.lastRequestAt = this.now();
+  wait(): Promise<void> {
+    const turn = this.queue.then(async () => {
+      const elapsed = this.now() - this.lastRequestAt;
+      if (this.lastRequestAt > 0 && elapsed < this.minIntervalMs) {
+        await this.sleep(this.minIntervalMs - elapsed);
+      }
+      this.lastRequestAt = this.now();
+    });
+    // A failure in one caller's turn must not jam every later caller's.
+    this.queue = turn.catch(() => undefined);
+    return turn;
   }
 }
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { backfillReferences, type BackfillCandidate } from "../src/core/backfill";
+import {
+  arxivDerivedDoi,
+  backfillReferences,
+  hasExactIdentifier,
+  type BackfillCandidate,
+} from "../src/core/backfill";
 import { titlesMatch } from "../src/core/ids";
 import { emptyWork, type Work } from "../src/core/types";
 
@@ -60,9 +65,15 @@ describe("backfillReferences", () => {
     expect(outcomes[0]?.references).toEqual([{ namespace: "openalex", value: "W9" }]);
   });
 
-  it("falls back to a title lookup when there is no DOI", async () => {
+  // No DOI and no arXiv id: the only real "must guess by title" case, since
+  // an arXiv id now resolves through the cheap, exact, derived-DOI path
+  // instead (see "resolves an arXiv-only arrival by its derived DOI" below).
+  const titleOnly = (overrides: Partial<BackfillCandidate> = {}) =>
+    candidate({ originIds: ["rss:guid-123"], ...overrides });
+
+  it("falls back to a title lookup when there is no DOI or arXiv id", async () => {
     const outcomes = await backfillReferences(
-      [candidate()],
+      [titleOnly()],
       {
         worksByDois: async () => [],
         workByTitle: async () => resolvedWork("a fresh preprint about things!", ["W9"], "10.1/y"),
@@ -79,7 +90,7 @@ describe("backfillReferences", () => {
   it("refuses a title lookup that returns a different paper", async () => {
     // Attaching the wrong paper's references is far worse than no references.
     const outcomes = await backfillReferences(
-      [candidate()],
+      [titleOnly()],
       {
         worksByDois: async () => [],
         workByTitle: async () => resolvedWork("An Entirely Different Paper", ["W9"]),
@@ -91,7 +102,7 @@ describe("backfillReferences", () => {
 
   it("ignores a resolution that has no references either", async () => {
     const outcomes = await backfillReferences(
-      [candidate()],
+      [titleOnly()],
       {
         worksByDois: async () => [],
         workByTitle: async () => resolvedWork("A Fresh Preprint About Things", []),
@@ -99,6 +110,34 @@ describe("backfillReferences", () => {
       titlesMatch,
     );
     expect(outcomes).toEqual([]);
+  });
+
+  it("resolves an arXiv-only arrival by its derived DOI, never falling back to title", async () => {
+    // arXiv mints a DOI for every submission (10.48550/arxiv.<id>), which is
+    // fully computable from the id alone — confirmed live against the real
+    // API. This is what lets an arXiv arrival skip the expensive, un-
+    // batchable title-search path entirely.
+    const outcomes = await backfillReferences(
+      [candidate({ originIds: ["arxiv:2401.12345"] })],
+      {
+        worksByDois: async (dois: string[]) => {
+          expect(dois).toEqual([arxivDerivedDoi("2401.12345")]);
+          return [
+            resolvedWork(
+              "A Fresh Preprint About Things",
+              ["W9"],
+              arxivDerivedDoi("2401.12345"),
+            ),
+          ];
+        },
+        workByTitle: async () => {
+          throw new Error("must not fall back to title when an arXiv id is known");
+        },
+      },
+      titlesMatch,
+    );
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.references).toEqual([{ namespace: "openalex", value: "W9" }]);
   });
 
   it("does not re-report an id the note already has", async () => {
@@ -135,9 +174,9 @@ describe("backfillReferences", () => {
     expect(outcomes).toEqual([]);
   });
 
-  it("still falls back to a title lookup when a note has no DOI", async () => {
+  it("still falls back to a title lookup when a note has no DOI or arXiv id", async () => {
     const outcomes = await backfillReferences(
-      [candidate({ notePath: "Inbox/Titled.md", originIds: ["arxiv:2401.1"] })],
+      [titleOnly({ notePath: "Inbox/Titled.md" })],
       {
         worksByDois: async () => {
           throw new Error("should not be asked: no DOIs among the candidates");
@@ -149,24 +188,45 @@ describe("backfillReferences", () => {
     expect(outcomes.map((o) => o.notePath)).toEqual(["Inbox/Titled.md"]);
   });
 
-  it("caps how many lookups one run performs", async () => {
-    const many = Array.from({ length: 40 }, (_, i) =>
-      candidate({ notePath: `Inbox/Paper ${i}.md`, originIds: [`doi:10.1/${i}`] }),
+  it("caps how many title lookups one run performs, but never caps the batched DOI lookup", async () => {
+    // The DOI batch is one shared, cheap request regardless of size — capping
+    // it would ration something that costs nothing extra to leave uncapped.
+    // Only the un-batchable, per-item title-search path needs rationing.
+    const manyWithDoi = Array.from({ length: 40 }, (_, i) =>
+      candidate({ notePath: `Inbox/DOI Paper ${i}.md`, originIds: [`doi:10.1/${i}`] }),
+    );
+    const manyTitleOnly = Array.from({ length: 40 }, (_, i) =>
+      titleOnly({ notePath: `Inbox/Title Paper ${i}.md`, title: `Title Paper ${i}` }),
     );
     const outcomes = await backfillReferences(
-      many,
+      [...manyWithDoi, ...manyTitleOnly],
       {
         worksByDois: async (dois: string[]) =>
           dois.map((doi) => resolvedWork("A Fresh Preprint About Things", ["W9"], doi)),
-        workByTitle: async () => undefined,
+        workByTitle: async (title: string) => resolvedWork(title, ["W9"]),
       },
       titlesMatch,
       5,
     );
-    expect(outcomes).toHaveLength(5);
+    const fromDoi = outcomes.filter((o) => o.notePath.startsWith("Inbox/DOI"));
+    const fromTitle = outcomes.filter((o) => o.notePath.startsWith("Inbox/Title"));
+    expect(fromDoi).toHaveLength(40);
+    expect(fromTitle).toHaveLength(5);
   });
 
   it("does nothing when there is nothing to resolve", async () => {
     await expect(backfillReferences([], noResolver, titlesMatch)).resolves.toEqual([]);
+  });
+});
+
+describe("hasExactIdentifier", () => {
+  it("is true for a real DOI or an arXiv id", () => {
+    expect(hasExactIdentifier(["doi:10.1/x"])).toBe(true);
+    expect(hasExactIdentifier(["arxiv:2401.12345"])).toBe(true);
+  });
+
+  it("is false for anything else, including an RSS guid", () => {
+    expect(hasExactIdentifier(["rss:guid-123"])).toBe(false);
+    expect(hasExactIdentifier([])).toBe(false);
   });
 });

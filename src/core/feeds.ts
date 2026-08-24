@@ -33,8 +33,14 @@ export function arxivCategoryFeedUrl(category: string): string {
   return `https://rss.arxiv.org/rss/${encodeURIComponent(category.trim())}`;
 }
 
-/** Loose shape check, so an obvious typo is caught before a silent empty feed.
- * arXiv categories are `quant-ph`, `cs.CL`, `math.AG`, `astro-ph.HE`. */
+/**
+ * Loose shape check, so an obvious typo is caught before a silent empty feed.
+ * arXiv categories are `quant-ph`, `cs.CL`, `math.AG`, `astro-ph.HE` — but a
+ * real fraction of the taxonomy hyphenates the part *after* the dot too
+ * (`physics.atom-ph`, `cond-mat.mes-hall`, `physics.acc-ph`). A first version
+ * of this check only allowed a hyphen before the dot, so "Test" reported
+ * "not found" for a large, entirely valid slice of the real categories.
+ */
 export function looksLikeArxivCategory(category: string): boolean {
-  return /^[a-z-]+(\.[A-Za-z]{2,})?$/.test(category.trim());
+  return /^[a-z-]+(\.[A-Za-z-]{2,})?$/.test(category.trim());
 }

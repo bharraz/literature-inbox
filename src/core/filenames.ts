@@ -1,11 +1,9 @@
 /**
- * Filename sanitization and collision resolution — docs/interop-spec.md §5.3.
+ * Filename sanitization and collision resolution.
  *
- * **This must match zot2vault exactly.** It is load-bearing, not cosmetic:
- * when a user moves an inbox note into `Papers/` and zot2vault later generates
- * that same paper, identical filename rules mean it *upgrades the note in
- * place* (preserving what the user wrote below the generated marker). Diverge
- * by one character and the upgrade silently becomes a second, competing file.
+ * Consistency matters here for its own sake: the same paper must always
+ * resolve to the same filename, so a kept note and a later-arriving
+ * duplicate never end up as two competing files for one paper.
  */
 
 import { firstAuthorLastName, workYear, type Work } from "./types";
@@ -68,7 +66,7 @@ export class FilenameAllocator {
   constructor(private readonly maxLength: number = DEFAULT_MAX_LENGTH) {}
 
   /** Seed names that already exist and must not be reused — e.g. everything
-   * zot2vault has in `Papers/`, so an inbox note can never collide with one. */
+   * already in `Papers/`, so an inbox note can never collide with one. */
   reserve(filename: string, owner = "reserved"): void {
     this.assigned.set(filename.toLowerCase(), owner);
   }

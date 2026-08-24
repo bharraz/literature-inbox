@@ -189,9 +189,43 @@ export class FileManager {
   }
 }
 
+export class MenuItem {
+  title = "";
+  private clickHandler?: () => unknown;
+
+  setTitle(title: string): this {
+    this.title = title;
+    return this;
+  }
+  setIcon(_icon: string | null): this {
+    return this;
+  }
+  onClick(fn: () => unknown): this {
+    this.clickHandler = fn;
+    return this;
+  }
+  /** Test helper: simulate the user actually clicking this menu item. */
+  click(): void {
+    void this.clickHandler?.();
+  }
+}
+
+export class Menu {
+  readonly items: MenuItem[] = [];
+  addItem(cb: (item: MenuItem) => unknown): this {
+    const item = new MenuItem();
+    cb(item);
+    this.items.push(item);
+    return this;
+  }
+}
+
+type WorkspaceListener = (...args: unknown[]) => unknown;
+
 export class Workspace {
   activeFile: TFile | null = null;
   readonly opened: string[] = [];
+  private readonly listeners = new Map<string, WorkspaceListener[]>();
 
   getActiveFile(): TFile | null {
     return this.activeFile;
@@ -203,6 +237,28 @@ export class Workspace {
         this.opened.push(file.path);
       },
     };
+  }
+
+  on(name: string, callback: WorkspaceListener): { name: string } {
+    const list = this.listeners.get(name) ?? [];
+    list.push(callback);
+    this.listeners.set(name, list);
+    return { name };
+  }
+
+  /** Test helper: build the context menu Obsidian would show for a
+   * multi-file selection, so a test can find and click an added item. */
+  triggerFilesMenu(files: TFile[]): Menu {
+    const menu = new Menu();
+    for (const cb of this.listeners.get("files-menu") ?? []) cb(menu, files, "test");
+    return menu;
+  }
+
+  /** Same, for a single-file right-click. */
+  triggerFileMenu(file: TFile): Menu {
+    const menu = new Menu();
+    for (const cb of this.listeners.get("file-menu") ?? []) cb(menu, file, "test");
+    return menu;
   }
 }
 
@@ -252,6 +308,10 @@ export class Plugin {
 
   addRibbonIcon(icon: string, title: string, callback: () => void): HTMLElement {
     this.ribbonIcons.push({ icon, title, callback });
+    return document.createElement("div");
+  }
+
+  addStatusBarItem(): HTMLElement {
     return document.createElement("div");
   }
 

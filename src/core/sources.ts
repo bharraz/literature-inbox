@@ -32,6 +32,28 @@ export interface SourceConfig {
   windowDays?: number;
   /** Ceiling on arrivals from this row per run. Blank inherits the global. */
   maxPerRun?: number;
+  /** Where this row's arrivals land. Blank means the parent inbox folder
+   * directly; anything else is nested under it — see `effectiveInboxFolder`. */
+  inboxFolder?: string;
+}
+
+/**
+ * A source's effective inbox folder, always nested under *parentInboxFolder*.
+ *
+ * This is what lets cleanup, "Keep this paper", and every other bit of code
+ * that trusts a single prefix match against the parent folder go on doing
+ * exactly that without ever learning about per-source folders: whatever a
+ * source is given here, the result is guaranteed to start with
+ * `${parentInboxFolder}/` (or equal it), so scanning the parent recursively
+ * already covers it. The plugin's bound is the parent folder; a per-source
+ * folder is only ever a way of organizing what's inside that bound.
+ */
+export function effectiveInboxFolder(source: SourceConfig, parentInboxFolder: string): string {
+  const override = (source.inboxFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!override || override === parentInboxFolder) return parentInboxFolder;
+  return override.startsWith(`${parentInboxFolder}/`)
+    ? override
+    : `${parentInboxFolder}/${override}`;
 }
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {

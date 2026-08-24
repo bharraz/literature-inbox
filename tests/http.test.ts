@@ -129,6 +129,18 @@ describe("RateLimiter", () => {
     await limiter.wait();
     expect(delays).toEqual([]);
   });
+
+  it("serializes concurrent callers instead of letting them race", async () => {
+    // Both calls read `now` before either could plausibly have updated
+    // `lastRequestAt` if `wait()` weren't itself serialized — the bug this
+    // guards is two callers both concluding "no need to sleep" and firing
+    // together, silently doubling the real request rate.
+    const delays: number[] = [];
+    const now = 1000;
+    const limiter = new RateLimiter(100, async (ms) => { delays.push(ms); }, () => now);
+    await Promise.all([limiter.wait(), limiter.wait(), limiter.wait()]);
+    expect(delays).toEqual([100, 100]);
+  });
 });
 
 describe("buildUrl", () => {

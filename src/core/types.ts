@@ -35,6 +35,11 @@ export interface Work {
   publication?: string;
   authors: Author[];
   references: WorkId[];
+  /** Citation count, when the source gives one (OpenAlex does; arXiv and
+   * Crossref generally don't) — a real impact signal for ranking, rather than
+   * relying on incidental fetch order. Undefined, not 0: "unknown" must not
+   * outrank or underrank a work whose count is genuinely zero. */
+  citedByCount?: number;
   /**
    * Subject terms, kept separate by vocabulary because they behave
    * differently: `topics` is a small curated set, `keywords` is close to what

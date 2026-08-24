@@ -1,10 +1,10 @@
 import { PluginSettingTab, Setting, type App } from "obsidian";
+import { ARXIV_CATEGORIES, CUSTOM_ARXIV_CATEGORY, isKnownArxivCategory } from "./core/arxiv-categories";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
 import { type FeedConfig } from "./core/feeds";
 import {
   SOURCE_LABELS,
   SOURCE_PLACEHOLDERS,
-  emptySource,
   needsValue,
   type SourceConfig,
   type SourceKind,
@@ -38,8 +38,7 @@ export interface LiteratureInboxSettings {
   /** Where arrivals land. Keeping them in one folder is what makes "moving a
    * note out" a usable keep signal. */
   inboxFolder: string;
-  /** Where kept papers go — the same folder zot2vault writes, so a kept note
-   * gets upgraded in place if that paper later enters Zotero. */
+  /** Where kept papers go — the "library directory". */
   papersFolder: string;
 
   /** Every stream that brings in new papers, one row each. */
@@ -77,14 +76,14 @@ export interface LiteratureInboxSettings {
   kernelAuthor: string;
 
   /**
-   * What "new" means, in days back from today. The user's definition, not
-   * "since you last ran" — that returns an empty inbox on day one and on any
-   * second run the same day, both of which read as a broken plugin.
+   * What "new" means, in days back from today — one number for every source.
+   * The user's definition, not "since you last ran": that returns an empty
+   * inbox on day one and on any second run the same day, both of which read
+   * as a broken plugin.
    */
   newWindowDays: number;
 
   maxArrivalsPerRun: number;
-
 
   /** Where OpenAlex's subject terms go in a generated note, if anywhere. */
   subjectPlacement: "off" | "property" | "tags";
@@ -125,9 +124,6 @@ export interface LiteratureInboxSettings {
   crossrefEnabled: boolean;
   /** Optional contact address for Crossref's polite pool: 3 req/s not 1. */
   crossrefMailto: string;
-  /** Path to a zot2vault executable the user downloaded themselves. Blank by
-   * default; the plugin never ships or fetches a binary. */
-  zot2vaultPath: string;
 
   lastUpdate?: string;
 }
@@ -139,12 +135,12 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   // finds is wired to something the user kept.
   sources: [{ kind: "citing", value: "", enabled: true }],
   openAlexTopic: "",
-  kernelSize: 100,
+  kernelSize: 20,
   kernelMode: "topic",
   kernelSeeds: "",
   kernelAuthor: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
-  maxArrivalsPerRun: 25,
+  maxArrivalsPerRun: 3,
   // Terms as a property by default, never as tags: tags show up in the tag
   // pane and the graph, and a vault-wide dump of machine-assigned subject
   // terms is exactly the clutter people rightly fear. Concepts stays off for
@@ -159,7 +155,6 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   openAlexApiKey: "",
   crossrefEnabled: true,
   crossrefMailto: "",
-  zot2vaultPath: "",
 };
 
 /** Split a comma/newline separated setting into clean entries. */
@@ -184,26 +179,37 @@ function parseCount(value: string, fallback: number, min = 1): number {
 }
 
 export class LiteratureInboxSettingTab extends PluginSettingTab {
+  /**
+   * The row being configured before it's added — kind and value only, no
+   * on/off toggle and no remove button, because neither means anything until
+   * the row actually exists. Local to the tab, never persisted: it resets to
+   * blank the moment "Add source" commits it into `settings.sources`.
+   */
+  private draftKind: SourceKind = "topic";
+  private draftValue = "";
+
   constructor(app: App, private readonly plugin: LiteratureInboxPlugin) {
     super(app, plugin);
   }
 
   override display(): void {
     const { containerEl } = this;
+    // Every interaction that changes a setting re-renders the whole page
+    // (the simplest way to keep dependent fields honest) — without this, that
+    // re-render silently threw the reader back to the top every single time.
+    const scrollTop = containerEl.scrollTop;
     containerEl.empty();
 
     // Order follows what a user actually does, most-often first: add papers,
     // fetch new ones, then the settings behind each of those, then the rest.
     this.renderStatus(containerEl);
     this.renderStartingGraph(containerEl);
-    this.renderEveryday(containerEl);
-    this.renderGraphSetup(containerEl);
     this.renderSources(containerEl);
-    this.renderArrivals(containerEl);
-    this.renderNoteContent(containerEl);
-    this.renderFolders(containerEl);
     this.renderCleanup(containerEl);
+    this.renderNoteContent(containerEl);
     this.renderIntegrations(containerEl);
+
+    containerEl.scrollTop = scrollTop;
   }
 
   /** Where things stand, and what is left of today's allowance. */
@@ -219,100 +225,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   }
 
   /**
-   * The two buttons people press repeatedly, in one obvious place.
-   *
-   * These used to be scattered — "fetch" was stranded at the end of the
-   * graph-setup instructions, which is where you look once and never again.
-   * Frequency of use is the only sensible ordering principle for a settings
-   * page that doubles as a control panel.
-   */
-  private renderEveryday(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Everyday").setHeading();
-
-    new Setting(containerEl)
-      .setName("Fetch new papers")
-      .setDesc(
-        "Run this whenever you like — nothing fetches on its own. New papers land in " +
-          `${this.plugin.settings.inboxFolder}/; keep one by moving its note into ` +
-          `${this.plugin.settings.papersFolder}/.`,
-      )
-      .addButton((button) =>
-        button
-          .setButtonText("Update inbox")
-          .setCta()
-          .onClick(() => void this.plugin.updateInbox()),
-      );
-
-    new Setting(containerEl)
-      .setName("Clean up old arrivals")
-      .setDesc(
-        "Shows what would go and asks first. Only ever touches notes still in the " +
-          "inbox, unedited, and past the keep window — see Cleanup below.",
-      )
-      .addButton((button) =>
-        button.setButtonText("Clean up").onClick(() => void this.plugin.cleanUp()),
-      );
-  }
-
-  /**
-   * How to make Obsidian's graph a triage surface.
-   *
-   * Instructions rather than automation: graph settings live in Obsidian's own
-   * config, and writing that from a plugin is fragile and the kind of thing
-   * review questions. A one-time setup the user does themselves is the honest
-   * trade — but bookmarking it is what makes it a habit rather than a chore.
-   */
-  private renderGraphSetup(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Set up the graph (once)").setHeading();
-    const graph = containerEl.createEl("div", { cls: "setting-item-description" });
-    graph.createEl("p", {
-      text:
-        "The plugin writes notes; Obsidian draws the graph. Out of the box every note " +
-        "in the vault shows up and arrivals look like everything else. Open graph view " +
-        "(Ctrl/Cmd+G), then its settings (the slider icon), and:",
-    });
-    const steps = graph.createEl("ol");
-    steps.createEl("li", {
-      text:
-        `Filters → search: path:${this.plugin.settings.inboxFolder} OR ` +
-        `path:${this.plugin.settings.papersFolder}`,
-    });
-    steps.createEl("li", {
-      text:
-        `Groups → New group: path:${this.plugin.settings.inboxFolder} in a bright ` +
-        `colour, then a second group for path:${this.plugin.settings.papersFolder} in a ` +
-        "muted one.",
-    });
-    steps.createEl("li", {
-      text:
-        "Bookmark it: with the graph open and configured, run “Bookmarks: bookmark " +
-        "current view” from the command palette. This is the step that makes it " +
-        "stick — the graph becomes one click from the sidebar instead of a setup " +
-        "you redo each time.",
-    });
-    graph.createEl("p", {
-      text:
-        "Colour by path rather than by tag: notes carry no inbox/kept tag on purpose, " +
-        "because a tag written when the note is generated cannot follow a file you " +
-        "later drag into another folder.",
-    });
-    graph.createEl("p", {
-      text:
-        "Once you are reading regularly, a third group is worth adding: tag your own " +
-        "favourites (#favourite, #to-read, whatever you use) and give that group its " +
-        "own colour. Those tags are yours and the plugin never touches them.",
-    });
-  }
-
-  /**
-   * The starting graph, in five flavours.
-   *
-   * Only the input the chosen mode actually needs is shown — five modes with
-   * every field visible at once is exactly the settings-page clutter this is
-   * meant to avoid. Changing the mode re-renders the tab, which is cheap and
-   * keeps the page honest about what it will use.
-   */
-  /**
    * OpenAlex's daily allowance, as a bar.
    *
    * Deliberately in requests rather than currency: the allowance is metered,
@@ -322,6 +234,20 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    */
   private renderBudget(containerEl: HTMLElement): void {
     const budget = this.plugin.budgetGauge();
+
+    new Setting(containerEl)
+      .setName("OpenAlex daily allowance")
+      .addButton((button) =>
+        button
+          .setButtonText("Refresh")
+          .setTooltip("Ask OpenAlex for today's real figures right now")
+          .onClick(async () => {
+            button.setDisabled(true);
+            await this.plugin.refreshBudget();
+            this.display();
+          }),
+      );
+
     const wrapper = containerEl.createDiv({ cls: "setting-item-description" });
 
     const bar = wrapper.createDiv();
@@ -344,13 +270,21 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     wrapper.createEl("p", {
       cls: "setting-item-description",
       text:
-        `OpenAlex daily allowance: ${budget.label}. ` +
+        `${budget.label}. ` +
         (budget.fraction > 0.9
           ? "Nearly used up — it resets at midnight UTC."
           : "Resets at midnight UTC."),
     });
   }
 
+  /**
+   * The starting graph, in five flavours, plus the library directory itself.
+   *
+   * Only the input the chosen mode actually needs is shown — five modes with
+   * every field visible at once is exactly the settings-page clutter this is
+   * meant to avoid. Changing the mode re-renders the tab, which is cheap and
+   * keeps the page honest about what it will use.
+   */
   private renderStartingGraph(containerEl: HTMLElement): void {
     const mode = this.plugin.settings.kernelMode;
 
@@ -370,13 +304,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.display(); // show the input this mode needs, hide the rest
         });
-      })
-      .addButton((button) =>
-        button
-          .setButtonText("Add papers")
-          .setCta()
-          .onClick(() => void this.plugin.buildKernel()),
-      );
+      });
 
     // The topic field belongs to the modes that use it, not to the top of the
     // page — it was step 1 of onboarding while doing nothing at all in four of
@@ -386,9 +314,11 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         .setName("Topic")
         .setDesc(
           'A query — "quantum error correction", "machine translation" — or an OpenAlex ' +
-            "concept id like C41008148. You get the field's canon: the papers everything " +
-            "else cites. Needs no input beyond this, but is not specific to you — if the " +
-            "result looks like a stranger's library, try one of the other modes.",
+            "concept id like C41008148. Comma-separate several terms to intersect them — " +
+            '"Smart Grid, AI" prioritizes papers at the overlap of both, not either alone. ' +
+            "You get the field's canon: the papers everything else cites. Needs no input " +
+            "beyond this, but is not specific to you — if the result looks like a stranger's " +
+            "library, try one of the other modes.",
         )
         .addText((text) =>
           text
@@ -412,8 +342,11 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         .setName("Papers to start from")
         .setDesc(
           "DOIs or arXiv ids, one per line — paste a bibliography, your own reference " +
-            "list, or a handful of papers that define what you work on. Full URLs are " +
-            "fine. Anything unrecognised is reported, never silently skipped." +
+            "list, or a handful of papers that define what you work on. From Zotero: " +
+            "select items, right-click → Create Bibliography from Items → a style that " +
+            "includes DOIs (APA works) → Copy to Clipboard, then paste here — no export " +
+            "file needed. Full URLs are fine. Anything unrecognised is reported, never " +
+            "silently skipped." +
             (mode === "snowball"
               ? " Each one is expanded with what it cites and what cites it, so a few " +
                 "papers become a neighbourhood."
@@ -452,10 +385,12 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       containerEl.createEl("p", {
         cls: "setting-item-description",
         text:
-          `Takes the papers already in ${this.plugin.settings.papersFolder}/ — whether you ` +
-          "kept them here or zot2vault wrote them — and pulls in what they cite and what " +
-          "cites them. The most personal starting graph available, and it needs no typing. " +
-          "Does nothing if that folder is empty.",
+          `Takes the papers already in ${this.plugin.settings.papersFolder}/ and pulls in ` +
+          "what they cite and what cites them. The most personal starting graph available, " +
+          "and it needs no typing. Does nothing if that folder is empty. To dig into a " +
+          "handful of specific papers instead of your whole library, select them in the " +
+          "file explorer or graph view and use \"Expand outward from these papers\" in the " +
+          "right-click menu.",
       });
     }
 
@@ -477,14 +412,106 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
         );
     }
-  }
-
-  private renderFolders(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Folders").setHeading();
 
     new Setting(containerEl)
-      .setName("Inbox folder")
-      .setDesc("Where new arrivals are written. Move a note out of here to keep it.")
+      .setName("Library directory")
+      .setDesc(
+        "Feel free to make subfolders — everything under this directory is considered " +
+          "your library and gets updated with citation links on every inbox update.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Papers")
+          .setValue(this.plugin.settings.papersFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.papersFolder = value.trim() || DEFAULT_SETTINGS.papersFolder;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl).addButton((button) =>
+      button
+        .setButtonText("Add papers")
+        .setCta()
+        .onClick(() => void this.plugin.buildKernel()),
+    );
+  }
+
+  /** The value control for one source row — a plain text box, except arXiv
+   * categories get a dropdown of the real taxonomy with a manual fallback,
+   * since the codes are easy to mistype and hard to remember. */
+  private renderSourceValue(
+    row: Setting,
+    kind: SourceKind,
+    value: string,
+    onChange: (value: string) => Promise<void>,
+  ): void {
+    if (kind !== "arxiv") {
+      row.addText((text) =>
+        text
+          .setPlaceholder(SOURCE_PLACEHOLDERS[kind])
+          .setValue(value)
+          .onChange(async (v) => {
+            await onChange(v.trim());
+          }),
+      );
+      return;
+    }
+
+    const known = isKnownArxivCategory(value);
+    row.addDropdown((dropdown) => {
+      for (const category of ARXIV_CATEGORIES) dropdown.addOption(category.code, category.label);
+      dropdown.addOption(CUSTOM_ARXIV_CATEGORY, "Other (type the code manually)");
+      dropdown.setValue(known ? value : CUSTOM_ARXIV_CATEGORY);
+      dropdown.onChange(async (v) => {
+        await onChange(v === CUSTOM_ARXIV_CATEGORY ? "" : v);
+        this.display();
+      });
+    });
+    if (!known) {
+      row.addText((text) =>
+        text
+          .setPlaceholder("e.g. cs.CL")
+          .setValue(value)
+          .onChange(async (v) => {
+            await onChange(v.trim());
+          }),
+      );
+    }
+  }
+
+  /**
+   * Every stream in one table: "Update your inbox".
+   *
+   * A topic query, "papers citing my library", an arXiv category and a feed
+   * URL are all the same kind of thing — something producing candidate papers
+   * — so they share a shape: on/off, what to watch, and a per-run cap. Only
+   * the first two columns differ by kind. Fetching lives here too, since this
+   * is what fetching actually consults.
+   */
+  private renderSources(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName("Update your inbox").setHeading();
+
+    new Setting(containerEl)
+      .setName("Fetch new papers")
+      .setDesc(
+        "Run this whenever you like — nothing fetches on its own. Keep an arrival by " +
+          `moving its note into ${this.plugin.settings.papersFolder}/.`,
+      )
+      .addButton((button) =>
+        button
+          .setButtonText("Update inbox")
+          .setCta()
+          .onClick(() => void this.plugin.updateInbox()),
+      );
+
+    new Setting(containerEl)
+      .setName("Parent inbox folder")
+      .setDesc(
+        "Every source's own folder below (and this one, when a source leaves it blank) " +
+          "nests under this one. Together with the library directory (set above), this is " +
+          "the plugin's whole bound — it never reads or writes anywhere else in your vault.",
+      )
       .addText((text) =>
         text
           .setPlaceholder("Inbox")
@@ -496,47 +523,33 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Papers folder")
+      .setName("How far back counts as new")
       .setDesc(
-        "Your kept papers, and where the starting graph is built. If you also use " +
-          "zot2vault, point this at the same folder it writes to — a kept note is then " +
-          "upgraded in place if that paper later enters your Zotero library.",
+        "In days. One global window for every source below — recency is the whole reason " +
+          "a result belongs in the inbox, so this shouldn't need per-source tuning. Wide " +
+          "windows are cheap: exact dedup means re-seeing a paper costs nothing.",
       )
       .addText((text) =>
-        text
-          .setPlaceholder("Papers")
-          .setValue(this.plugin.settings.papersFolder)
-          .onChange(async (value) => {
-            this.plugin.settings.papersFolder = value.trim() || DEFAULT_SETTINGS.papersFolder;
-            await this.plugin.saveSettings();
-          }),
+        text.setValue(String(this.plugin.settings.newWindowDays)).onChange(async (value) => {
+          this.plugin.settings.newWindowDays = parseCount(
+            value,
+            DEFAULT_SETTINGS.newWindowDays,
+            0,
+          );
+          await this.plugin.saveSettings();
+        }),
       );
-  }
-
-  /**
-   * Every stream in one table.
-   *
-   * A topic query, "papers citing my library", an arXiv category and a feed
-   * URL are all the same kind of thing — something producing candidate papers
-   * — so they share a shape: on/off, what to watch, how far back counts as
-   * new, and how many per run. Only the first two columns differ by kind.
-   */
-  private renderSources(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Where new papers come from").setHeading();
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text:
-        "Nothing fetches on its own — these are only consulted when you press Update " +
-        "inbox. Leave the window and cap blank to inherit the settings below. When the " +
-        "per-run cap bites, rows higher in this list are kept first.",
-    });
 
     const sources = this.plugin.settings.sources;
-    if (sources.length === 0) {
-      containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text: "No sources yet. Add one below — “Papers citing my library” needs no typing.",
-      });
+
+    if (sources.length > 0) {
+      const header = containerEl.createDiv({ cls: "literature-inbox-feed-header" });
+      const label = (text: string) => header.createSpan({ text });
+      label("Source");
+      label("On/off");
+      label("Papers per run");
+      label("Folder");
+      label(""); // remove button's column
     }
 
     sources.forEach((source, index) => {
@@ -552,59 +565,40 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
       );
 
-      row.addDropdown((dropdown) => {
-        for (const [kind, label] of Object.entries(SOURCE_LABELS)) dropdown.addOption(kind, label);
-        dropdown.setValue(source.kind).onChange(async (value) => {
-          source.kind = value as SourceKind;
-          if (!needsValue(source.kind)) source.value = "";
-          await this.plugin.saveSettings();
-          this.display(); // the value box appears or disappears with the kind
-        });
-      });
+      // Fixed once added: this is what the row *is*, not a value to edit in
+      // place. Wrong kind, wrong row — remove it and add the right one.
+      row.setName(SOURCE_LABELS[source.kind]);
 
       if (needsValue(source.kind)) {
-        row.addText((text) =>
-          text
-            .setPlaceholder(SOURCE_PLACEHOLDERS[source.kind])
-            .setValue(source.value)
-            .onChange(async (value) => {
-              source.value = value.trim();
-              await this.plugin.saveSettings();
-            }),
-        );
+        this.renderSourceValue(row, source.kind, source.value, async (value) => {
+          source.value = value;
+          await this.plugin.saveSettings();
+        });
       }
 
-      row
-        .addText((text) =>
-          text
-            .setPlaceholder(`${this.plugin.settings.newWindowDays}d`)
-            .setValue(source.windowDays === undefined ? "" : String(source.windowDays))
-            .onChange(async (value) => {
-              source.windowDays = parseOptionalCount(value, 0);
-              await this.plugin.saveSettings();
-            }),
-        )
-        .addText((text) =>
-          text
-            .setPlaceholder(`max ${this.plugin.settings.maxArrivalsPerRun}`)
-            .setValue(source.maxPerRun === undefined ? "" : String(source.maxPerRun))
-            .onChange(async (value) => {
-              source.maxPerRun = parseOptionalCount(value, 1);
-              await this.plugin.saveSettings();
-            }),
-        );
+      row.addText((text) =>
+        text
+          .setPlaceholder("Number of papers to add per run")
+          .setValue(
+            source.maxPerRun === undefined
+              ? String(this.plugin.settings.maxArrivalsPerRun)
+              : String(source.maxPerRun),
+          )
+          .onChange(async (value) => {
+            source.maxPerRun = parseOptionalCount(value, 1);
+            await this.plugin.saveSettings();
+          }),
+      );
 
-      if (source.kind === "feed" || source.kind === "arxiv") {
-        row.addButton((button) =>
-          button
-            .setButtonText("Test")
-            .setTooltip("Fetch this once and report what came back")
-            .onClick(() => {
-              if (source.kind === "arxiv") void this.plugin.testArxivCategories(source.value);
-              else void this.plugin.testFeeds(source.value);
-            }),
-        );
-      }
+      row.addText((text) =>
+        text
+          .setPlaceholder("Inbox subfolder for this source")
+          .setValue(source.inboxFolder?.trim() || this.plugin.settings.inboxFolder)
+          .onChange(async (value) => {
+            source.inboxFolder = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
 
       row.addButton((button) =>
         button
@@ -617,19 +611,64 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
       );
 
-      row.setDesc(
-        index === 0
-          ? "On/off, what kind, what to watch, days back, and a per-run cap."
-          : "",
-      );
+      void index;
     });
 
-    new Setting(containerEl).addButton((button) =>
-      button.setButtonText("Add a source").onClick(async () => {
-        this.plugin.settings.sources.push(emptySource("topic"));
-        await this.plugin.saveSettings();
+    if (sources.length === 0) {
+      containerEl.createEl("p", {
+        cls: "setting-item-description",
+        text: "No sources yet — add one below.",
+      });
+    }
+
+    // A row being configured, not yet a source: no toggle, no remove button,
+    // because neither means anything until "Add source" commits it. Test
+    // sits right next to Add — and only here, since a real row is watching
+    // something already known to work.
+    const draft = new Setting(containerEl).setName("Add a source");
+
+    draft.addDropdown((dropdown) => {
+      for (const [kind, label] of Object.entries(SOURCE_LABELS)) dropdown.addOption(kind, label);
+      dropdown.setValue(this.draftKind).onChange((value) => {
+        this.draftKind = value as SourceKind;
+        this.draftValue = "";
         this.display();
-      }),
+      });
+    });
+
+    if (needsValue(this.draftKind)) {
+      this.renderSourceValue(draft, this.draftKind, this.draftValue, (value) => {
+        this.draftValue = value;
+        return Promise.resolve();
+      });
+    }
+
+    if (this.draftKind === "feed" || this.draftKind === "arxiv") {
+      draft.addButton((button) =>
+        button
+          .setButtonText("Test")
+          .setTooltip("Fetch this once and report what came back, before adding it")
+          .onClick(() => {
+            if (this.draftKind === "arxiv") void this.plugin.testArxivCategories(this.draftValue);
+            else void this.plugin.testFeeds(this.draftValue);
+          }),
+      );
+    }
+
+    draft.addButton((button) =>
+      button
+        .setButtonText("Add source")
+        .setCta()
+        .onClick(async () => {
+          const kind = this.draftKind;
+          const value = needsValue(kind) ? this.draftValue.trim() : "";
+          if (needsValue(kind) && !value) return; // nothing to add yet
+          this.plugin.settings.sources.push({ kind, value, enabled: true });
+          this.draftKind = "topic";
+          this.draftValue = "";
+          await this.plugin.saveSettings();
+          this.display();
+        }),
     );
 
     containerEl.createEl("p", {
@@ -643,30 +682,12 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     });
   }
 
-  private renderArrivals(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Arrivals").setHeading();
-
-    new Setting(containerEl)
-      .setName("Maximum arrivals per run")
-      .setDesc("A ceiling on how much any single update can add.")
-      .addText((text) =>
-        text.setValue(String(this.plugin.settings.maxArrivalsPerRun)).onChange(async (value) => {
-          this.plugin.settings.maxArrivalsPerRun = parseCount(
-            value,
-            DEFAULT_SETTINGS.maxArrivalsPerRun,
-          );
-          await this.plugin.saveSettings();
-        }),
-      );
-  }
-
   /**
    * What a generated note contains beyond the essentials.
    *
-   * Deliberately a fixed set of switches rather than a template. The
-   * generated-section markers and frontmatter conventions are a contract with
-   * zot2vault (`docs/interop-spec.md` §5) — an arbitrary template would break
-   * upgrade-in-place and turn a kept note into a competing duplicate.
+   * Deliberately a fixed set of switches rather than a template — the
+   * generated-section markers are an on-disk format (`docs/interop-spec.md`
+   * §5), and an arbitrary template would make regenerating a note ambiguous.
    */
   private renderNoteContent(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("What goes in a note").setHeading();
@@ -682,9 +703,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       .setDesc(
         "OpenAlex labels each paper with subject terms. As a property they are " +
           "searchable and stay out of the way; as tags they appear in the tag pane and " +
-          "the graph, which gets noisy fast across a few hundred papers. If you also " +
-          "use zot2vault, note that these terms are dropped when a kept note is later " +
-          "upgraded from your Zotero library.",
+          "the graph, which gets noisy fast across a few hundred papers.",
       )
       .addDropdown((dropdown) => {
         dropdown
@@ -741,7 +760,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   }
 
   private renderCleanup(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Cleanup — manual only").setHeading();
+    new Setting(containerEl).setName("Clean out your inbox").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text:
@@ -755,7 +774,8 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         "It can only touch a note that is still in the inbox folder, still byte-for-byte " +
         "what was generated, and past the keep window — and it moves notes to Obsidian's " +
         "trash rather than deleting them. Anything you edited, moved, or wrote yourself " +
-        "is invisible to it.",
+        "is invisible to it. Feel free to move any note to the trash yourself at any time " +
+        "— the plugin only ever acts on what's still sitting in the inbox, untouched.",
     });
 
     new Setting(containerEl)
@@ -844,23 +864,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.openAlexApiKey)
           .onChange(async (value) => {
             this.plugin.settings.openAlexApiKey = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("zot2vault program (optional, desktop only)")
-      .setDesc(
-        "If you mirror a Zotero library with zot2vault, point this at the program you " +
-          "downloaded to rebuild those notes without leaving Obsidian. This plugin " +
-          "never downloads or bundles any program; leave blank if you don't use it.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("C:\\Tools\\zot2vault.exe")
-          .setValue(this.plugin.settings.zot2vaultPath)
-          .onChange(async (value) => {
-            this.plugin.settings.zot2vaultPath = value.trim();
             await this.plugin.saveSettings();
           }),
       );

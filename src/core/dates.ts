@@ -9,13 +9,15 @@
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * How far back an update looks when the user hasn't said otherwise.
- *
- * Wide enough that the very first run returns something — the alternative,
+ * How far back an update looks, in days — one global setting for every
+ * source, not something worth tuning per row: recency is the entire reason a
+ * result is in the inbox at all, so the number worth exposing is how far back
+ * "recent" reaches, not a per-source override nobody needs. Two weeks is
+ * wide enough that the very first run returns something — the alternative,
  * anchoring on "since you last ran", returns an empty inbox on day one and
  * looks broken.
  */
-export const DEFAULT_RECENCY_WINDOW_DAYS = 30;
+export const DEFAULT_RECENCY_WINDOW_DAYS = 14;
 
 export function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);

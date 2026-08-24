@@ -14,6 +14,15 @@ describe("arXiv categories as feeds", () => {
     }
   });
 
+  it("recognises a hyphenated subcategory too", () => {
+    // Regression: a first version only allowed the hyphen before the dot, so
+    // "Test" reported these — a real, sizeable slice of the taxonomy — as
+    // not found even though they're entirely valid.
+    for (const good of ["physics.atom-ph", "cond-mat.mes-hall", "physics.acc-ph"]) {
+      expect(looksLikeArxivCategory(good)).toBe(true);
+    }
+  });
+
   it("rejects an obvious typo before it becomes a silently empty feed", () => {
     for (const bad of ["quantph.", "https://example.org/f.xml", "", "cs/CL"]) {
       expect(looksLikeArxivCategory(bad)).toBe(false);

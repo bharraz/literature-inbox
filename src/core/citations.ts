@@ -2,9 +2,9 @@
  * Exact citation resolution — the plugin's only citation mechanism.
  *
  * Resolves a work's `references` against a corpus by id intersection: no PDF
- * parsing, no fuzzy matching, no ambiguity, nothing to review. That's the
- * whole reason this is viable in a mobile-compatible plugin, where the
- * PDF-text pipeline zot2vault uses would be out of the question.
+ * parsing, no fuzzy matching, no ambiguity, nothing to review. That's also
+ * what keeps this viable in a mobile-compatible plugin, where a PDF-text
+ * pipeline would be out of the question.
  *
  * References that resolve to nothing are simply not edges — they're papers
  * outside the vault, which is the normal case for most of a bibliography and

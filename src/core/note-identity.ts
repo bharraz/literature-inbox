@@ -1,20 +1,13 @@
 /**
  * Recovering a note's identity from the note itself.
  *
- * Why this exists: the vault manifest (`.scriptorium/state.json`) is written
- * only by zot2vault. A vault that has only ever used this plugin has no
- * manifest at all — and in that vault, keeping a paper (moving its note out of
- * `Inbox/`) would otherwise leave nothing that knows the paper is already
- * here, so the next update would fetch it again and put it straight back.
- *
- * Every note this plugin writes records its `origin-ids` and `title` in
- * frontmatter, so a kept note carries its identity with it wherever the user
- * files it. Scanning the papers folder recovers that, which makes the keep
- * mechanism work standalone and makes the manifest a pure optimisation rather
- * than a dependency.
- *
- * This also recognises zot2vault-written notes, which carry `doi:` and
- * `title:` even when no manifest is present.
+ * Why this exists: keeping a paper is nothing more than moving its note out
+ * of `Inbox/` — there is no separate manifest or plugin-state record of what
+ * that move means. Every note this plugin writes records its `origin-ids`
+ * and `title` in frontmatter, so a kept note carries its own identity with
+ * it wherever the user files it, and scanning the papers folder recovers
+ * that directly. Without this, the next update would find no record of a
+ * kept paper and fetch it straight back in.
  */
 
 import { DOI, normalizeDoi } from "./ids";
@@ -71,7 +64,7 @@ export function parseNoteIdentity(content: string): NoteIdentity | undefined {
 
     if (key === "title" && value) identity.title = value;
     if (key === "doi" && value) {
-      // zot2vault preserves the DOI's source casing in frontmatter while the
+      // The `doi` field keeps its source casing in frontmatter while the
       // origin id is lowercased — normalize before recording it.
       const doi = normalizeDoi(value);
       if (doi) addId(`${DOI}:${doi}`);

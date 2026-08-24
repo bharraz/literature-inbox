@@ -38,6 +38,17 @@ describe("parseSeedList", () => {
     expect(list.dois).toEqual(["10.1234/one", "10.1234/two", "10.1234/three"]);
   });
 
+  it("strips the sentence period off a DOI pasted from a bibliography", () => {
+    // Zotero's "Create Bibliography from Items" -> copy to clipboard is a
+    // lower-friction import path than exporting a file: a style that
+    // includes DOIs (e.g. APA 7th) ends each entry with the DOI URL followed
+    // by the reference's own closing period, which is not part of the DOI.
+    const list = parseSeedList(
+      "Smith, J. (2020). A paper. Journal, 1(1), 1-2. https://doi.org/10.1234/abc.",
+    );
+    expect(list.dois).toEqual(["10.1234/abc"]);
+  });
+
   it("does not split inside a DOI that legally contains a comma", () => {
     // Commas are legal in a DOI, so they are not separators. Splitting on them
     // would silently corrupt the identifier into two dead ones.

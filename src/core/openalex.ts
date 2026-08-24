@@ -31,6 +31,7 @@ import {
 import { emptyWork, type Author, type Work } from "./types";
 
 export const OPENALEX_BASE_URL = "https://api.openalex.org/works";
+export const OPENALEX_CONCEPTS_URL = "https://api.openalex.org/concepts";
 
 /** Article-like types only — OpenAlex also indexes datasets, grants, etc. */
 const ALLOWED_TYPES = [
@@ -147,6 +148,7 @@ export function workFromOpenAlex(data: any): Work {
   work.keywords = subjectTerms(data.keywords);
   work.concepts = subjectTerms(data.concepts);
   work.source = "openalex";
+  if (typeof data.cited_by_count === "number") work.citedByCount = data.cited_by_count;
   return work;
 }
 
@@ -208,6 +210,12 @@ export interface OpenAlexOptions {
   onPartialFetch?: (error: unknown, fetched: number) => void;
 }
 
+/** Strips embedded quotes before a term goes inside a quoted-phrase filter
+ * value, so a user typing their own quotes can't produce a malformed filter. */
+function quotedPhrase(term: string): string {
+  return term.replace(/"/g, "");
+}
+
 export class OpenAlexClient {
   private readonly limiter: RateLimiter;
 
@@ -219,10 +227,92 @@ export class OpenAlexClient {
     this.limiter = new RateLimiter(options.minIntervalMs ?? 150, options.sleep);
   }
 
-  /** A free-text query, or an OpenAlex concept id like `C41008148`. */
-  private static topicFilter(topic: string): string {
-    const trimmed = topic.trim();
-    return /^C\d+$/.test(trimmed) ? `concepts.id:${trimmed}` : `default.search:${trimmed}`;
+  /**
+   * A topic box may hold several comma-separated terms — "Smart Grid, AI" —
+   * meant as an intersection ("papers at the intersection of both"), not
+   * several separate searches. OpenAlex ANDs filter clauses joined by commas,
+   * so each term becomes its own `concepts.id:` (or `default.search:` when it
+   * doesn't resolve to a concept) clause, and joining them all with commas
+   * narrows to works matching every term at once.
+   */
+  private static splitTopics(topic: string): string[] {
+    return topic
+      .split(",")
+      .map((term) => term.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * Resolves every comma-separated term in *topic* to its own filter clause
+   * and ANDs them together. `unresolved` lists the terms that had no matching
+   * OpenAlex concept and fell back to unscoped full-text search — the
+   * settings preview uses this to warn before a fetch runs on that path.
+   */
+  private async resolveTopicFilter(
+    topic: string,
+  ): Promise<{ filter: string; unresolved: string[] }> {
+    const terms = OpenAlexClient.splitTopics(topic);
+    if (terms.length === 0) {
+      const trimmed = topic.trim();
+      return {
+        filter: `default.search:"${quotedPhrase(trimmed)}"`,
+        unresolved: trimmed ? [trimmed] : [],
+      };
+    }
+
+    const resolved = await Promise.all(
+      terms.map(async (term) => {
+        if (OpenAlexClient.isConceptId(term)) return { term, conceptId: term };
+        return { term, conceptId: await this.resolveConceptId(term) };
+      }),
+    );
+
+    const filter = resolved
+      .map((r) => (r.conceptId ? `concepts.id:${r.conceptId}` : `default.search:"${quotedPhrase(r.term)}"`))
+      .join(",");
+    const unresolved = resolved.filter((r) => !r.conceptId).map((r) => r.term);
+    return { filter, unresolved };
+  }
+
+  /**
+   * Free text resolved once to a concept id, memoized for the run.
+   *
+   * `default.search` unquoted matches *any* of the words anywhere in
+   * title/abstract/fulltext — sorting those hits by citation count surfaces
+   * the most-cited paper in the whole corpus that happens to contain just the
+   * word "simulation" (a biomolecular simulation package, a DFT code),
+   * regardless of field. `concepts.id` scopes to an actual field, so "most
+   * cited" means something, and is tried first. Falls back to full-text
+   * (returning undefined) if no concept matches or the lookup itself fails —
+   * quoted as an exact phrase (see `topicFilter`'s caller), which turns that
+   * fallback from "contains any of these words" into "contains this phrase",
+   * a real precision fix confirmed live: an OR match across "trapped ion
+   * quantum simulation" pulled in 82k works sorted by raw citation count
+   * (unrelated top-cited papers dominate); the same string quoted as a phrase
+   * narrows to 347, all genuinely on topic. A topic search degrading to
+   * quoted full-text beats a kernel build failing outright.
+   */
+  private conceptIdCache = new Map<string, string | undefined>();
+
+  private async resolveConceptId(topic: string): Promise<string | undefined> {
+    const key = topic.trim().toLowerCase();
+    if (this.conceptIdCache.has(key)) return this.conceptIdCache.get(key);
+    try {
+      const url = this.buildUrl(OPENALEX_CONCEPTS_URL, { search: topic, "per-page": "1" });
+      const data = await this.getJson(url);
+      const id = data.results?.[0]?.id;
+      const resolved = typeof id === "string" ? bareOpenAlexId(id) : undefined;
+      this.conceptIdCache.set(key, resolved);
+      return resolved;
+    } catch (error) {
+      // A rate limit here must latch exactly like it does inside `paginated`,
+      // so the works request right behind this one short-circuits instead of
+      // spending a second request against a service that just said stop —
+      // and must NOT be cached as "no concept found", since that's not what
+      // happened and would poison every later call this run.
+      if (error instanceof RateLimitError) this.rateLimited = error;
+      return undefined;
+    }
   }
 
   private typeFilter(): string {
@@ -304,9 +394,39 @@ export class OpenAlexClient {
     });
   }
 
-  /** The N most-cited works matching *topic*. */
+  /** True for an OpenAlex concept id, e.g. `C41008148` — already scoped, so
+   * resolving it again would just spend a request to relearn the input. */
+  private static isConceptId(topic: string): boolean {
+    return /^C\d+$/.test(topic.trim());
+  }
+
+  /**
+   * Which comma-separated terms in *topic* have no matching OpenAlex concept
+   * and would fall back to unscoped full-text search (see `resolveConceptId`'s
+   * doc comment). Empty means every term resolved. Used by the settings
+   * preview to warn before a fetch runs on the unscoped path, where "most
+   * cited" stops meaning "most cited in your field."
+   */
+  async unresolvedTopics(topic: string): Promise<string[]> {
+    return (await this.resolveTopicFilter(topic)).unresolved;
+  }
+
+  /**
+   * The cheapest possible real request — a List+Filter singleton page, billed
+   * at the lowest rate — whose only purpose is to read the current
+   * `X-RateLimit-*` headers. Used for a manual "refresh the budget gauge"
+   * action, where the user wants today's real figures without waiting for an
+   * update to happen to report them as a side effect.
+   */
+  async ping(): Promise<void> {
+    const url = this.buildUrl(OPENALEX_BASE_URL, { filter: this.typeFilter(), "per-page": "1" });
+    await this.getJson(url);
+  }
+
+  /** The N most-cited works matching *topic* (comma-separated terms AND together). */
   async topWorks(topic: string, n: number): Promise<Work[]> {
-    const filter = `${OpenAlexClient.topicFilter(topic)},${this.typeFilter()}`;
+    const { filter: topicFilter } = await this.resolveTopicFilter(topic);
+    const filter = `${topicFilter},${this.typeFilter()}`;
     return this.paginated(filter, "cited_by_count:desc", n);
   }
 
@@ -331,11 +451,8 @@ export class OpenAlexClient {
     basis: RecencyBasis = "publication",
   ): Promise<Work[]> {
     const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
-    const filter = [
-      OpenAlexClient.topicFilter(topic),
-      this.typeFilter(),
-      `${dateFilter}:${since}`,
-    ].join(",");
+    const { filter: topicFilter } = await this.resolveTopicFilter(topic);
+    const filter = [topicFilter, this.typeFilter(), `${dateFilter}:${since}`].join(",");
     return this.paginated(filter, "publication_date:desc", limit);
   }
 

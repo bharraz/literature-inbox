@@ -9,7 +9,7 @@
  * and no network access on load.
  */
 
-import { Modal, Platform, Plugin, TFile, type App } from "obsidian";
+import { Modal, Plugin, Setting, TFile, type App, type TAbstractFile } from "obsidian";
 import { ArxivClient } from "./core/arxiv";
 import { isoDaysAgo } from "./core/dates";
 import { OpenAlexClient, OPENALEX_BASE_URL } from "./core/openalex";
@@ -21,29 +21,33 @@ import { arxivCategoryFeedUrl, looksLikeArxivCategory } from "./core/feeds";
 import {
   describeSource,
   effective,
+  effectiveInboxFolder,
   isUsable,
   migrateSources,
   withinWindow,
   type SourceConfig,
 } from "./core/sources";
 import { titlesMatch, normalizeTitle } from "./core/ids";
-import {
-  EMPTY_STATE,
-  STATE_PATH,
-  VaultIndex,
-  mergeSnapshots,
-  parseVaultState,
-  scanFolderIdentities,
-} from "./core/vault-state";
+import { VaultIndex, scanFolderIdentities } from "./core/vault-state";
 import { parseNoteIdentity } from "./core/note-identity";
 import { runUpdate, type InboxRecord, type UpdateReport } from "./core/update";
 import { applyPrune, planPrune } from "./core/prune";
 import {
   backfillReferences,
+  hasExactIdentifier,
   hasGivenUp,
   isDueForBackfill,
   type BackfillCandidate,
 } from "./core/backfill";
+
+/** What one backfill pass accomplished. */
+interface BackfillSummary {
+  /** How many notes gained citation edges this run. */
+  connected: number;
+  /** How many arrivals have an exact identifier (so they were asked about
+   * this run) but still have nothing back from OpenAlex yet. */
+  stillWaiting: number;
+}
 import {
   emptyBudget,
   gauge,
@@ -54,10 +58,14 @@ import {
   type BudgetState,
 } from "./core/budget";
 import { CitationIndex } from "./core/citations";
-import { GENERATED_END, appendCitations, type SubjectOptions } from "./core/notes";
+import { GENERATED_END, mergeCitations, type SubjectOptions } from "./core/notes";
 import { contentHash } from "./core/hash";
-import { runExecutable, type Spawner } from "./core/launcher";
-import { runKernel } from "./core/kernel";
+import {
+  estimateConnectivity,
+  selectTopicCandidates,
+  runKernel,
+  type ConnectivityEstimate,
+} from "./core/kernel";
 import { parseSeedList, seedsFromOriginIds } from "./core/seeds";
 import {
   explain,
@@ -89,6 +97,13 @@ interface PersistedData {
   /** DOI -> OpenAlex id for kept papers, so adjacency stops re-resolving the
    * same library on every run. The mapping never changes. */
   openAlexIdByDoi?: Record<string, string>;
+  /**
+   * Ids of papers a fetch once added and cleanup later removed. Checked on
+   * every later fetch so the same real, still-matching paper doesn't just
+   * reappear the moment it shows up again — without this, cleanup dropping a
+   * record leaves nothing anywhere to remember it was ever seen.
+   */
+  previouslyRemoved?: string[];
 }
 
 function todayIso(): string {
@@ -151,18 +166,34 @@ export default class LiteratureInboxPlugin extends Plugin {
   private inbox: InboxRecord[] = [];
   private budget: BudgetState = emptyBudget(utcDay());
   private openAlexIdByDoi: Record<string, string> = {};
+  /** Never re-add these — see `PersistedData.previouslyRemoved`. */
+  private previouslyRemoved: string[] = [];
   private running = false;
   /** The OpenAlex client for the run in progress, if any — see openAlex(). */
   private runClient?: OpenAlexClient;
+  /**
+   * The candidate pool from the last topic preview, reused by Build so
+   * clicking Preview then Build doesn't pay for the same fetch twice — the
+   * concept resolution and the up-to-200-work pool fetch are the expensive
+   * part of a topic build. One-shot: cleared as soon as it's consumed, so a
+   * later Build with no fresh Preview always re-fetches rather than risk
+   * building from a stale pool.
+   */
+  private topicPreviewCache?: { topic: string; size: number; works: Work[] };
   /** Papers in the kept folder, refreshed on load and after a kernel run —
    * shown in settings so the plugin's state is legible at a glance. */
   private keptCount = 0;
+  /** Persistent status-bar text for the run in progress. A `Notice` fades on
+   * its own after a few seconds, so a slow phase between two notices reads as
+   * a hang; this stays put until the run clears it. */
+  private statusBarItem!: HTMLElement;
 
   override async onload(): Promise<void> {
     await this.loadPersisted();
     // Cheap, local, and no network: just counts what's on disk.
     await this.refreshKeptCount();
     this.addSettingTab(new LiteratureInboxSettingTab(this.app, this));
+    this.statusBarItem = this.addStatusBarItem();
 
     // One-click access to the action people run most; everything else lives
     // in the command palette rather than cluttering the ribbon.
@@ -214,52 +245,57 @@ export default class LiteratureInboxPlugin extends Plugin {
       name: "Clean up old arrivals (preview first)",
       callback: () => void this.cleanUp(),
     });
-    this.addCommand({
-      id: "run-zot2vault",
-      name: "Rebuild Zotero notes (runs zot2vault)",
-      checkCallback: (checking) => {
-        // Desktop only: launching a program needs child_process, which does
-        // not exist on mobile. Hidden entirely there rather than failing.
-        if (!Platform.isDesktop) return false;
-        if (!checking) void this.runZot2vault();
-        return true;
-      },
-    });
-  }
 
-  /**
-   * Run the user's own zot2vault executable.
-   *
-   * The plugin never ships or downloads a binary — this runs exactly the path
-   * typed into settings, with no shell, and only on desktop. `child_process`
-   * is imported lazily so the module is never even touched on mobile.
-   */
-  async runZot2vault(spawner?: Spawner): Promise<void> {
-    if (!Platform.isDesktop) {
-      notify("Running zot2vault is only possible on desktop.");
-      return;
-    }
-    const path = this.settings.zot2vaultPath.trim();
-    if (!path) {
-      notify("Set the path to your zot2vault program in Literature Inbox settings first.");
-      return;
-    }
-
-    let spawn = spawner;
-    if (!spawn) {
-      try {
-        const childProcess = await import("node:child_process");
-        spawn = (command, args) =>
-          childProcess.spawn(command, args, { shell: false }) as ReturnType<Spawner>;
-      } catch (error) {
-        notify(`Could not access the system's process API: ${String(error)}`);
-        return;
-      }
-    }
-
-    notify("Running zot2vault…");
-    const result = await runExecutable(path, [], spawn);
-    notify(result.message);
+    // "Expand from my whole library" (the `library` kernel mode) answers a
+    // different question than "I want to dig deeper into *these* specific
+    // papers" — the context menu on an actual selection is how you say the
+    // second thing, rather than a text box where you'd have to retype titles
+    // you can already see and click.
+    const papersOnly = (files: TAbstractFile[]) =>
+      files.filter(
+        (file): file is TFile =>
+          file instanceof TFile && file.path.startsWith(`${this.settings.papersFolder}/`),
+      );
+    this.registerEvent(
+      this.app.workspace.on("files-menu", (menu, files) => {
+        const selected = papersOnly(files);
+        if (selected.length === 0) return;
+        menu.addItem((item) =>
+          item
+            .setTitle(`Expand outward from ${selected.length} paper(s)…`)
+            .setIcon("git-branch-plus")
+            .onClick(() =>
+              new ExpandOptionsModal(
+                this.app,
+                selected.length,
+                this.settings.kernelSize,
+                this.settings.papersFolder,
+                (count, folder) => void this.expandFromNotes(selected, { count, folder }),
+              ).open(),
+            ),
+        );
+      }),
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        const selected = papersOnly([file]);
+        if (selected.length === 0) return;
+        menu.addItem((item) =>
+          item
+            .setTitle("Expand outward from this paper…")
+            .setIcon("git-branch-plus")
+            .onClick(() =>
+              new ExpandOptionsModal(
+                this.app,
+                selected.length,
+                this.settings.kernelSize,
+                this.settings.papersFolder,
+                (count, folder) => void this.expandFromNotes(selected, { count, folder }),
+              ).open(),
+            ),
+        );
+      }),
+    );
   }
 
   // --- persistence ---------------------------------------------------------
@@ -286,6 +322,7 @@ export default class LiteratureInboxPlugin extends Plugin {
     this.inbox = Array.isArray(data?.inbox) ? (data?.inbox as InboxRecord[]) : [];
     this.budget = data?.budget ?? emptyBudget(utcDay());
     this.openAlexIdByDoi = data?.openAlexIdByDoi ?? {};
+    this.previouslyRemoved = Array.isArray(data?.previouslyRemoved) ? data.previouslyRemoved : [];
   }
 
   private async persist(): Promise<void> {
@@ -294,6 +331,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       inbox: this.inbox,
       budget: this.budget,
       openAlexIdByDoi: this.openAlexIdByDoi,
+      previouslyRemoved: this.previouslyRemoved,
     } satisfies PersistedData);
   }
 
@@ -329,6 +367,24 @@ export default class LiteratureInboxPlugin extends Plugin {
   }
 
   /**
+   * Ask OpenAlex for today's real figures right now, rather than waiting for
+   * them to arrive as a side effect of the next run. One cheap request; the
+   * transport wrapper records its `X-RateLimit-*` headers the same as any
+   * other.
+   */
+  async refreshBudget(): Promise<void> {
+    if (this.running) {
+      notify("Literature Inbox is already running.");
+      return;
+    }
+    try {
+      await this.openAlex().ping();
+    } catch (error) {
+      notify(`Could not refresh: ${String(error)}`);
+    }
+  }
+
+  /**
    * An OpenAlex client. Pass `onPartial` for long fetches where returning what
    * was gathered beats losing the run — the caller then owns telling the user
    * that the result is incomplete.
@@ -343,6 +399,11 @@ export default class LiteratureInboxPlugin extends Plugin {
       apiKey: this.settings.openAlexApiKey || undefined,
       onPartialFetch: onPartial,
     });
+  }
+
+  /** Shows in the status bar for the run in progress; clear with no argument. */
+  private setStatus(text?: string): void {
+    this.statusBarItem.setText(text ? `⏳ ${text}` : "");
   }
 
   /**
@@ -395,28 +456,22 @@ export default class LiteratureInboxPlugin extends Plugin {
   }
 
   /**
-   * What the vault already contains, from two independent sources:
+   * What the vault already contains, read directly from the papers folder.
    *
-   *  1. zot2vault's manifest, if present — absent is completely normal, since
-   *     a vault that has only ever used this plugin has no such file;
-   *  2. the papers folder itself, read note by note.
-   *
-   * (2) is not an optimisation, it's what makes keeping work at all: moving a
-   * note out of the inbox is the keep signal, and without scanning the folder
-   * the next update would find no record of that paper and fetch it straight
-   * back in.
+   * Moving a note out of the inbox is the keep signal, and without scanning
+   * the folder the next update would find no record of that paper and fetch
+   * it straight back in — so this isn't an optimisation, it's what makes
+   * keeping work at all.
    */
   private async vaultIndex(): Promise<VaultIndex> {
     const adapter = this.adapter();
-    const raw = await adapter.read(STATE_PATH);
-    const state = raw === undefined ? EMPTY_STATE : parseVaultState(raw);
     const scanned = await scanFolderIdentities(
       this.settings.papersFolder,
       (folder) => adapter.list(folder),
       (path) => adapter.read(path),
       parseNoteIdentity,
     );
-    return new VaultIndex(mergeSnapshots(state, scanned), normalizeTitle);
+    return new VaultIndex(scanned, normalizeTitle);
   }
 
   private updateSettings() {
@@ -444,9 +499,9 @@ export default class LiteratureInboxPlugin extends Plugin {
    * OpenAlex ids for the papers the user keeps, to anchor an adjacency query.
    *
    * `cites:` only accepts OpenAlex ids, so notes carrying only a DOI would
-   * otherwise be unable to anchor anything — which would silently exclude an
-   * entire zot2vault library. One batched DOI lookup converts them, and is
-   * worth the request.
+   * otherwise be unable to anchor anything — which would silently exclude
+   * every DOI-only paper in the library. One batched DOI lookup converts
+   * them, and is worth the request.
    */
   private async adjacencyAnchors(vault: VaultIndex): Promise<string[]> {
     const { openAlexIds, dois } = seedsFromOriginIds(
@@ -494,16 +549,33 @@ export default class LiteratureInboxPlugin extends Plugin {
    * The default first row is "papers citing my library", whose results are
    * connected by construction.
    */
-  private async fetchAll(report: UpdateReport, vault: VaultIndex): Promise<Work[]> {
+  /**
+   * *folderByWork* is populated as a side effect — one entry per fetched
+   * work, mapping it to its source's effective inbox folder (see
+   * `effectiveInboxFolder`) — so the caller can hand `runUpdate` a
+   * `folderFor` that writes each arrival to its own source's folder.
+   */
+  private async fetchAll(
+    report: UpdateReport,
+    vault: VaultIndex,
+    folderByWork: Map<Work, string>,
+  ): Promise<Work[]> {
     const works: Work[] = [];
     const globalCap = this.settings.maxArrivalsPerRun;
+    // "New" means the same thing for every source — one global window, not a
+    // per-row override nobody needs: the whole point of these results is that
+    // they're recent, so the value worth tuning is how far back "recent"
+    // reaches, and that's a single number for the whole inbox.
+    const since = isoDaysAgo(this.settings.newWindowDays);
 
     for (const source of this.settings.sources) {
       if (!isUsable(source)) continue;
-      const since = isoDaysAgo(effective(source.windowDays, this.settings.newWindowDays));
       const cap = effective(source.maxPerRun, globalCap);
+      const folder = effectiveInboxFolder(source, this.settings.inboxFolder);
       try {
-        works.push(...(await this.fetchFrom(source, since, cap, vault, report)));
+        const fetched = await this.fetchFrom(source, since, cap, vault, report);
+        for (const work of fetched) folderByWork.set(work, folder);
+        works.push(...fetched);
       } catch (error) {
         report.sourceErrors.push({
           source: describeSource(source),
@@ -559,22 +631,33 @@ export default class LiteratureInboxPlugin extends Plugin {
    * regenerating it would destroy their work, and a missing edge is a far
    * smaller loss. Returns how many notes gained edges.
    */
-  private async backfillEdgelessArrivals(): Promise<number> {
+  private async backfillEdgelessArrivals(): Promise<BackfillSummary> {
     const adapter = this.adapter();
     const candidates: BackfillCandidate[] = [];
 
     const today = todayIso();
     const due: InboxRecord[] = [];
+    // Arrivals with an exact identifier (a real DOI, or an arXiv id) resolve
+    // through one shared batched request regardless of how many there are —
+    // see `hasExactIdentifier`'s doc comment — so there's no cost reason to
+    // ration them on the widening schedule; only a bare title guess, priced
+    // an order of magnitude higher and never batchable, needs that.
+    const exactIdCandidates = new Set<string>();
     for (const record of this.inbox) {
       const content = await adapter.read(record.notePath);
       if (content === undefined) continue;
-      if (contentHash(content) !== record.contentHash) continue; // user edited it
+      // An edit elsewhere in the note no longer excludes it: the citations
+      // block is additive-only and self-contained, so it's safe to update
+      // regardless. (The write path still never lets that edit's tracked
+      // hash get laundered into looking untouched again — see below.)
       const hasEdges = content.includes("## Citations");
-      // Only ask about notes that are actually due. Without this, every
-      // isolated arrival was re-queried on every run forever — around 25
-      // requests per update against a daily allowance of roughly 100.
-      if (!hasEdges && !isDueForBackfill(record, record.arrivedOn, today)) continue;
-      if (!hasEdges) due.push(record);
+      const exact = hasExactIdentifier(record.originIds);
+      if (exact) exactIdCandidates.add(record.notePath);
+      // Only ask about notes that are actually due — for a title-only
+      // candidate. Without this, every isolated title-only arrival was
+      // re-queried on every run forever, at the expensive per-item rate.
+      if (!hasEdges && !exact && !isDueForBackfill(record, record.arrivedOn, today)) continue;
+      if (!hasEdges && !exact) due.push(record);
       candidates.push({
         notePath: record.notePath,
         originIds: record.originIds,
@@ -582,18 +665,20 @@ export default class LiteratureInboxPlugin extends Plugin {
         hasEdges,
       });
     }
-    if (candidates.length === 0) return 0;
+    if (candidates.length === 0) return { connected: 0, stillWaiting: 0 };
 
     let outcomes;
     try {
       outcomes = await backfillReferences(candidates, this.referenceResolver(), titlesMatch);
     } catch {
-      return 0; // backfill is an improvement on what's there, never a blocker
+      return { connected: 0, stillWaiting: 0 }; // an improvement on what's there, never a blocker
     }
 
-    // Spend an attempt on everything we asked about, whether or not it
-    // resolved — that is what makes the schedule widen rather than repeat.
     const resolvedPaths = new Set(outcomes.map((outcome) => outcome.notePath));
+    // Spend an attempt on every title-only note we asked about, whether or
+    // not it resolved — that is what makes the schedule widen rather than
+    // repeat. Exact-identifier candidates never spend an attempt and never
+    // give up: they're cheap enough to just keep asking about forever.
     for (const record of due) {
       record.backfillAttempts = (record.backfillAttempts ?? 0) + 1;
       record.lastBackfillOn = today;
@@ -601,9 +686,12 @@ export default class LiteratureInboxPlugin extends Plugin {
         await this.markUnindexed(record);
       }
     }
+    const stillWaiting = [...exactIdCandidates].filter(
+      (path) => !resolvedPaths.has(path) && candidates.some((c) => c.notePath === path && !c.hasEdges),
+    ).length;
     if (outcomes.length === 0) {
       await this.persist();
-      return 0;
+      return { connected: 0, stillWaiting };
     }
 
     // Resolve the new references against everything the vault knows, so the
@@ -629,17 +717,26 @@ export default class LiteratureInboxPlugin extends Plugin {
       if (cites.length === 0) continue;
 
       const content = await adapter.read(outcome.notePath);
-      if (content === undefined || contentHash(content) !== record.contentHash) continue;
+      if (content === undefined) continue;
 
-      const updated = appendCitations(content, cites);
+      // The citations block is safe to add to regardless of whether the rest
+      // of the note has been edited — it's additive-only, and never touches
+      // anything outside its own markers. But the *tracked* hash must not
+      // move unless the note was already untouched: if the user genuinely
+      // edited this note, adding a link here must not make it look freshly
+      // generated again and newly eligible for cleanup.
+      const wasUnchanged = contentHash(content) === record.contentHash;
+      const updated = mergeCitations(content, cites, []);
+      if (updated === content) continue;
+
       await adapter.write(outcome.notePath, updated);
-      record.contentHash = contentHash(updated);
+      if (wasUnchanged) record.contentHash = contentHash(updated);
       record.originIds = [...record.originIds, ...outcome.newIds];
       connected += 1;
     }
 
     if (connected > 0) await this.persist();
-    return connected;
+    return { connected, stillWaiting };
   }
 
   /** Re-read the papers folder. Cheap, local, and no network. */
@@ -764,8 +861,23 @@ ${content.slice(marker)}`;
         notify("Set a topic in Literature Inbox settings first.");
         return undefined;
       }
-      notify(`Fetching the ${size} most-cited papers on "${topic}"… this can take a minute.`);
-      return this.openAlex().topWorks(topic, size);
+      // Reuse a matching Preview's pool rather than re-paying for the same
+      // fetch — see topicPreviewCache. One-shot: consumed here, so a second
+      // Build without a fresh Preview fetches again rather than risk
+      // building from a stale pool.
+      const cached = this.topicPreviewCache;
+      if (cached && cached.topic === topic && cached.size === size) {
+        this.topicPreviewCache = undefined;
+        return cached.works;
+      }
+
+      // Over-fetch: "most cited" alone can surface a mutually disconnected
+      // set for a narrow or recent field, so a larger pool is fetched here
+      // and runKernel picks the best-connected `size` of them.
+      const poolSize = topicPoolSize(size);
+      notify(`Fetching candidates for "${topic}"… this can take a minute.`);
+      this.setStatus(`fetching candidates for "${topic}"…`);
+      return this.openAlex().topWorks(topic, poolSize);
     }
 
     if (mode === "author") {
@@ -775,6 +887,7 @@ ${content.slice(marker)}`;
         return undefined;
       }
       notify(`Fetching up to ${size} papers by ${author}…`);
+      this.setStatus(`fetching up to ${size} papers by ${author}…`);
       return this.openAlex().worksByAuthor(author, size);
     }
 
@@ -784,6 +897,7 @@ ${content.slice(marker)}`;
         return undefined;
       }
       notify("Looking up the papers you listed…");
+      this.setStatus("looking up the papers you listed…");
       const { works, missing, unrecognised } = await this.resolveSeeds(this.settings.kernelSeeds);
       this.reportSeedProblems(missing, unrecognised);
       if (works.length === 0) {
@@ -796,6 +910,7 @@ ${content.slice(marker)}`;
 
     // library
     notify("Reading the papers you already have…");
+    this.setStatus("reading the papers you already have…");
     const seeds = await this.librarySeeds(LIBRARY_SEED_LIMIT);
     if (seeds.length === 0) {
       notify(
@@ -810,6 +925,7 @@ ${content.slice(marker)}`;
   /** Seeds plus their references and citers. */
   private async expand(seeds: Work[], size: number): Promise<Work[]> {
     notify(`Expanding ${seeds.length} paper(s) outward… this can take a minute.`);
+    this.setStatus(`expanding ${seeds.length} paper(s) outward…`);
     const client = this.openAlex();
     const report = await snowball({
       seeds,
@@ -820,15 +936,119 @@ ${content.slice(marker)}`;
       limit: size,
       // One notice per phase, so a minute-long expansion doesn't read as a
       // hang. The totals are repeated in the summary, not announced twice.
-      onProgress: (phase, found) =>
-        notify(
+      // The status bar mirrors it and, unlike a Notice, stays legible for
+      // however long the phase actually takes.
+      onProgress: (phase, found) => {
+        const message =
           phase === "references"
             ? `Found ${found} cited paper(s), now looking for citing papers…`
-            : `Found ${found} citing paper(s).`,
-        ),
+            : `Found ${found} citing paper(s).`;
+        notify(message);
+        this.setStatus(message);
+      },
     });
     for (const error of report.errors) notify(`Part of the expansion failed — ${error}`);
     return report.works;
+  }
+
+  /** Origin ids read straight off the selected notes' frontmatter, resolved
+   * to full works. Unlike `librarySeeds`, this is exactly the files the user
+   * picked — no folder-wide scan, no cap. */
+  private async seedsFromNotes(files: readonly TFile[]): Promise<Work[]> {
+    const adapter = this.adapter();
+    const originIdSets: string[][] = [];
+    for (const file of files) {
+      const content = await adapter.read(file.path);
+      if (content === undefined) continue;
+      const identity = parseNoteIdentity(content);
+      if (identity?.originIds.length) originIdSets.push(identity.originIds);
+    }
+    const { openAlexIds, dois } = seedsFromOriginIds(originIdSets, originIdSets.length);
+    if (openAlexIds.length === 0 && dois.length === 0) return [];
+
+    const client = this.openAlex();
+    const works: Work[] = [];
+    if (openAlexIds.length > 0) works.push(...(await client.worksByIds(openAlexIds)));
+    if (dois.length > 0) works.push(...(await client.worksByDois(dois)));
+    return works;
+  }
+
+  /**
+   * Expand outward from specific papers the user picked (context menu on a
+   * file selection), rather than the whole library — "I want to dig deeper
+   * into *these*" is a different request than "grow everything I have."
+   *
+   * Over-fetches a pool beyond `kernelSize` and lets `runKernel`'s balanced
+   * selection pick the best `kernelSize` of it — same reasoning as the topic
+   * mode's over-fetch (see `topicPoolSize`), except a snowball's own order
+   * (seeds, then references, then citers) isn't an impact ranking the way a
+   * topic fetch's cited_by_count:desc sort already is, so the pool is
+   * re-sorted by real citation count first.
+   */
+  async expandFromNotes(
+    files: readonly TFile[],
+    options?: { count?: number; folder?: string },
+  ): Promise<void> {
+    if (this.running) {
+      notify("Literature Inbox is already running.");
+      return;
+    }
+    if (files.length === 0) {
+      notify(`Select papers in ${this.settings.papersFolder}/ to expand from.`);
+      return;
+    }
+
+    this.running = true;
+    this.setStatus("reading selected papers…");
+    const problems: string[] = [];
+    const targetFolder = options?.folder?.trim() || this.settings.papersFolder;
+    try {
+      const size = options?.count ?? this.settings.kernelSize;
+      const pool = await this.withSharedClient(
+        (error, fetched) =>
+          problems.push(
+            describeFetchError(error, fetched, Boolean(this.settings.openAlexApiKey.trim())),
+          ),
+        async () => {
+          const seeds = await this.seedsFromNotes(files);
+          if (seeds.length === 0) return [];
+          return this.expand(seeds, topicPoolSize(size));
+        },
+      );
+      for (const problem of problems) notify(problem);
+      if (pool.length === 0) {
+        notify("None of the selected papers had a usable identifier.");
+        return;
+      }
+
+      const ranked = [...pool].sort((a, b) => (b.citedByCount ?? 0) - (a.citedByCount ?? 0));
+
+      const report = await runKernel({
+        works: ranked,
+        vault: await this.vaultIndex(),
+        papersFolder: targetFolder,
+        adapter: this.adapter(),
+        today: todayIso(),
+        subjects: this.subjectOptions(),
+        readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
+        targetCount: size,
+        onProgress: (written, total) => {
+          this.setStatus(`writing ${written} of ${total}…`);
+          if (written % 25 === 0 && written < total) notify(`Writing ${written} of ${total}…`);
+        },
+      });
+
+      this.keptCount += report.written.length;
+      const parts = [`${report.written.length} papers added to ${targetFolder}/`];
+      if (report.totalEdges) parts.push(`${report.totalEdges} citation links between them`);
+      if (report.skipped) parts.push(`${report.skipped} you already had`);
+      notify(`Expanded from ${files.length} selected paper(s): ${parts.join(", ")}.`);
+    } catch (error) {
+      notify(`Could not expand: ${String(error)}`);
+    } finally {
+      this.running = false;
+      this.setStatus(undefined);
+    }
   }
 
   private reportSeedProblems(missing: string[], unrecognised: string[]): void {
@@ -847,6 +1067,7 @@ ${content.slice(marker)}`;
     }
 
     this.running = true;
+    this.setStatus("starting…");
     const problems: string[] = [];
     try {
       const works = await this.withSharedClient(
@@ -868,9 +1089,14 @@ ${content.slice(marker)}`;
         today: todayIso(),
         subjects: this.subjectOptions(),
         readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
+        // Only topic mode over-fetches a pool bigger than what it wants
+        // written; every other mode already fetched exactly its input.
+        targetCount: this.settings.kernelMode === "topic" ? this.settings.kernelSize : undefined,
         onProgress: (written, total) => {
-          // Every 25, not every note: a Notice per paper would bury the
-          // screen, and silence for a minute reads as a hang.
+          // The status bar updates every note — cheap, and unlike a Notice it
+          // doesn't fade, so it's always current. A Notice still fires only
+          // every 25, or a paper's worth of them would bury the screen.
+          this.setStatus(`writing ${written} of ${total}…`);
           if (written % 25 === 0 && written < total) notify(`Writing ${written} of ${total}…`);
         },
       });
@@ -884,6 +1110,7 @@ ${content.slice(marker)}`;
       notify(`Could not add papers: ${String(error)}`);
     } finally {
       this.running = false;
+      this.setStatus(undefined);
     }
   }
 
@@ -899,18 +1126,20 @@ ${content.slice(marker)}`;
 
     this.running = true;
     notify("Literature Inbox: fetching…");
+    this.setStatus("fetching…");
     try {
       // One scan of the vault, shared: adjacency selection needs to know what
       // you keep, and so does the dedup pass.
       const vault = await this.vaultIndex();
       const preliminary: UpdateReport = { arrived: [], skipped: [], sourceErrors: [] };
+      const folderByWork = new Map<Work, string>();
       const fetched = await this.withSharedClient(
         (error, fetched) =>
           preliminary.sourceErrors.push({
             source: "OpenAlex",
             message: describeFetchError(error, fetched, Boolean(this.settings.openAlexApiKey.trim())),
           }),
-        () => this.fetchAll(preliminary, vault),
+        () => this.fetchAll(preliminary, vault, folderByWork),
       );
 
       const { report, inbox } = await runUpdate({
@@ -920,6 +1149,8 @@ ${content.slice(marker)}`;
         settings: this.updateSettings(),
         adapter: this.adapter(),
         today: todayIso(),
+        previouslyRemoved: this.previouslyRemoved,
+        folderFor: (work) => folderByWork.get(work) ?? this.settings.inboxFolder,
       });
       report.sourceErrors.push(...preliminary.sourceErrors);
 
@@ -929,7 +1160,8 @@ ${content.slice(marker)}`;
 
       // arXiv and RSS arrivals land edge-less; OpenAlex usually indexes them
       // within days, so ask again for the ones still isolated.
-      const backfilled = await this.backfillEdgelessArrivals();
+      this.setStatus("checking isolated arrivals for new connections…");
+      const { connected: backfilled, stillWaiting } = await this.backfillEdgelessArrivals();
 
       const parts = [`${report.arrived.length} new`];
       if (report.skipped.length) parts.push(`${report.skipped.length} already known`);
@@ -937,6 +1169,15 @@ ${content.slice(marker)}`;
       if (report.cappedAt) parts.push(`capped at ${report.cappedAt}`);
       if (report.sourceErrors.length) parts.push(`${report.sourceErrors.length} source error(s)`);
       notify(`Literature Inbox: ${parts.join(", ")}.`);
+      // Told separately from the main summary — it's "still working on it",
+      // not a problem, and burying it in the comma-list above would read as
+      // one more failure among several rather than the reassurance it is.
+      if (stillWaiting > 0) {
+        notify(
+          `${stillWaiting} arrival(s) not yet indexed by OpenAlex — checked again every run ` +
+            "until they connect.",
+        );
+      }
 
       // A notice can't say *which* papers arrived or how connected they are,
       // and that is the whole triage question. Shown only when there is
@@ -949,6 +1190,7 @@ ${content.slice(marker)}`;
       notify(`Literature Inbox failed: ${String(error)}`);
     } finally {
       this.running = false;
+      this.setStatus(undefined);
     }
   }
 
@@ -964,8 +1206,8 @@ ${content.slice(marker)}`;
     this.inbox = this.inbox.filter((record) => record.notePath !== file.path);
     await this.persist();
     // Recount rather than increment: papers also arrive in this folder by
-    // being dragged there, by zot2vault, or by a kernel run, so a counter
-    // nudged only on this path drifts out of step with the folder.
+    // being dragged there by hand or by a kernel run, so a counter nudged
+    // only on this path drifts out of step with the folder.
     await this.refreshKeptCount();
     notify(`Kept — moved to ${this.settings.papersFolder}/.`);
   }
@@ -993,6 +1235,7 @@ ${content.slice(marker)}`;
     }
 
     this.running = true;
+    this.setStatus("looking up what you pasted…");
     try {
       const { works, missing, unrecognised } = await this.resolveSeeds(raw);
       this.reportSeedProblems(missing, unrecognised);
@@ -1051,6 +1294,7 @@ ${content.slice(marker)}`;
       notify(`Could not add: ${String(error)}`);
     } finally {
       this.running = false;
+      this.setStatus(undefined);
     }
   }
 
@@ -1105,6 +1349,15 @@ ${content.slice(marker)}`;
     }
 
     new ConfirmPruneModal(this.app, plan.prunable.map((c) => c.record), async () => {
+      // Remember what's actually being removed *before* it's gone, so a
+      // later fetch that turns up the same real paper again knows to skip it
+      // — cleanup drops the record too, and would otherwise leave nothing to
+      // remember it by.
+      for (const candidate of plan.prunable) {
+        for (const id of candidate.record.originIds) {
+          if (!this.previouslyRemoved.includes(id)) this.previouslyRemoved.push(id);
+        }
+      }
       this.inbox = await applyPrune(plan, (path) => trashNote(this.app, path));
       await this.persist();
       notify(`Moved ${plan.prunable.length} untouched arrival(s) to trash.`);
@@ -1162,13 +1415,16 @@ ${content.slice(marker)}`;
     const targets = categories.map((category) => ({
       label: category,
       url: looksLikeArxivCategory(category) ? arxivCategoryFeedUrl(category) : undefined,
+      // arXiv skips Saturday and Sunday: a valid category legitimately shows
+      // zero items on those days, which otherwise looks identical to a typo.
+      emptyHint: "arXiv doesn't publish new listings on Saturdays or Sundays — a category that is otherwise correct can show zero items on those days.",
     }));
     await this.reportSources(targets);
   }
 
   /** Fetch each target once and show what it returned. */
   private async reportSources(
-    targets: { label: string; url?: string }[],
+    targets: { label: string; url?: string; emptyHint?: string }[],
   ): Promise<void> {
     notify(`Testing ${targets.length} source(s)…`);
     const results: FeedTestResult[] = [];
@@ -1187,6 +1443,7 @@ ${content.slice(marker)}`;
           count: works.length,
           newestTitle: newest?.title,
           newestDate: newest?.date,
+          emptyHint: target.emptyHint,
         });
       } catch (error) {
         results.push({ url: target.label, count: 0, error: String(error) });
@@ -1275,12 +1532,33 @@ ${content.slice(marker)}`;
       return;
     }
     try {
-      const works = await this.openAlex().topWorks(topic, 10);
-      new PreviewModal(this.app, topic, works).open();
+      const client = this.openAlex();
+      const size = this.settings.kernelSize;
+      // Sequential, not parallel: both calls resolve the same topic's
+      // concept id, and the client memoizes that per topic — running them
+      // one after another means the second reuses the first's cached
+      // resolution instead of doubling the request burst against a client
+      // that has no daily budget problem but can still trip a short-window
+      // rate limit on a fast double-fire.
+      const pool = await client.topWorks(topic, topicPoolSize(size));
+      const unresolved = await client.unresolvedTopics(topic);
+      this.topicPreviewCache = { topic, size, works: pool };
+      // Same selection Build would apply, so the preview's connectivity
+      // number describes the real outcome, not just the raw top-cited
+      // handful.
+      const selected = selectTopicCandidates(pool, size);
+      const connectivity = estimateConnectivity(selected);
+      new PreviewModal(this.app, topic, selected, unresolved, connectivity).open();
     } catch (error) {
-      notify(`Preview failed: ${String(error)}`);
+      notify(describeFetchError(error, 0, Boolean(this.settings.openAlexApiKey.trim())));
     }
   }
+}
+
+/** How many candidates to over-fetch so connectivity-based selection has a
+ * real pool to pick a well-connected `target` out of. */
+function topicPoolSize(target: number): number {
+  return Math.min(Math.max(target * 5, target + 40), 200);
 }
 
 /**
@@ -1302,13 +1580,17 @@ class RunReportModal extends Modal {
   override onOpen(): void {
     this.titleEl.setText("Update report");
     const { report } = this;
+    const previouslyRemoved = report.skipped.filter((s) => s.reason === "previously-removed");
 
     if (report.arrived.length === 0) {
       this.contentEl.createEl("p", {
         text:
-          report.skipped.length > 0
-            ? `Nothing new — all ${report.skipped.length} paper(s) found are already in your vault.`
-            : "Nothing new this run.",
+          report.skipped.length === 0
+            ? "Nothing new this run."
+            : previouslyRemoved.length === report.skipped.length
+              ? `Nothing new — every paper found is one you removed before.`
+              : `Nothing new — all ${report.skipped.length} paper(s) found are already in your ` +
+                "vault or ones you removed before.",
       });
     } else {
       this.contentEl.createEl("p", {
@@ -1331,8 +1613,14 @@ class RunReportModal extends Modal {
     }
 
     const notes: string[] = [];
-    if (report.skipped.length > 0 && report.arrived.length > 0) {
-      notes.push(`${report.skipped.length} already in your vault, skipped.`);
+    const otherSkips = report.skipped.length - previouslyRemoved.length;
+    if (otherSkips > 0 && report.arrived.length > 0) {
+      notes.push(`${otherSkips} already in your vault, skipped.`);
+    }
+    if (previouslyRemoved.length > 0) {
+      notes.push(
+        `${previouslyRemoved.length} not re-added — you removed ${previouslyRemoved.length === 1 ? "it" : "them"} before.`,
+      );
     }
     if (this.backfilled > 0) {
       notes.push(`${this.backfilled} earlier arrival(s) gained citation links.`);
@@ -1424,6 +1712,7 @@ interface FeedTestResult {
   newestTitle?: string;
   newestDate?: string;
   error?: string;
+  emptyHint?: string;
 }
 
 /** What a feed actually returned, per URL — a count alone doesn't tell you
@@ -1448,7 +1737,9 @@ class FeedTestModal extends Modal {
       if (result.count === 0) {
         block.createEl("p", {
           cls: "setting-item-description",
-          text: "Reachable, but no items — probably not a feed URL, or an empty feed.",
+          text:
+            result.emptyHint ??
+            "Reachable, but no items — probably not a feed URL, or an empty feed.",
         });
         continue;
       }
@@ -1500,6 +1791,69 @@ class AddByIdModal extends Modal {
   }
 }
 
+/** Count + destination folder for an "expand from selected papers" run — the
+ * two things worth asking about before spending a fetch, since they change
+ * where the result lands and how big it is. */
+class ExpandOptionsModal extends Modal {
+  private count: number;
+  private folder: string;
+
+  constructor(
+    app: App,
+    private readonly selectionSize: number,
+    defaultCount: number,
+    defaultFolder: string,
+    private readonly onSubmit: (count: number, folder: string) => void,
+  ) {
+    super(app);
+    this.count = defaultCount;
+    this.folder = defaultFolder;
+  }
+
+  override onOpen(): void {
+    this.titleEl.setText(
+      `Expand outward from ${this.selectionSize} paper(s)`,
+    );
+
+    new Setting(this.contentEl)
+      .setName("How many papers to add")
+      .setDesc("A ceiling on what the expansion adds, beyond the papers you selected.")
+      .addText((text) =>
+        text.setValue(String(this.count)).onChange((value) => {
+          const parsed = Number.parseInt(value, 10);
+          if (Number.isFinite(parsed) && parsed >= 1) this.count = parsed;
+        }),
+      );
+
+    new Setting(this.contentEl)
+      .setName("Add to folder")
+      .setDesc(
+        "Where the expanded papers are written. Feel free to use a subfolder — " +
+          "anything under your library directory is still scanned normally.",
+      )
+      .addText((text) =>
+        text.setValue(this.folder).onChange((value) => {
+          this.folder = value;
+        }),
+      );
+
+    const buttonRow = new Setting(this.contentEl);
+    buttonRow.addButton((button) =>
+      button
+        .setButtonText("Expand")
+        .setCta()
+        .onClick(() => {
+          this.close();
+          this.onSubmit(this.count, this.folder);
+        }),
+    );
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 class ConfirmPruneModal extends Modal {
   constructor(
     app: App,
@@ -1542,7 +1896,13 @@ class ConfirmPruneModal extends Modal {
 }
 
 class PreviewModal extends Modal {
-  constructor(app: App, private readonly topic: string, private readonly works: Work[]) {
+  constructor(
+    app: App,
+    private readonly topic: string,
+    private readonly works: Work[],
+    private readonly unresolvedTopics: string[],
+    private readonly connectivity: ConnectivityEstimate,
+  ) {
     super(app);
   }
 
@@ -1552,6 +1912,26 @@ class PreviewModal extends Modal {
       this.contentEl.createEl("p", { text: "No results — try a different query." });
       return;
     }
+    if (this.unresolvedTopics.length > 0) {
+      const terms = this.unresolvedTopics.map((t) => `"${t}"`).join(", ");
+      this.contentEl.createEl("p", {
+        text:
+          `OpenAlex has no field matching ${terms} — that part of the query falls back ` +
+          "to unscoped full-text search sorted by citation count, so it can surface " +
+          "unrelated highly-cited papers. Try a more common phrasing, or add spaces " +
+          "between words (e.g. \"Smart Grid\" instead of \"SmartGrid\").",
+        cls: "literature-inbox-warning",
+      });
+    }
+    const { connected, total, edges } = this.connectivity;
+    this.contentEl.createEl("p", {
+      text:
+        `${connected} of ${total} cite or are cited by another paper in this set ` +
+        `(${edges} link${edges === 1 ? "" : "s"}) — the rest would land as isolated dots. ` +
+        (connected === 0
+          ? "This query may be too narrow or too recent for a connected starting graph."
+          : ""),
+    });
     this.contentEl.createEl("p", { text: "Does this look like your field?" });
     const list = this.contentEl.createEl("ol");
     for (const work of this.works) {
