@@ -1,6 +1,6 @@
 {
   "name": "literature-inbox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "New scholarly papers arrive as nodes in your Obsidian graph, already wired by citation edges to the papers you keep.",
   "main": "main.js",
   "type": "module",
