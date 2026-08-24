@@ -141,6 +141,33 @@ describe("parseFeed on RSS 2.0", () => {
     expect(works[0]?.abstract).toBe("Some bold abstract.");
   });
 
+  it("strips arXiv's own submission-metadata prefix out of the abstract", () => {
+    // rss.arxiv.org prefixes every description with its own boilerplate
+    // ahead of the real abstract — real example, live-tested.
+    const works = parseFeed(
+      rssFeed(`<item>
+        <title>Practical Error Suppression</title>
+        <guid>oai:arXiv.org:2608.20453</guid>
+        <description>arXiv:2608.20453v1 Announce Type: new
+Abstract: Quantum computing promises to solve certain problems faster.</description>
+      </item>`),
+    );
+    expect(works[0]?.abstract).toBe(
+      "Quantum computing promises to solve certain problems faster.",
+    );
+  });
+
+  it("leaves an ordinary abstract alone when it doesn't start with arXiv's prefix", () => {
+    const works = parseFeed(
+      rssFeed(`<item>
+        <title>Ordinary Paper</title>
+        <guid>urn:journal:5</guid>
+        <description>This paper builds on arXiv:1234.5678 in section 2.</description>
+      </item>`),
+    );
+    expect(works[0]?.abstract).toBe("This paper builds on arXiv:1234.5678 in section 2.");
+  });
+
   it("keeps an item that resolves to nothing but a title", () => {
     // Shallow arrivals are still arrivals; dropping them loses papers.
     const works = parseFeed(rssFeed("<item><title>Bare Title Only</title></item>"));

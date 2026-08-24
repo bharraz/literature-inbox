@@ -49,6 +49,20 @@ function stripHtml(value: string | undefined): string | undefined {
   return collapseWhitespace(value.replace(/<[^>]*>/g, " "));
 }
 
+/**
+ * arXiv's own RSS feed (`rss.arxiv.org`) prefixes every item's description
+ * with its own submission metadata — `arXiv:2608.20453v1 Announce Type: new
+ * Abstract: ` — ahead of the actual abstract. Recognisable and specific
+ * enough that no legitimate abstract from any other feed would ever start
+ * this way, so it's safe to strip unconditionally rather than gate it on
+ * which feed the item came from.
+ */
+function stripArxivAnnouncePrefix(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const stripped = value.replace(/^arXiv:\S+\s+Announce Type:\s*\S+\s*Abstract:\s*/i, "");
+  return stripped || undefined;
+}
+
 function firstDefined(...values: (string | undefined)[]): string | undefined {
   return values.find((value) => value !== undefined && value !== "");
 }
@@ -78,8 +92,10 @@ export function workFromFeedItem(item: Element): Work | undefined {
 
   const link = linkOf(item);
   const guid = childText(item, "guid") ?? childText(item, "id");
-  const description = stripHtml(
-    firstDefined(childText(item, "description"), childText(item, "summary"), childText(item, "content")),
+  const description = stripArxivAnnouncePrefix(
+    stripHtml(
+      firstDefined(childText(item, "description"), childText(item, "summary"), childText(item, "content")),
+    ),
   );
   const searchable = [description, guid, link].filter(Boolean).join(" ");
 
