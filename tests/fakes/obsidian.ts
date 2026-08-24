@@ -354,6 +354,14 @@ export class Modal {
 
   constructor(readonly app: App) {}
 
+  /** The documented way to title a modal since Obsidian 1.4; writing to
+   * `titleEl` directly still works but is the thing plugin review asks you
+   * not to do. Backed by `titleEl` so existing assertions still read it. */
+  setTitle(title: string): this {
+    this.titleEl.setText(title);
+    return this;
+  }
+
   open(): void {
     this.isOpen = true;
     openModals.push(this);

@@ -35,19 +35,30 @@ export const NO_ABSTRACT_PLACEHOLDER = "*No abstract available.*";
 
 /** Values that YAML would otherwise reinterpret as a non-string must be
  * quoted — a bare `2017` is a number, `no` is a boolean, and a leading `@`
- * or `:` is a syntax error. */
+ * or `:` is a syntax error. The leading `-`, `?` and `=` matter for real
+ * titles: `title: - Some Paper` is a parse error, not a title. */
 function needsQuoting(value: string): boolean {
   if (value === "") return true;
-  if ("\"'@`|>*&!%#,[]{}:".includes(value[0] as string)) return true;
+  if ("\"'@`|>*&!%#,[]{}:-?=".includes(value[0] as string)) return true;
   if (value.trim() !== value) return true;
-  if (["true", "false", "null", "~", "yes", "no"].includes(value.toLowerCase())) return true;
+  const lowered = value.toLowerCase();
+  if (["true", "false", "null", "~", "yes", "no", "on", "off"].includes(lowered)) return true;
   if (value !== "" && !Number.isNaN(Number(value))) return true;
   return value.includes(":") || value.includes("#");
 }
 
+/**
+ * A single-line, always-parseable YAML scalar.
+ *
+ * Control whitespace is folded to spaces before anything else. Sources do
+ * publish titles containing literal newlines, and one reaching this point
+ * unescaped ends the scalar early — which corrupts the rest of the block and
+ * lets whatever followed be read as further YAML keys.
+ */
 function yamlScalar(value: string): string {
-  if (!needsQuoting(value)) return value;
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const flat = value.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim();
+  if (!needsQuoting(flat)) return flat;
+  return `"${flat.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 export type FrontmatterValue = string | string[];
@@ -71,6 +82,8 @@ export function renderFrontmatter(fields: Array<[string, FrontmatterValue | unde
 
 export interface InboxNoteOptions {
   work: Work;
+  /** Where author names appear in a generated note. */
+  authorPlacement?: AuthorPlacement;
   /** Note filenames (no extension) this work cites that exist in the vault. */
   cites?: string[];
   /** Note filenames that cite this work. */
@@ -95,6 +108,8 @@ export interface InboxNoteOptions {
    */
   readStatus?: string;
 }
+
+export type AuthorPlacement = "off" | "property" | "plaintext";
 
 /** Where subject terms go, and which vocabularies they come from. */
 export interface SubjectOptions {
@@ -175,6 +190,7 @@ function renderWhy(connectedKept: readonly string[]): string {
 
 export function renderInboxNote(options: InboxNoteOptions): string {
   const { work, arrivedOn, originIds } = options;
+  const authorPlacement = options.authorPlacement ?? "plaintext";
   const cites = options.cites ?? [];
   const citedBy = options.citedBy ?? [];
 
@@ -187,7 +203,10 @@ export function renderInboxNote(options: InboxNoteOptions): string {
 
   const frontmatter = renderFrontmatter([
     ["title", work.title],
-    ["authors", work.authors.map(fullName).filter(Boolean)],
+    [
+      "authors",
+      authorPlacement === "property" ? work.authors.map(fullName).filter(Boolean) : undefined,
+    ],
     ["year", workYear(work)],
     ["doi", work.doi],
     ["url", work.url],
@@ -209,10 +228,12 @@ export function renderInboxNote(options: InboxNoteOptions): string {
     // keys on the path instead.
   ]);
 
-  const title = work.title || work.key;
+  // Flattened for the same reason frontmatter scalars are: a newline here
+  // would split the note's heading in two and orphan the rest of the title.
+  const title = (work.title || work.key).replace(/\s+/g, " ").trim();
   const parts = [`# ${title}\n`];
   const authorLine = work.authors.map(fullName).filter(Boolean).join(", ");
-  if (authorLine) parts.push(`**Authors:** ${authorLine}\n`);
+  if (authorPlacement === "plaintext" && authorLine) parts.push(`**Authors:** ${authorLine}\n`);
   const why = renderWhy(options.connectedKept ?? []);
   if (why) parts.push(why);
   parts.push(`## Abstract\n\n${work.abstract?.trim() || NO_ABSTRACT_PLACEHOLDER}\n`);

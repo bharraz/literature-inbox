@@ -20,7 +20,7 @@
 import { CitationIndex, resolveCitations, type ReferenceRecord } from "./citations";
 import { FilenameAllocator } from "./filenames";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
-import { renderInboxNote, type SubjectOptions } from "./notes";
+import { renderInboxNote, type AuthorPlacement, type SubjectOptions } from "./notes";
 import type { VaultAdapter } from "./update";
 import type { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
@@ -43,6 +43,7 @@ export interface KernelRunInput {
   papersFolder: string;
   adapter: VaultAdapter;
   today: string;
+  authorPlacement?: AuthorPlacement;
   subjects?: SubjectOptions;
   readStatus?: string;
   /**
@@ -221,6 +222,7 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
     const notePath = `${papersFolder}/${entry.noteName}.md`;
     const content = renderInboxNote({
       work: entry.work,
+      authorPlacement: input.authorPlacement,
       cites,
       citedBy,
       arrivedOn: today,

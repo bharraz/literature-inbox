@@ -47,6 +47,12 @@ const TYPE_TO_ITEM_TYPE: Record<string, string> = {
   review: "journalArticle",
 };
 
+/** Collapse runs of whitespace and trim, returning undefined for blanks. */
+function cleanText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.replace(/\s+/g, " ").trim() || undefined;
+}
+
 /** Reassemble the abstract OpenAlex stores as {word: [positions]} to dodge
  * publisher copyright on the contiguous text. */
 export function reconstructAbstract(
@@ -69,10 +75,8 @@ function authorFromDisplayName(displayName: string): Author {
 }
 
 function venueName(data: any): string | undefined {
-  return (
-    data?.primary_location?.source?.display_name ??
-    data?.host_venue?.display_name ??
-    undefined
+  return cleanText(
+    data?.primary_location?.source?.display_name ?? data?.host_venue?.display_name,
   );
 }
 
@@ -131,7 +135,9 @@ export function workFromOpenAlex(data: any): Work {
   if (doi) work.ids.push(makeId(DOI, doi));
   const arxivId = extractArxivId(data);
   if (arxivId) work.ids.push(makeId(ARXIV, arxivId));
-  work.title = data.title ?? data.display_name ?? undefined;
+  // Collapsed, not just taken as-is: a title carrying an embedded newline
+  // breaks the note's YAML frontmatter and splits its heading in two.
+  work.title = cleanText(data.title ?? data.display_name);
   work.abstract = reconstructAbstract(data.abstract_inverted_index);
   work.date = data.publication_date ?? undefined;
   work.doi = doi;

@@ -2,6 +2,7 @@ import { PluginSettingTab, Setting, type App } from "obsidian";
 import { ARXIV_CATEGORIES, CUSTOM_ARXIV_CATEGORY, isKnownArxivCategory } from "./core/arxiv-categories";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
 import { type FeedConfig } from "./core/feeds";
+import type { AuthorPlacement } from "./core/notes";
 import {
   SOURCE_LABELS,
   SOURCE_PLACEHOLDERS,
@@ -91,6 +92,11 @@ export interface LiteratureInboxSettings {
   subjectKeywords: boolean;
   subjectConcepts: boolean;
 
+  /** Where author names go in generated notes. */
+  authorPlacement: AuthorPlacement;
+  /** Legacy setting migrated to authorPlacement on load. */
+  includeAuthors?: boolean;
+
   /**
    * Track a read-status property on each paper note.
    *
@@ -149,6 +155,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   subjectTopics: true,
   subjectKeywords: true,
   subjectConcepts: false,
+  authorPlacement: "property",
   readStatusEnabled: false,
   keepWindowDays: 30,
   pruneEnabled: false,
@@ -250,22 +257,14 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
 
     const wrapper = containerEl.createDiv({ cls: "setting-item-description" });
 
-    const bar = wrapper.createDiv();
-    bar.style.height = "6px";
-    bar.style.borderRadius = "3px";
-    bar.style.background = "var(--background-modifier-border)";
-    bar.style.overflow = "hidden";
-    bar.style.margin = "4px 0";
-
-    const fill = bar.createDiv();
-    fill.style.height = "100%";
-    fill.style.width = `${Math.round(budget.fraction * 100)}%`;
-    fill.style.background =
-      budget.fraction > 0.9
-        ? "var(--text-error)"
-        : budget.fraction > 0.6
-          ? "var(--text-warning)"
-          : "var(--interactive-accent)";
+    // Everything but the fill width lives in styles.css; the width is the one
+    // genuinely dynamic value, so it goes through a custom property rather
+    // than a hand-built style string.
+    const bar = wrapper.createDiv({ cls: "literature-inbox-budget-bar" });
+    const level = budget.fraction > 0.9 ? "high" : budget.fraction > 0.6 ? "medium" : "low";
+    const fill = bar.createDiv({ cls: "literature-inbox-budget-fill" });
+    fill.dataset.level = level;
+    fill.style.setProperty("--literature-inbox-budget-fraction", `${Math.round(budget.fraction * 100)}%`);
 
     wrapper.createEl("p", {
       cls: "setting-item-description",
@@ -691,12 +690,20 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    */
   private renderNoteContent(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("What goes in a note").setHeading();
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text:
-        "Authors are always recorded as a note property, never as tags — author tags " +
-        "clutter a vault badly and add nothing to the graph.",
-    });
+    new Setting(containerEl)
+      .setName("Authors")
+      .setDesc("Choose whether author names are note properties, plaintext, or omitted.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("property", "As a note property")
+          .addOption("plaintext", "As plaintext")
+          .addOption("off", "Don't include them")
+          .setValue(this.plugin.settings.authorPlacement)
+          .onChange(async (value) => {
+            this.plugin.settings.authorPlacement = value as AuthorPlacement;
+          await this.plugin.saveSettings();
+          }),
+      );
 
     new Setting(containerEl)
       .setName("Subject terms")

@@ -94,6 +94,55 @@ describe("Crossref's date and abstract shapes", () => {
     expect(work?.abstract).toBe("We present a deep framework.");
   });
 
+  it("drops the redundant 'Abstract' title JATS opens with", () => {
+    // 15 of 100 sampled live records open this way. Left in, every one of
+    // them renders as "Abstract" directly under this plugin's own heading
+    // of the same name.
+    const work = workFromCrossref({
+      DOI: "10.1/x",
+      abstract:
+        "<jats:title>Abstract</jats:title>\n  <jats:sec>" +
+        "<jats:title>Background</jats:title><jats:p>Plate readers measure growth.</jats:p>" +
+        "</jats:sec>",
+    });
+    expect(work?.abstract).toBe("Background Plate readers measure growth.");
+  });
+
+  it("keeps an inner section title that isn't the leading 'Abstract'", () => {
+    const work = workFromCrossref({
+      DOI: "10.1/x",
+      abstract: "<jats:p>Text about the abstract nature of it.</jats:p>",
+    });
+    expect(work?.abstract).toBe("Text about the abstract nature of it.");
+  });
+
+  it("decodes the entities that survive a tag strip", () => {
+    const work = workFromCrossref({
+      DOI: "10.1/x",
+      abstract: "<jats:p>Cost &lt; 5% &amp; rising&#x2014;see &#8220;note&#8221;.</jats:p>",
+    });
+    expect(work?.abstract).toBe("Cost < 5% & rising—see “note”.");
+  });
+
+  it("closes up inline tags instead of turning them into spaces", () => {
+    // "H<sub>2</sub>O" became "H 2 O" when every tag was replaced by a space.
+    const work = workFromCrossref({
+      DOI: "10.1/x",
+      abstract: "<jats:p>H<sub>2</sub>O and Fe(<sc>iv</sc>)-oxo.</jats:p>",
+    });
+    expect(work?.abstract).toBe("H2O and Fe(iv)-oxo.");
+  });
+
+  it("collapses the newlines publishers deposit inside titles", () => {
+    // Roughly 1 in 200 live records. A newline reaching the note breaks its
+    // YAML frontmatter outright.
+    const work = workFromCrossref({
+      DOI: "10.1/x",
+      title: ["A Study on Safety\n            Management"],
+    });
+    expect(work?.title).toBe("A Study on Safety Management");
+  });
+
   it("takes a corporate author that has no family name", () => {
     const work = workFromCrossref({ DOI: "10.1/x", author: [{ name: "The Consortium" }] });
     expect(work?.authors).toEqual([{ lastName: "The Consortium" }]);

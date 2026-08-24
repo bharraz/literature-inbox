@@ -42,3 +42,39 @@
 .literature-inbox-feed-header span {
   min-width: 6em;
 }
+
+/* The OpenAlex daily-allowance gauge. Only the fill width is dynamic, and it
+   arrives as a custom property set on the element. */
+.literature-inbox-budget-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  overflow: hidden;
+  margin: var(--size-2-1) 0;
+}
+
+.literature-inbox-budget-fill {
+  height: 100%;
+  width: var(--literature-inbox-budget-fraction, 0%);
+  background: var(--interactive-accent);
+}
+
+.literature-inbox-budget-fill[data-level="medium"] {
+  background: var(--text-warning);
+}
+
+.literature-inbox-budget-fill[data-level="high"] {
+  background: var(--text-error);
+}
+
+/* The suggested paper's title, in place of a bare heading element. */
+.literature-inbox-suggestion-title {
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-semibold);
+  line-height: var(--line-height-tight);
+  margin-bottom: var(--size-4-2);
+}
+
+.literature-inbox-id-input {
+  width: 100%;
+}

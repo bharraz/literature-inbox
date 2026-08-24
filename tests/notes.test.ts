@@ -14,6 +14,86 @@ function work(title: string) {
   return w;
 }
 
+/** The frontmatter block alone, so a test can assert it parses as YAML. */
+function frontmatterOf(note: string): string {
+  const end = note.indexOf("\n---", 4);
+  return note.slice(4, end);
+}
+
+describe("frontmatter stays parseable whatever the title contains", () => {
+  const render = (title: string) =>
+    renderInboxNote({ work: work(title), arrivedOn: "2026-08-24", originIds: ["doi:10.1/x"] });
+
+  it("quotes a title starting with a dash", () => {
+    // `title: - Something` is a YAML parse error, not a title — Obsidian
+    // shows the whole properties block as broken.
+    const note = render("- A Dash To Begin With");
+    expect(frontmatterOf(note)).toContain('title: "- A Dash To Begin With"');
+  });
+
+  it("quotes a title starting with other YAML indicators", () => {
+    expect(frontmatterOf(render("? What Happens Here"))).toContain('title: "? What Happens Here"');
+    expect(frontmatterOf(render("= Equals Lead"))).toContain('title: "= Equals Lead"');
+  });
+
+  it("quotes titles YAML would read as booleans", () => {
+    expect(frontmatterOf(render("On"))).toContain('title: "On"');
+    expect(frontmatterOf(render("Off"))).toContain('title: "Off"');
+  });
+
+  it("flattens an embedded newline rather than ending the scalar early", () => {
+    // Sources really do publish these. Unflattened, everything after the
+    // newline is read as further YAML keys.
+    const note = render("A Study on Safety\n            Management");
+    expect(frontmatterOf(note)).toContain("title: A Study on Safety Management");
+    expect(frontmatterOf(note)).not.toContain("\n            Management");
+  });
+
+  it("keeps the note's heading on one line too", () => {
+    const note = render("A Study on Safety\nManagement");
+    expect(note).toContain("# A Study on Safety Management\n");
+  });
+
+  it("leaves an ordinary title unquoted", () => {
+    expect(frontmatterOf(render("Deep Residual Learning"))).toContain(
+      "title: Deep Residual Learning",
+    );
+  });
+
+  it("omits authors when author inclusion is disabled", () => {
+    const note = renderInboxNote({
+      work: work("A Paper"),
+      authorPlacement: "off",
+      arrivedOn: "2026-08-24",
+      originIds: ["doi:10.1/x"],
+    });
+    expect(note).not.toContain("authors:");
+    expect(note).not.toContain("**Authors:**");
+  });
+
+  it("can place authors in frontmatter or plaintext", () => {
+    const paper = work("A Paper");
+    paper.authors = [{ firstName: "Ada", lastName: "Lovelace" }];
+    const property = renderInboxNote({
+      work: paper,
+      authorPlacement: "property",
+      arrivedOn: "2026-08-24",
+      originIds: ["doi:10.1/x"],
+    });
+    expect(property).toContain("authors:\n  - Ada Lovelace");
+    expect(property).not.toContain("**Authors:**");
+
+    const plaintext = renderInboxNote({
+      work: paper,
+      authorPlacement: "plaintext",
+      arrivedOn: "2026-08-24",
+      originIds: ["doi:10.1/x"],
+    });
+    expect(plaintext).not.toContain("authors:");
+    expect(plaintext).toContain("**Authors:** Ada Lovelace");
+  });
+});
+
 describe("renderInboxNote citations block", () => {
   it("wraps the Citations section in its own markers when there are edges", () => {
     const content = renderInboxNote({

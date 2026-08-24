@@ -16,7 +16,12 @@ import {
 import { FilenameAllocator } from "./filenames";
 import { contentHash } from "./hash";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
-import { mergeCitations, renderInboxNote, type SubjectOptions } from "./notes";
+import {
+  mergeCitations,
+  renderInboxNote,
+  type AuthorPlacement,
+  type SubjectOptions,
+} from "./notes";
 import { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
 
@@ -56,6 +61,7 @@ export interface UpdateSettings {
   inboxFolder: string;
   papersFolder: string;
   maxArrivalsPerRun: number;
+  authorPlacement?: AuthorPlacement;
   subjects?: SubjectOptions;
   /** Initial read-status for new notes, when the feature is on. */
   readStatus?: string;
@@ -317,6 +323,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     const notePath = `${folder}/${entry.noteName}.md`;
     const content = renderInboxNote({
       work: entry.work,
+      authorPlacement: settings.authorPlacement,
       cites,
       citedBy,
       arrivedOn: today,

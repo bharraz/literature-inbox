@@ -312,7 +312,12 @@ export default class LiteratureInboxPlugin extends Plugin {
 
   private async loadPersisted(): Promise<void> {
     const data = (await this.loadData()) as Partial<PersistedData> | null;
-    this.settings = { ...DEFAULT_SETTINGS, ...(data?.settings ?? {}) };
+    const savedSettings: Partial<LiteratureInboxSettings> & { includeAuthors?: boolean } =
+      data?.settings ?? {};
+    this.settings = { ...DEFAULT_SETTINGS, ...savedSettings };
+    if (!Object.prototype.hasOwnProperty.call(savedSettings, "authorPlacement")) {
+      this.settings.authorPlacement = savedSettings.includeAuthors === false ? "off" : "property";
+    }
     // Sources used to be three different shapes: a toggle plus a text box for
     // OpenAlex, a comma-separated string for arXiv, and rows only for feeds.
     // Convert once, then drop the old keys — silently losing someone's
@@ -326,6 +331,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       "rssEnabled",
       "feeds",
       "rssFeeds",
+      "includeAuthors",
     ] as const) {
       delete this.settings[key];
     }
@@ -510,6 +516,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       inboxFolder: this.settings.inboxFolder,
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
+      authorPlacement: this.settings.authorPlacement,
       subjects: this.subjectOptions(),
       readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
     };
@@ -1070,6 +1077,7 @@ ${content.slice(marker)}`;
         papersFolder: targetFolder,
         adapter: this.adapter(),
         today: todayIso(),
+        authorPlacement: this.settings.authorPlacement,
         subjects: this.subjectOptions(),
         readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
         targetCount: size,
@@ -1130,6 +1138,7 @@ ${content.slice(marker)}`;
         papersFolder: this.settings.papersFolder,
         adapter: this.adapter(),
         today: todayIso(),
+        authorPlacement: this.settings.authorPlacement,
         subjects: this.subjectOptions(),
         readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
         // Only topic mode over-fetches a pool bigger than what it wants
@@ -1302,6 +1311,9 @@ ${content.slice(marker)}`;
           papersFolder: this.settings.papersFolder,
           adapter: this.adapter(),
           today: todayIso(),
+          authorPlacement: this.settings.authorPlacement,
+          subjects: this.subjectOptions(),
+          readStatus: this.settings.readStatusEnabled ? "to-read" : undefined,
         });
         await this.mergeReferenceRecords(report.newReferenceRecords, vault);
         this.keptCount += report.written.length;
@@ -1632,7 +1644,7 @@ class RunReportModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText("Update report");
+    this.setTitle("Update report");
     const { report } = this;
     const previouslyRemoved = report.skipped.filter((s) => s.reason === "previously-removed");
 
@@ -1732,8 +1744,11 @@ class SuggestionModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText("What should I read?");
-    this.contentEl.createEl("h3", { text: this.choice.title });
+    this.setTitle("What should I read?");
+    this.contentEl.createDiv({
+      cls: "literature-inbox-suggestion-title",
+      text: this.choice.title,
+    });
     this.contentEl.createEl("p", {
       cls: "setting-item-description",
       text: explain(this.choice),
@@ -1791,7 +1806,7 @@ class FeedTestModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText("Feed test");
+    this.setTitle("Feed test");
     for (const result of this.results) {
       const block = this.contentEl.createDiv();
       block.createEl("p", { text: result.url });
@@ -1832,12 +1847,12 @@ class AddByIdModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText("Add a paper");
+    this.setTitle("Add a paper");
     const input = this.contentEl.createEl("input", {
       type: "text",
+      cls: "literature-inbox-id-input",
       placeholder: "10.5555/example or 2401.12345",
     });
-    input.style.width = "100%";
     input.addEventListener("input", () => { this.value = input.value; });
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -1879,7 +1894,7 @@ class ExpandOptionsModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText(
+    this.setTitle(
       `Expand outward from ${this.selectionSize} paper(s)`,
     );
 
@@ -1932,7 +1947,7 @@ class ConfirmPruneModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText("Clean up these arrivals?");
+    this.setTitle("Clean up these arrivals?");
     this.contentEl.createEl("p", {
       text:
         `${this.records.length} arrival(s) are past the keep window and haven't ` +
@@ -1975,7 +1990,7 @@ class PreviewModal extends Modal {
   }
 
   override onOpen(): void {
-    this.titleEl.setText(`Top results for "${this.topic}"`);
+    this.setTitle(`Top results for "${this.topic}"`);
     if (this.works.length === 0) {
       this.contentEl.createEl("p", { text: "No results — try a different query." });
       return;
