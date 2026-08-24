@@ -4,8 +4,12 @@ main.js.map
 *.tgz
 .DS_Store
 
-# Scratch Obsidian vault for manual testing (TESTING.md). Holds generated
-# notes and local Obsidian config; regenerate it rather than commit it.
+# Scratch Obsidian vault for manual testing. Holds generated notes and local
+# Obsidian config; regenerate it rather than commit it.
 test-vault/
 live-vault/
 test-vaults/
+
+# Local Claude Code project settings — machine-specific paths, not part of
+# the plugin.
+.claude/
