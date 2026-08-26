@@ -97,15 +97,6 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 }
 
-/** Move a note to Obsidian's trash — honouring the user's "deleted files"
- * preference — rather than deleting it. Cleanup must always be recoverable. */
-export async function trashNote(app: App, path: string): Promise<void> {
-  const file = app.vault.getAbstractFileByPath(normalizePath(path));
-  if (file instanceof TFile) {
-    await app.fileManager.trashFile(file);
-  }
-}
-
 /** Move a note between folders. Uses `fileManager.renameFile` rather than the
  * raw vault rename so Obsidian rewrites every wikilink pointing at it — which
  * is exactly what makes "keep by moving the file" safe. */

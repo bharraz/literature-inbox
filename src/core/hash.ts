@@ -7,8 +7,7 @@
  * write path for no benefit. WebCrypto's digest is async-only.
  *
  * A collision would mean an edited note read as untouched and became eligible
- * for cleanup — which is why cleanup *also* requires the keep window to have
- * elapsed and, by default, moves to trash rather than deleting.
+ * for an automated rewrite.
  */
 
 export function contentHash(text: string): string {

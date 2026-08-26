@@ -162,7 +162,6 @@ describe("plugin load", () => {
       "add-by-doi",
       "suggest-paper",
       "copy-identifier",
-      "clean-up-inbox",
     ]);
   });
 
@@ -175,7 +174,6 @@ describe("plugin load", () => {
   it("starts from defaults when there is no saved data", async () => {
     const { plugin } = await bootPlugin();
     expect(plugin.settings.inboxFolder).toBe("Inbox");
-    expect(plugin.settings.pruneEnabled).toBe(false); // cleanup off until asked for
   });
 
   it("renders the settings tab without throwing", async () => {
@@ -208,14 +206,11 @@ describe("plugin load", () => {
   });
 
   it("puts the everyday actions where their settings live", async () => {
-    // Fetch lives with the sources it consults; clean-up lives with the
-    // cleanup settings it depends on — not stranded in setup instructions.
+    // Fetch lives with the sources it consults, not stranded in setup instructions.
     const { plugin } = await bootPlugin();
     (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
     const fetch = allSettings.find((s: Setting) => s.name === "Fetch new papers");
-    const clean = allSettings.find((s: Setting) => s.name === "Clean up now");
     expect(fetch?.buttons[0]?.text).toBe("Update inbox");
-    expect(clean?.buttons[0]?.text).toBe("Preview cleanup");
   });
 });
 
@@ -292,6 +287,33 @@ describe("update inbox", () => {
 
     expect(new Set(app.vault.files.keys())).toEqual(afterFirst);
     expect(notices.some((n) => n.includes("already known"))).toBe(true);
+  });
+
+  it("forgets a manually deleted arrival and blocks its return", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    app.vault.files.delete("Inbox/A Paper About Transformers.md");
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(false);
+    expect((plugin as never as { previouslyRemoved: string[] }).previouslyRemoved).toContain(
+      "doi:10.1234/one",
+    );
+    expect((plugin as never as { inbox: { notePath: string }[] }).inbox).toHaveLength(1);
+  });
+
+  it("allows a manual DOI add after the same paper was deleted", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await plugin.updateInbox();
+
+    app.vault.files.delete("Inbox/A Paper About Transformers.md");
+    respondWith(DEFAULT_RESPONSE);
+    await plugin.addById("10.1234/one");
+
+    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
   });
 
   it("persists its state across a reload", async () => {
@@ -436,35 +458,6 @@ describe("what should I read?", () => {
     expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
   });
 
-  it("puts a paper you marked read beyond cleanup's reach", async () => {
-    // Saying you have read something is engagement, and cleanup is only for
-    // arrivals nobody looked at. Leaving the recorded hash stale is what makes
-    // the note count as touched, which is exactly the guard we want here.
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.readStatusEnabled = true;
-    });
-    await plugin.updateInbox();
-
-    const path = "Inbox/A Paper About Transformers.md";
-    await plugin.setReadStatus(path, "read");
-
-    const content = app.vault.files.get(path) as string;
-    expect(content).toContain("read-status: read");
-
-    // Cleanup now sees a note that no longer matches what it generated.
-    const { contentHash } = await import("../src/core/hash");
-    const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
-      .find((r) => r.notePath === path);
-    expect(record?.contentHash).not.toBe(contentHash(content));
-
-    plugin.settings.pruneEnabled = true;
-    plugin.settings.keepWindowDays = 0;
-    await plugin.cleanUp();
-    expect(app.vault.files.has(path)).toBe(true);
-  });
-
   it("writes no read-status property unless the feature is on", async () => {
     respondWith(DEFAULT_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
@@ -524,73 +517,6 @@ describe("keeping a paper", () => {
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(false);
     expect(app.vault.files.has("Papers/A Paper About Transformers.md")).toBe(true);
-  });
-});
-
-// --- cleanup ------------------------------------------------------------------------------
-
-describe("cleanup safety", () => {
-  it("refuses to do anything while cleanup is disabled", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
-    await runCommand(plugin, "update-inbox");
-
-    await runCommand(plugin, "clean-up-inbox");
-
-    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
-    // And says why, including that nothing happens automatically — the point
-    // people most often misread about this setting.
-    const refusal = notices.find((n) => n.toLowerCase().includes("cleanup is locked"));
-    expect(refusal).toBeDefined();
-    expect(refusal?.toLowerCase()).toContain("automatically");
-  });
-
-  it("keeps recent arrivals even when cleanup is enabled", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.pruneEnabled = true;
-      p.settings.keepWindowDays = 30;
-    });
-    await runCommand(plugin, "update-inbox");
-
-    await runCommand(plugin, "clean-up-inbox");
-
-    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
-    expect(notices.some((n) => n.toLowerCase().includes("nothing to clean"))).toBe(true);
-  });
-
-  it("never removes an edited note, even once it is old", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.pruneEnabled = true;
-      p.settings.keepWindowDays = 0; // everything is immediately eligible
-    });
-    await runCommand(plugin, "update-inbox");
-
-    const path = "Inbox/A Paper About Transformers.md";
-    app.vault.files.set(path, (app.vault.files.get(path) as string) + "\n\nMy own notes.\n");
-
-    await runCommand(plugin, "clean-up-inbox");
-
-    expect(app.vault.files.has(path)).toBe(true);
-  });
-
-  it("asks before removing anything", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.pruneEnabled = true;
-      p.settings.keepWindowDays = 0;
-    });
-    await runCommand(plugin, "update-inbox");
-
-    await runCommand(plugin, "clean-up-inbox");
-
-    // The confirmation modal is open; nothing has been removed yet.
-    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
-    expect(app.fileManager.trashed).toEqual([]);
   });
 });
 
@@ -1033,15 +959,16 @@ describe("adding papers by hand", () => {
     expect(plugin.status().inboxCount).toBe(0);
   });
 
-  it("adds to the inbox when asked, exempt from cleanup", async () => {
+  it("adds to the inbox when asked", async () => {
     respondWith(openAlexPage([openAlexWork("W1", "A Triage Paper", [], "10.1234/one")]));
     const { app, plugin } = await bootPlugin();
 
     await plugin.addByIds("10.1234/one", "inbox");
 
     expect(app.vault.files.has("Inbox/A Triage Paper.md")).toBe(true);
-    const records = (plugin as never as { inbox: { manual?: boolean }[] }).inbox;
-    expect(records[0]?.manual).toBe(true);
+    expect((plugin as never as { inbox: { notePath: string }[] }).inbox[0]?.notePath).toBe(
+      "Inbox/A Triage Paper.md",
+    );
   });
 
   it("refuses an empty box instead of making a request", async () => {
@@ -1165,6 +1092,33 @@ describe("choosing arrivals by citation adjacency", () => {
 
     expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
     expect(app.vault.files.has("Inbox/A Topic Match.md")).toBe(false);
+  });
+
+  it("over-fetches citing papers so connectivity selects beyond the first N", async () => {
+    let call = 0;
+    setRequestResponder((url) => {
+      call += 1;
+      if (call === 1) {
+        expect(url).toContain("cites%3AW1");
+      }
+      return {
+        status: 200,
+        text: openAlexPage([
+          openAlexWork("W9", "Recent Weak Connection", [], "10.1234/nine", "2026-07-18"),
+          openAlexWork("W8", "Older Strong Connection", ["W1"], "10.1234/eight", "2026-07-01"),
+        ]),
+      };
+    });
+    const { app, plugin } = await vaultWithKeptPaper((p) => {
+      p.settings.maxArrivalsPerRun = 1;
+      p.settings.sources = [{ kind: "citing", value: "", enabled: true }];
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/Older Strong Connection.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Recent Weak Connection.md")).toBe(false);
+    expect(requestedUrls[0]).toContain("per-page=4");
   });
 
   it("skips the adjacency query entirely in topic-only mode", async () => {
@@ -1374,35 +1328,6 @@ describe("what should I read?", () => {
     await plugin.suggestPaper();
 
     expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
-  });
-
-  it("puts a paper you marked read beyond cleanup's reach", async () => {
-    // Saying you have read something is engagement, and cleanup is only for
-    // arrivals nobody looked at. Leaving the recorded hash stale is what makes
-    // the note count as touched, which is exactly the guard we want here.
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.readStatusEnabled = true;
-    });
-    await plugin.updateInbox();
-
-    const path = "Inbox/A Paper About Transformers.md";
-    await plugin.setReadStatus(path, "read");
-
-    const content = app.vault.files.get(path) as string;
-    expect(content).toContain("read-status: read");
-
-    // Cleanup now sees a note that no longer matches what it generated.
-    const { contentHash } = await import("../src/core/hash");
-    const record = (plugin as never as { inbox: { notePath: string; contentHash: string }[] }).inbox
-      .find((r) => r.notePath === path);
-    expect(record?.contentHash).not.toBe(contentHash(content));
-
-    plugin.settings.pruneEnabled = true;
-    plugin.settings.keepWindowDays = 0;
-    await plugin.cleanUp();
-    expect(app.vault.files.has(path)).toBe(true);
   });
 
   it("writes no read-status property unless the feature is on", async () => {
@@ -1685,31 +1610,27 @@ describe("per-source inbox folders", () => {
     expect(app.vault.files.has("Inbox/A Topic Paper.md")).toBe(false);
   });
 
-  it("cleanup still finds an expired arrival in a per-source subfolder", async () => {
-    // Cleanup trusts one prefix match against the *parent* inbox folder — the
-    // whole point of nesting every source folder under it (see
-    // effectiveInboxFolder) is that this keeps working with no folder-specific
-    // cleanup logic at all.
-    respondWith(openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]));
-    const { plugin } = await bootPlugin((p) => {
+  it("reconciles a deleted arrival in a per-source subfolder", async () => {
+    const response = openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]);
+    respondWith(response);
+    const { app, plugin } = await bootPlugin((p) => {
       p.settings.sources = [
         { kind: "topic", value: "transformers", enabled: true, inboxFolder: "ArXiv" },
       ];
-      p.settings.pruneEnabled = true;
-      p.settings.keepWindowDays = 1;
     });
+
+    await plugin.updateInbox();
+    app.vault.files.delete("Inbox/ArXiv/A Topic Paper.md");
+    respondWith(response);
     await plugin.updateInbox();
 
-    const record = (plugin as never as { inbox: { arrivedOn: string }[] }).inbox[0];
-    if (record) record.arrivedOn = "2020-01-01";
-
-    await plugin.cleanUp();
-
-    // ConfirmPruneModal only opens when there's something prunable — reaching
-    // it at all proves cleanup found the note in its nested subfolder.
-    expect(notices.some((n) => n.includes("Nothing to clean up"))).toBe(false);
+    expect((plugin as never as { inbox: unknown[] }).inbox).toHaveLength(0);
+    expect((plugin as never as { previouslyRemoved: string[] }).previouslyRemoved).toContain(
+      "doi:10.1234/one",
+    );
   });
 });
+
 
 describe("settings page: layout details", () => {
   it("preserves scroll position across a re-render", async () => {
@@ -1857,9 +1778,6 @@ describe("the plugin's visible surface", () => {
 
     const headings = allSettings.filter((s: Setting) => s.isHeading).map((s: Setting) => s.name);
     expect(headings).toContain("Update your inbox");
-    // The heading itself has to say cleanup never runs on its own — that is
-    // the misreading the wording exists to prevent.
-    expect(headings).toContain("Clean out your inbox");
     expect(headings).toContain("What goes in a note");
     expect(headings).toContain("Network and integrations");
   });
@@ -2254,8 +2172,6 @@ describe("retroactive citation linking", () => {
     });
     const { app, plugin } = await bootPlugin((p) => {
       enableOpenAlex(p);
-      p.settings.pruneEnabled = true;
-      p.settings.keepWindowDays = 0; // everything is immediately eligible
     });
     await runCommand(plugin, "update-inbox");
 
@@ -2263,9 +2179,7 @@ describe("retroactive citation linking", () => {
       (plugin as never as { referenceIndex: { ids: string[] }[] }).referenceIndex;
     expect(stored().length).toBe(1);
 
-    // Clean up trashes the untouched arrival and drops its inbox record —
-    // simulating that whole path directly, the same as the cleanup safety
-    // tests above do for other assertions.
+    // Simulate the user deleting the untouched arrival and its tracked state.
     app.vault.files.delete("Inbox/Paper A Arrives First.md");
     (plugin as never as { inbox: unknown[] }).inbox = [];
 

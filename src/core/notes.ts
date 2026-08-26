@@ -16,9 +16,9 @@ export const GENERATED_END = "<!-- literature-inbox:generated:end -->";
 /**
  * A second, narrower marker pair around just the Citations section.
  *
- * The outer generated-section markers guard the *whole* note for cleanup:
- * edit anything inside them, anywhere, and the note is "touched" and safe
- * from cleanup forever — exactly what cleanup should do. But that same
+ * The outer generated-section markers guard the *whole* generated note:
+ * edit anything inside them, anywhere, and the note is considered user-owned.
+ * But that same
  * all-or-nothing rule would also have frozen the citations list the moment
  * you wrote so much as a personal tag elsewhere in the note, and keeping the
  * graph's edges accurate matters independently of that. These markers let

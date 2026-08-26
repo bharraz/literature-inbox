@@ -37,8 +37,6 @@ export interface InboxRecord {
   arrivedOn: string;
   /** Hash of the note exactly as generated; a mismatch means the user edited it. */
   contentHash: string;
-  /** Manual adds are intentional and never auto-pruned. */
-  manual?: boolean;
   /** How many vault papers this arrival cites, recorded at arrival and shown
    * in the run report. */
   edgeCount?: number;
@@ -99,10 +97,8 @@ export function emptyReport(): UpdateReport {
  * against. A false skip is recoverable and reported; a false *add* creates a
  * duplicate note, so the bias is toward skipping.
  *
- * `previouslyRemoved` is what stops a cleaned-up arrival from silently
- * reappearing: cleanup drops the note *and* its tracked record, so without
- * this, the moment the same paper shows up in a later fetch there is nothing
- * left anywhere to say "you already saw this and let it go."
+ * `previouslyRemoved` stops a manually deleted arrival from silently
+ * reappearing after its tracked record is reconciled away.
  */
 export function findExisting(
   work: Work,
@@ -143,9 +139,8 @@ export interface UpdateRunInput {
   /** `YYYY-MM-DD`; injected so tests aren't clock-dependent. */
   today: string;
   /**
-   * Ids of papers that were fetched, added, and later cleaned up. Omit (or
-   * leave empty) for a manual add — a manual add is deliberate, so it is
-   * exempt from this the same way it is exempt from cleanup itself.
+  * Ids of papers the user deleted from the inbox. Omit (or leave empty) for
+  * a manual add so the explicitly requested paper is always allowed.
    */
   previouslyRemoved?: readonly string[];
   /**

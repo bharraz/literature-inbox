@@ -107,10 +107,6 @@ export interface LiteratureInboxSettings {
    */
   readStatusEnabled: boolean;
 
-  keepWindowDays: number;
-  /** Off by default: nothing is ever removed until you say so. */
-  pruneEnabled: boolean;
-
   /**
    * A free OpenAlex API key. Blank by default — never a hardcoded one.
    *
@@ -157,8 +153,6 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   subjectConcepts: false,
   authorPlacement: "property",
   readStatusEnabled: false,
-  keepWindowDays: 30,
-  pruneEnabled: false,
   openAlexApiKey: "",
   crossrefEnabled: true,
   crossrefMailto: "",
@@ -212,7 +206,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     this.renderStatus(containerEl);
     this.renderStartingGraph(containerEl);
     this.renderSources(containerEl);
-    this.renderCleanup(containerEl);
     this.renderNoteContent(containerEl);
     this.renderIntegrations(containerEl);
 
@@ -764,63 +757,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
         );
     }
-  }
-
-  private renderCleanup(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("Clean out your inbox").setHeading();
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text:
-        "Nothing is ever removed automatically. There is no timer and no background " +
-        "task: cleanup runs only when you press the button below, and even then it " +
-        "shows you the list and asks first.",
-    });
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text:
-        "It can only touch a note that is still in the inbox folder, still byte-for-byte " +
-        "what was generated, and past the keep window — and it moves notes to Obsidian's " +
-        "trash rather than deleting them. Anything you edited, moved, or wrote yourself " +
-        "is invisible to it. Feel free to move any note to the trash yourself at any time " +
-        "— the plugin only ever acts on what's still sitting in the inbox, untouched.",
-    });
-
-    new Setting(containerEl)
-      .setName("Keep window (days)")
-      .setDesc("How long an untouched arrival sits in the inbox before it can be cleaned up.")
-      .addText((text) =>
-        text.setValue(String(this.plugin.settings.keepWindowDays)).onChange(async (value) => {
-          this.plugin.settings.keepWindowDays = parseCount(
-            value,
-            DEFAULT_SETTINGS.keepWindowDays,
-            0,
-          );
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(containerEl)
-      .setName("Unlock the cleanup button")
-      .setDesc(
-        "Off by default. This does not schedule anything — it only lets the button " +
-          "below do its work. While it is off, cleanup refuses to run at all.",
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.pruneEnabled).onChange(async (value) => {
-          this.plugin.settings.pruneEnabled = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(containerEl)
-      .setName("Clean up now")
-      .setDesc(
-        "Runs once, right now. Shows what would be removed and asks before doing " +
-          "anything. This is the only thing that ever removes a note.",
-      )
-      .addButton((button) =>
-        button.setButtonText("Preview cleanup").onClick(() => void this.plugin.cleanUp()),
-      );
   }
 
   private renderIntegrations(containerEl: HTMLElement): void {

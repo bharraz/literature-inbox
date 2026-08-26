@@ -18,8 +18,14 @@
 
 /* The URL is the one field that needs real width; the two override boxes are
    short numbers and should not take space from it. */
-.literature-inbox-feed-row .setting-item-control input[type="text"]:first-of-type {
+.literature-inbox-feed-row .setting-item-control input[type="text"]:first-of-type:not([placeholder="Number of papers to add per run"]) {
   flex: 1 1 20em;
+}
+
+.literature-inbox-feed-row .setting-item-control input[placeholder="Number of papers to add per run"] {
+  flex: 0 0 3em;
+  width: 3em;
+  min-width: 3em;
 }
 
 /* A lightweight legend above the source rows — not a real aligned grid (the

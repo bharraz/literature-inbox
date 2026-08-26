@@ -31,7 +31,6 @@ import { titlesMatch, normalizeTitle, idsIntersect } from "./core/ids";
 import { VaultIndex, scanFolderIdentities } from "./core/vault-state";
 import { parseNoteIdentity } from "./core/note-identity";
 import { runUpdate, type InboxRecord, type ReferenceRecord, type UpdateReport } from "./core/update";
-import { applyPrune, planPrune } from "./core/prune";
 import {
   backfillReferences,
   hasExactIdentifier,
@@ -82,7 +81,6 @@ import {
   ObsidianVaultAdapter,
   moveNote,
   notify,
-  trashNote,
 } from "./obsidian-adapter";
 import {
   DEFAULT_SETTINGS,
@@ -98,10 +96,8 @@ interface PersistedData {
    * same library on every run. The mapping never changes. */
   openAlexIdByDoi?: Record<string, string>;
   /**
-   * Ids of papers a fetch once added and cleanup later removed. Checked on
-   * every later fetch so the same real, still-matching paper doesn't just
-   * reappear the moment it shows up again — without this, cleanup dropping a
-   * record leaves nothing anywhere to remember it was ever seen.
+  * Ids of papers the user deleted from the inbox. Checked on every later
+  * source fetch so a deleted paper does not silently reappear.
    */
   previouslyRemoved?: string[];
   /**
@@ -131,6 +127,11 @@ const LIBRARY_SEED_LIMIT = 50;
  * library is a hit — and the cost is one request per 25 anchors.
  */
 const ADJACENCY_ANCHOR_LIMIT = 100;
+
+/** Give connected arrivals a wider recent pool before the global cap selects
+ * the papers with the strongest library connections. */
+const ADJACENCY_CANDIDATE_MULTIPLIER = 4;
+const ADJACENCY_CANDIDATE_LIMIT = 100;
 
 /** Shown in a note whose references were looked for and never found. */
 const UNINDEXED_NOTICE =
@@ -250,12 +251,6 @@ export default class LiteratureInboxPlugin extends Plugin {
         return true;
       },
     });
-    this.addCommand({
-      id: "clean-up-inbox",
-      name: "Clean up old arrivals (preview first)",
-      callback: () => void this.cleanUp(),
-    });
-
     // "Expand from my whole library" (the `library` kernel mode) answers a
     // different question than "I want to dig deeper into *these* specific
     // papers" — the context menu on an actual selection is how you say the
@@ -355,9 +350,8 @@ export default class LiteratureInboxPlugin extends Plugin {
 
   /**
    * Fold newly-written papers' reference lists into the persisted index, and
-   * drop any existing record whose paper no longer has a note — cleanup (or
-   * a hand-deleted file) removing a note should not leave a permanent,
-   * ever-growing record behind with nothing left for it to link.
+  * drop any existing record whose paper no longer has a note, so a deleted
+  * file does not leave stale state behind with nothing left for it to link.
    */
   private async mergeReferenceRecords(
     fresh: readonly ReferenceRecord[],
@@ -511,6 +505,33 @@ export default class LiteratureInboxPlugin extends Plugin {
     return new VaultIndex(scanned, normalizeTitle);
   }
 
+  /** Reconcile inbox state with the vault before any new papers are added. */
+  private async reconcileInboxState(vault: VaultIndex): Promise<void> {
+    const inboxPaths = new Set(await this.adapter().list(this.settings.inboxFolder));
+    const remaining: InboxRecord[] = [];
+    let changed = false;
+
+    for (const record of this.inbox) {
+      if (inboxPaths.has(record.notePath)) {
+        remaining.push(record);
+        continue;
+      }
+
+      changed = true;
+      // A note moved into Papers/ is kept. A note found nowhere is treated as
+      // a deliberate deletion and must not return on a later source fetch.
+      if (!vault.findByOrigin(record.originIds)) {
+        for (const id of record.originIds) {
+          if (!this.previouslyRemoved.includes(id)) this.previouslyRemoved.push(id);
+        }
+      }
+    }
+
+    if (!changed) return;
+    this.inbox = remaining;
+    await this.persist();
+  }
+
   private updateSettings() {
     return {
       inboxFolder: this.settings.inboxFolder,
@@ -651,7 +672,11 @@ export default class LiteratureInboxPlugin extends Plugin {
           });
           return [];
         }
-        return this.openAlex().worksCitingSince(anchors, since, cap);
+        const candidateLimit = Math.min(
+          cap * ADJACENCY_CANDIDATE_MULTIPLIER,
+          ADJACENCY_CANDIDATE_LIMIT,
+        );
+        return this.openAlex().worksCitingSince(anchors, since, candidateLimit);
       }
 
       case "topic":
@@ -771,7 +796,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       // anything outside its own markers. But the *tracked* hash must not
       // move unless the note was already untouched: if the user genuinely
       // edited this note, adding a link here must not make it look freshly
-      // generated again and newly eligible for cleanup.
+      // generated again and newly eligible for automated rewriting.
       const wasUnchanged = contentHash(content) === record.contentHash;
       const updated = mergeCitations(content, cites, []);
       if (updated === content) continue;
@@ -1071,6 +1096,7 @@ ${content.slice(marker)}`;
       const ranked = [...pool].sort((a, b) => (b.citedByCount ?? 0) - (a.citedByCount ?? 0));
 
       const vault = await this.vaultIndex();
+      await this.reconcileInboxState(vault);
       const report = await runKernel({
         works: ranked,
         vault,
@@ -1132,6 +1158,7 @@ ${content.slice(marker)}`;
       }
 
       const vault = await this.vaultIndex();
+      await this.reconcileInboxState(vault);
       const report = await runKernel({
         works,
         vault,
@@ -1184,6 +1211,7 @@ ${content.slice(marker)}`;
       // One scan of the vault, shared: adjacency selection needs to know what
       // you keep, and so does the dedup pass.
       const vault = await this.vaultIndex();
+      await this.reconcileInboxState(vault);
       const preliminary: UpdateReport = { arrived: [], skipped: [], sourceErrors: [] };
       const folderByWork = new Map<Work, string>();
       const sourceByWork = new Map<Work, string>();
@@ -1305,6 +1333,7 @@ ${content.slice(marker)}`;
 
       if (target === "papers") {
         const vault = await this.vaultIndex();
+        await this.reconcileInboxState(vault);
         const report = await runKernel({
           works,
           vault,
@@ -1325,6 +1354,7 @@ ${content.slice(marker)}`;
       }
 
       const vault = await this.vaultIndex();
+      await this.reconcileInboxState(vault);
       const { report, inbox, newReferenceRecords } = await runUpdate({
         fetched: works,
         vault,
@@ -1347,12 +1377,7 @@ ${content.slice(marker)}`;
         return;
       }
 
-      // A manual add is deliberate, so it is exempt from automatic cleanup.
-      this.inbox = inbox.map((record) =>
-        report.arrived.some((arrival) => arrival.notePath === record.notePath)
-          ? { ...record, manual: true }
-          : record,
-      );
+      this.inbox = inbox;
       await this.mergeReferenceRecords(newReferenceRecords, vault);
       const skipped = report.skipped.length ? `, ${report.skipped.length} already known` : "";
       notify(`Added ${report.arrived.length} paper(s) to ${this.settings.inboxFolder}/${skipped}.`);
@@ -1384,50 +1409,6 @@ ${content.slice(marker)}`;
     }
     await navigator.clipboard.writeText(identifier);
     notify(`Copied ${identifier} — paste it into Zotero's "Add by identifier".`);
-  }
-
-  async cleanUp(): Promise<void> {
-    if (!this.settings.pruneEnabled) {
-      notify(
-        "Cleanup is locked. Unlock it in Literature Inbox settings — nothing is ever " +
-          "removed automatically, and you will still be shown the list and asked.",
-      );
-      return;
-    }
-    const plan = await planPrune(
-      this.inbox,
-      this.adapter(),
-      this.settings.inboxFolder,
-      this.settings.keepWindowDays,
-      todayIso(),
-    );
-
-    // Records for notes that were kept (moved out) or deleted by hand are
-    // dropped from state regardless — tracking them further would be wrong.
-    if (plan.forget.length > 0) {
-      this.inbox = [...plan.retained, ...plan.prunable].map((c) => c.record);
-      await this.persist();
-    }
-
-    if (plan.prunable.length === 0) {
-      notify("Nothing to clean up — every arrival is recent, edited, or already kept.");
-      return;
-    }
-
-    new ConfirmPruneModal(this.app, plan.prunable.map((c) => c.record), async () => {
-      // Remember what's actually being removed *before* it's gone, so a
-      // later fetch that turns up the same real paper again knows to skip it
-      // — cleanup drops the record too, and would otherwise leave nothing to
-      // remember it by.
-      for (const candidate of plan.prunable) {
-        for (const id of candidate.record.originIds) {
-          if (!this.previouslyRemoved.includes(id)) this.previouslyRemoved.push(id);
-        }
-      }
-      this.inbox = await applyPrune(plan, (path) => trashNote(this.app, path));
-      await this.persist();
-      notify(`Moved ${plan.prunable.length} untouched arrival(s) to trash.`);
-    }).open();
   }
 
   /**
@@ -1574,11 +1555,10 @@ ${content.slice(marker)}`;
    * Write a read status onto a note.
    *
    * The recorded hash is deliberately **not** updated, which makes the note
-   * count as touched and takes it out of cleanup's reach for good. That is the
+  * count as touched and keeps the note in the graph. That is the
    * point: saying you have read something is engagement, and a paper you
-   * engaged with should stay in the graph. Cleanup exists to clear out
-   * arrivals you never looked at, not ones you triaged. Deleting a paper you
-   * are actually done with stays a manual act.
+  * engaged with should stay in the graph. Deleting a paper you are actually
+  * done with stays a manual act.
    */
   async setReadStatus(notePath: string, status: ReadStatus): Promise<void> {
     const adapter = this.adapter();
@@ -1930,47 +1910,6 @@ class ExpandOptionsModal extends Modal {
           this.onSubmit(this.count, this.folder);
         }),
     );
-  }
-
-  override onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-class ConfirmPruneModal extends Modal {
-  constructor(
-    app: App,
-    private readonly records: InboxRecord[],
-    private readonly onConfirm: () => Promise<void>,
-  ) {
-    super(app);
-  }
-
-  override onOpen(): void {
-    this.setTitle("Clean up these arrivals?");
-    this.contentEl.createEl("p", {
-      text:
-        `${this.records.length} arrival(s) are past the keep window and haven't ` +
-        "been edited or moved. They'll go to Obsidian's trash, so you can get " +
-        "them back.",
-    });
-    const list = this.contentEl.createEl("ul");
-    for (const record of this.records.slice(0, 25)) {
-      list.createEl("li", { text: record.title ?? record.notePath });
-    }
-    if (this.records.length > 25) {
-      this.contentEl.createEl("p", { text: `…and ${this.records.length - 25} more.` });
-    }
-
-    const buttons = this.contentEl.createDiv();
-    const confirm = buttons.createEl("button", { text: "Move to trash" });
-    confirm.addClass("mod-warning");
-    confirm.addEventListener("click", () => {
-      this.close();
-      void this.onConfirm();
-    });
-    const cancel = buttons.createEl("button", { text: "Cancel" });
-    cancel.addEventListener("click", () => this.close());
   }
 
   override onClose(): void {

@@ -9,9 +9,9 @@
  * arrivals attach themselves to. That core *is* the triage surface.
  *
  * These notes go straight into the papers folder, not the inbox: they are
- * reference material the user chose to seed, not arrivals awaiting a verdict,
- * so they are never subject to the keep window or cleanup. Consistent with
- * the rest of the design, that's expressed purely by which folder they're in.
+ * reference material the user chose to seed, not arrivals awaiting a verdict.
+ * Consistent with the rest of the design, that's expressed purely by which
+ * folder they're in.
  *
  * Run once, or again later with a bigger N or a different topic — it skips
  * anything already present, so re-running is additive rather than duplicating.

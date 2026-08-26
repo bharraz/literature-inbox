@@ -40,7 +40,7 @@ export interface SourceConfig {
 /**
  * A source's effective inbox folder, always nested under *parentInboxFolder*.
  *
- * This is what lets cleanup, "Keep this paper", and every other bit of code
+ * This is what lets state reconciliation, "Keep this paper", and every other bit of code
  * that trusts a single prefix match against the parent folder go on doing
  * exactly that without ever learning about per-source folders: whatever a
  * source is given here, the result is guaranteed to start with
