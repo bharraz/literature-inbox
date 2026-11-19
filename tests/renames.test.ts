@@ -17,8 +17,6 @@ const record = (notePath: string): InboxRecord => ({
 const state = (overrides: Partial<RenameState> = {}): RenameState => ({
   inboxFolder: "Inbox",
   papersFolder: "Papers",
-  librarySubfolder: "",
-  sources: [],
   inbox: [],
   ...overrides,
 });
@@ -61,31 +59,8 @@ describe("applyRename", () => {
     expect(applyRename(state(), "Papers", "Library").papersFolder).toBe("Library");
   });
 
-  it("keeps a source's folder written the way the user wrote it", () => {
-    const sources = [
-      { kind: "arxiv" as const, value: "cs.CL", enabled: true, inboxFolder: "ArXiv" },
-      { kind: "feed" as const, value: "https://x", enabled: true, inboxFolder: "Inbox/Feeds" },
-    ];
-
-    const parentRenamed = applyRename(state({ sources }), "Inbox", "Arrivals");
-    expect(parentRenamed.sources.map((s) => s.inboxFolder)).toEqual(["ArXiv", "Arrivals/Feeds"]);
-
-    const subfolderRenamed = applyRename(state({ sources }), "Inbox/ArXiv", "Inbox/Preprints");
-    expect(subfolderRenamed.sources.map((s) => s.inboxFolder)).toEqual(["Preprints", "Inbox/Feeds"]);
-  });
-
-  it("follows the library subfolder chosen for expansion", () => {
-    const chosen = state({ librarySubfolder: "Ions" });
-    expect(applyRename(chosen, "Papers", "Library").librarySubfolder).toBe("Ions");
-    expect(applyRename(chosen, "Papers/Ions", "Papers/Trapped Ions").librarySubfolder).toBe(
-      "Trapped Ions",
-    );
-    // Moved out of the library entirely: no longer a part of it to expand from.
-    expect(applyRename(chosen, "Papers/Ions", "Archive/Ions").librarySubfolder).toBe("");
-  });
-
   it("reports no change for a rename that touches nothing it holds", () => {
-    const before = state({ inbox: [record("Inbox/A.md")], librarySubfolder: "Ions" });
+    const before = state({ inbox: [record("Inbox/A.md")] });
     expect(applyRename(before, "Notes/Diary.md", "Notes/Journal.md").changed).toBe(false);
   });
 });

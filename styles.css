@@ -1,7 +1,6 @@
 /*
- * A feed row carries six controls — enable, URL, window, cap, test, remove —
- * which is more than Obsidian's single-line Setting layout accommodates. Left
- * alone the controls overflow the row and visibly escape its container.
+ * A source row's controls need more room than Obsidian's single-line Setting
+ * layout provides. Left alone they overflow the row.
  *
  * Allowing the control block to wrap, and giving the URL box room to grow,
  * keeps the row inside its box at any width.
@@ -97,7 +96,6 @@
 .literature-inbox-paper-properties-compact .metadata-property:is(
     [data-property-key="title"],
     [data-property-key="origin-ids"],
-    [data-property-key="source"],
     [data-property-key="fetched"],
     [data-property-key="item-type"]
   ) {

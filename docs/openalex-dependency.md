@@ -104,7 +104,6 @@ searching it — see the topic-search row below.
 | Concept lookup | `GET /concepts?search={topic}&per-page=1` | resolves free-text topics before every topic search (skipped for a bare `C…` id) | **Search**, unverified — see §5a |
 | Topic search | `?filter=concepts.id:{id}` (falls back to `default.search:{topic}` if no concept matched) | starting graph, topic arrivals | **Search** |
 | Title search | `?filter=title.search:{title}` | resolving a feed item to a real paper | **Search** |
-| Author's works | `?filter=authorships.author.id:` / `.orcid:` / `raw_author_name.search:` | author starting-graph mode | Filter / **Search** |
 | Recency window | `?filter=from_publication_date:{date}` | every arrival query | (modifier) |
 
 > **Why the concept lookup exists.** `default.search` matches the words
@@ -235,7 +234,7 @@ Each of these is a deliberate trade, not an accident:
 | Keyless tier removed | Plugin stops working on install | `openAlexApiKey` becomes required; onboarding gains a mandatory step; README's "no account" claim goes |
 | Daily allowance cut sharply | Large starting graphs become impractical | Lower `kernelSize` default; make topic search opt-in; lean harder on adjacency (filter-priced) |
 | `cites:` filter paywalled | Adjacency selection dies — arrivals stop being connected by construction. **No free substitute exists** (§5a) | Fall back to topic search plus post-hoc edge resolution; `worksCitingSince` and the `adjacent` mode retire |
-| Search calls paywalled | Topic mode dies; title backfill moves to Crossref (§5a) | Starting graph falls back to seeds/snowball/library modes (all filter-priced). `topWorks` and `worksByAuthor`'s name branch retire; `workByTitle` re-points at Crossref |
+| Search calls paywalled | Topic mode dies; title backfill moves to Crossref (§5a) | Starting graphs can still begin from pasted identifiers; `topWorks` retires and `workByTitle` re-points at Crossref |
 | `X-RateLimit-*` headers dropped | Gauge silently reverts to estimating | `budget.ts` already falls back to the local tally; only the label changes |
 | Pricing per call type changes | §2's arithmetic is wrong | Re-measure with a probe; update this file and the `ADJACENCY_BATCH` / cap constants |
 | Cursor pagination changed | Multi-page fetches break | `paginated()` in `core/openalex.ts` |

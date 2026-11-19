@@ -3,7 +3,7 @@
  *
  * Every stream is the same kind of thing — something that produces candidate
  * papers on a schedule you control — so they get one table, one mental model,
- * and the same per-row window and cap. Previously an OpenAlex topic was a text
+ * and the same global recency window plus a per-row cap. Previously an OpenAlex topic was a text
  * box with a dropdown, arXiv was a comma-separated string, and only RSS had
  * rows; three shapes for one idea.
  *
@@ -28,28 +28,10 @@ export interface SourceConfig {
    */
   value: string;
   enabled: boolean;
-  /** Days back that count as new for this row. Blank inherits the global. */
+  /** Legacy pre-global-window value, retained only while old settings migrate. */
   windowDays?: number;
   /** Ceiling on arrivals from this row per run. Blank inherits the global. */
   maxPerRun?: number;
-  /** Where this row's arrivals land. Blank means the parent inbox folder
-   * directly; anything else is nested under it — see `effectiveInboxFolder`. */
-  inboxFolder?: string;
-}
-
-/**
- * A source's effective inbox folder, always nested under *parentInboxFolder*.
- *
- * This is what lets state reconciliation, "Keep this paper", and every other bit of code
- * that trusts a single prefix match against the parent folder go on doing
- * exactly that without ever learning about per-source folders: whatever a
- * source is given here, the result is guaranteed to start with
- * `${parentInboxFolder}/` (or equal it), so scanning the parent recursively
- * already covers it. The plugin's bound is the parent folder; a per-source
- * folder is only ever a way of organizing what's inside that bound.
- */
-export function effectiveInboxFolder(source: SourceConfig, parentInboxFolder: string): string {
-  return nestUnder(source.inboxFolder ?? "", parentInboxFolder);
 }
 
 /**
@@ -163,7 +145,15 @@ export function migrateSources(
   legacy: LegacySourceSettings,
   existing: readonly SourceConfig[] | undefined,
 ): SourceConfig[] {
-  if (existing && existing.length > 0) return existing.map((source) => ({ ...source }));
+  if (existing && existing.length > 0) {
+    return existing.map(({ kind, value, enabled, windowDays, maxPerRun }) => ({
+      kind,
+      value,
+      enabled,
+      windowDays,
+      maxPerRun,
+    }));
+  }
 
   const sources: SourceConfig[] = [];
   const selection = legacy.arrivalSelection ?? "both";

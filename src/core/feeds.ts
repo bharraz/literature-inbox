@@ -25,8 +25,8 @@ export interface FeedConfig {
  * rather than asking people to know arXiv's hosting arrangement.
  *
  * RSS rather than arXiv's Atom query API on purpose: both return the same
- * metadata with no reference lists, but the feed path already has per-source
- * windows, caps and a DOI-resolution pass, and arXiv asks for a 3s gap between
+ * metadata with no reference lists, but the feed path already has caps and a
+ * DOI-resolution pass, and arXiv asks for a 3s gap between
  * API queries that the feed does not.
  */
 export function arxivCategoryFeedUrl(category: string): string {

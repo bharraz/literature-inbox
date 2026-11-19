@@ -37,7 +37,6 @@ import { arxivCategoryFeedUrl, looksLikeArxivCategory } from "./core/feeds";
 import {
   describeSource,
   effective,
-  effectiveInboxFolder,
   foldersOverlap,
   isUsable,
   migrateSources,
@@ -78,7 +77,7 @@ import {
   type BudgetState,
 } from "./core/budget";
 import { CitationIndex } from "./core/citations";
-import { GENERATED_END, mergeCitations, type SubjectOptions } from "./core/notes";
+import { GENERATED_END, mergeCitations } from "./core/notes";
 import { contentHash } from "./core/hash";
 import {
   estimateConnectivity,
@@ -110,7 +109,6 @@ type ExpandRun = (count: number, folder: string) => void;
 
 /** Where a fetched work came from, as far as writing and capping it go. */
 interface FetchOrigin {
-  folder: string;
   label: string;
   /** Distinguishes source rows, even two with the same label. */
   group: string;
@@ -294,21 +292,16 @@ export default class LiteratureInboxPlugin extends Plugin {
       callback: () => new AddByIdModal(this.app, (value) => void this.addById(value)).open(),
     });
     this.addCommand({
-      id: "copy-identifier",
-      name: "Copy this paper's identifier",
+      id: "copy-doi",
+      name: "Copy this paper's DOI",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!(file instanceof TFile)) return false;
-        if (!checking) void this.copyIdentifier(file);
-        return true;
+        const doi = this.doiForFile(file);
+        if (!checking && doi) void this.copyDoi(doi);
+        return Boolean(doi);
       },
     });
-    // "Expand from my whole library" (the `library` kernel mode) answers a
-    // different question than "I want to dig deeper into *these* specific
-    // papers" — the context menu on an actual selection is how you say the
-    // second thing, rather than a text box where you'd have to retype titles
-    // you can already see and click.
-    //
     // Papers and folders inside the library, alone or together: a subfolder
     // is usually a topic the user has been gathering by hand. The results go,
     // by default, into the deepest folder the selection shares, alongside
@@ -382,8 +375,6 @@ export default class LiteratureInboxPlugin extends Plugin {
       {
         inboxFolder: this.settings.inboxFolder,
         papersFolder: this.settings.papersFolder,
-        librarySubfolder: this.settings.kernelLibraryFolder,
-        sources: this.settings.sources,
         inbox: this.inbox,
       },
       from,
@@ -393,8 +384,6 @@ export default class LiteratureInboxPlugin extends Plugin {
     if (result.changed) {
       this.settings.inboxFolder = result.inboxFolder;
       this.settings.papersFolder = result.papersFolder;
-      this.settings.kernelLibraryFolder = result.librarySubfolder;
-      this.settings.sources = [...result.sources];
       this.inbox = [...result.inbox];
       this.queuePersist();
     }
@@ -433,8 +422,15 @@ export default class LiteratureInboxPlugin extends Plugin {
             ? "compact"
             : "all";
     }
-    if (!Object.prototype.hasOwnProperty.call(savedSettings, "authorPlacement")) {
-      this.settings.authorPlacement = savedSettings.includeAuthors === false ? "off" : "property";
+    if (!Object.prototype.hasOwnProperty.call(savedSettings, "includeSubjects")) {
+      this.settings.includeSubjects = savedSettings.subjectPlacement !== "off";
+    }
+    const savedKernelMode = (savedSettings as { kernelMode?: string }).kernelMode;
+    if (savedKernelMode === "snowball") {
+      this.settings.kernelMode = "seeds";
+      this.settings.kernelExpandSeeds = true;
+    } else if (savedKernelMode !== "topic" && savedKernelMode !== "seeds") {
+      this.settings.kernelMode = "topic";
     }
     // Sources used to be three different shapes: a toggle plus a text box for
     // OpenAlex, a comma-separated string for arXiv, and rows only for feeds.
@@ -452,6 +448,13 @@ export default class LiteratureInboxPlugin extends Plugin {
       "includeAuthors",
       "tidyProperties",
       "readStatusEnabled",
+      "kernelAuthor",
+      "kernelLibraryFolder",
+      "subjectPlacement",
+      "subjectTopics",
+      "subjectKeywords",
+      "subjectConcepts",
+      "authorPlacement",
     ] as const) {
       delete (this.settings as unknown as Record<string, unknown>)[key];
     }
@@ -730,17 +733,7 @@ export default class LiteratureInboxPlugin extends Plugin {
       inboxFolder: this.settings.inboxFolder,
       papersFolder: this.settings.papersFolder,
       maxArrivalsPerRun: this.settings.maxArrivalsPerRun,
-      authorPlacement: this.settings.authorPlacement,
-      subjects: this.subjectOptions(),
-    };
-  }
-
-  private subjectOptions(): SubjectOptions {
-    return {
-      placement: this.settings.subjectPlacement,
-      topics: this.settings.subjectTopics,
-      keywords: this.settings.subjectKeywords,
-      concepts: this.settings.subjectConcepts,
+      includeSubjects: this.settings.includeSubjects,
     };
   }
 
@@ -793,20 +786,9 @@ export default class LiteratureInboxPlugin extends Plugin {
   }
 
   /**
-   * Consult every enabled source, in the order the user listed them.
-   *
-   * Order is load-bearing: when `maxArrivalsPerRun` bites, whatever is at the
-   * front of this list survives, so a row the user put first genuinely wins.
-   * The default first row is "papers citing my library", whose results are
-   * connected by construction.
-   */
-  /**
    * *originOf* is populated as a side effect — one entry per fetched work,
-   * recording its source's effective inbox folder (see
-   * `effectiveInboxFolder`), its human-readable label, the row's own cap, and
-   * the work's place in the source's own ranking — so the caller can hand
-   * `runUpdate` the `folderFor`, `sourceFor`, `capFor` and `orderFor` that
-   * write each arrival where its row says and keep each row to its own cap.
+   * recording its source label, the row's cap, and the work's place in that
+   * source's ranking for reporting and per-source limits.
    */
   private async fetchAll(
     report: UpdateReport,
@@ -824,7 +806,6 @@ export default class LiteratureInboxPlugin extends Plugin {
     for (const [row, source] of this.settings.sources.entries()) {
       if (!isUsable(source)) continue;
       const cap = effective(source.maxPerRun, globalCap);
-      const folder = effectiveInboxFolder(source, this.settings.inboxFolder);
       const label = describeSource(source);
       try {
         const fetched = await this.fetchFrom(source, since, cap, vault, report);
@@ -832,7 +813,7 @@ export default class LiteratureInboxPlugin extends Plugin {
         // feeds and citing papers are better ranked by their dates.
         for (const [position, work] of fetched.entries()) {
           const order = source.kind === "topic" ? position : 0;
-          originOf.set(work, { folder, label, group: String(row), cap, order });
+          originOf.set(work, { label, group: String(row), cap, order });
         }
         works.push(...fetched);
       } catch (error) {
@@ -1120,24 +1101,6 @@ ${content.slice(marker)}`;
   }
 
   /**
-   * The folder the library mode expands from: the whole library, or the
-   * subfolder chosen in settings. Its results are written there too, next to
-   * the papers they grew from.
-   */
-  private libraryFolder(): string {
-    return nestUnder(this.settings.kernelLibraryFolder, this.settings.papersFolder);
-  }
-
-  /** Subfolders of the library, relative to it, for the settings dropdown. */
-  librarySubfolders(): string[] {
-    const papers = this.settings.papersFolder;
-    return this.adapter()
-      .listFolders(papers)
-      .map((path) => path.slice(papers.length + 1))
-      .sort((a, b) => a.localeCompare(b));
-  }
-
-  /**
    * Fetch the works for whichever starting-graph mode is selected.
    *
    * Returns undefined when the mode's input is missing — the caller has
@@ -1172,18 +1135,7 @@ ${content.slice(marker)}`;
       return this.openAlex().topWorks(topic, poolSize);
     }
 
-    if (mode === "author") {
-      const author = this.settings.kernelAuthor.trim();
-      if (!author) {
-        notify("Enter an author id, ORCID, or name first.");
-        return undefined;
-      }
-      notify(`Fetching up to ${size} papers by ${author}…`);
-      this.setStatus(`fetching up to ${size} papers by ${author}…`);
-      return this.openAlex().worksByAuthor(author, size);
-    }
-
-    if (mode === "seeds" || mode === "snowball") {
+    if (mode === "seeds") {
       if (!this.settings.kernelSeeds.trim()) {
         notify("Paste some DOIs or arXiv ids first.");
         return undefined;
@@ -1196,23 +1148,9 @@ ${content.slice(marker)}`;
         notify("None of those identifiers resolved to a paper.");
         return undefined;
       }
-      if (mode === "seeds") return works;
-      return this.expand(works, size);
+      return this.settings.kernelExpandSeeds ? this.expand(works, size) : works;
     }
-
-    // library
-    const folder = this.libraryFolder();
-    notify("Reading the papers you already have…");
-    this.setStatus("reading the papers you already have…");
-    const { works: seeds } = await this.seedsFromNotes(
-      await this.adapter().list(folder),
-      LIBRARY_SEED_LIMIT,
-    );
-    if (seeds.length === 0) {
-      notify(`No papers with a usable identifier in ${folder}/ — build a graph another way first.`);
-      return undefined;
-    }
-    return this.expand(seeds, size);
+    return undefined;
   }
 
   /** Seeds plus their references and citers. */
@@ -1278,8 +1216,8 @@ ${content.slice(marker)}`;
   /**
    * Expand outward from every paper in one folder of the library — the
    * right-click "Expand outward from papers in this folder". Results land in
-   * that folder unless the user picks another, and a large folder is capped
-   * at the same number of seeds as the whole-library mode.
+   * that folder unless the user picks another, and a large folder uses a
+   * bounded number of seeds.
    */
   async expandFromFolder(folder: string, options?: { count?: number; folder?: string }): Promise<void> {
     if (!this.isInLibrary(folder)) {
@@ -1296,9 +1234,8 @@ ${content.slice(marker)}`;
   /**
    * Expand outward from whatever was right-clicked: notes, folders, or both.
    * Papers picked one by one are all used; a folder can hold hundreds, so
-   * once folders are involved the seeds are capped like the whole-library
-   * mode — with the hand-picked papers first, so they are never the ones
-   * left out.
+   * once folders are involved the seeds are capped, with hand-picked papers
+   * first so they are never the ones left out.
    */
   async expandFromSelection(
     paperPaths: readonly string[],
@@ -1317,9 +1254,7 @@ ${content.slice(marker)}`;
   }
 
   /**
-   * Expand outward from specific papers the user picked (context menu on a
-   * file selection), rather than the whole library — "I want to dig deeper
-   * into *these*" is a different request than "grow everything I have."
+   * Expand outward from specific papers the user picked in the file explorer.
    *
    * Over-fetches a pool beyond `kernelSize` and lets `runKernel`'s balanced
    * selection pick the best `kernelSize` of it — same reasoning as the topic
@@ -1394,8 +1329,7 @@ ${content.slice(marker)}`;
         papersFolder: targetFolder,
         adapter: this.adapter(),
         today: todayIso(),
-        authorPlacement: this.settings.authorPlacement,
-        subjects: this.subjectOptions(),
+        includeSubjects: this.settings.includeSubjects,
         inbox: this.inbox,
         targetCount: size,
         onProgress: (written, total) => {
@@ -1451,16 +1385,14 @@ ${content.slice(marker)}`;
 
       const vault = await this.vaultIndex();
       await this.reconcileInboxState(vault);
-      const target =
-        this.settings.kernelMode === "library" ? this.libraryFolder() : this.settings.papersFolder;
+      const target = this.settings.papersFolder;
       const report = await runKernel({
         works,
         vault,
         papersFolder: target,
         adapter: this.adapter(),
         today: todayIso(),
-        authorPlacement: this.settings.authorPlacement,
-        subjects: this.subjectOptions(),
+        includeSubjects: this.settings.includeSubjects,
         inbox: this.inbox,
         // Only topic mode over-fetches a pool bigger than what it wants
         // written; every other mode already fetched exactly its input.
@@ -1537,7 +1469,6 @@ ${content.slice(marker)}`;
             adapter: this.adapter(),
             today: todayIso(),
             previouslyRemoved: this.previouslyRemoved,
-            folderFor: (work) => originOf.get(work)?.folder ?? this.settings.inboxFolder,
             sourceFor: (work) => originOf.get(work)?.label ?? "Unknown source",
             capFor: (work) => {
               const origin = originOf.get(work);
@@ -1674,8 +1605,7 @@ ${content.slice(marker)}`;
           papersFolder: this.settings.papersFolder,
           adapter: this.adapter(),
           today: todayIso(),
-          authorPlacement: this.settings.authorPlacement,
-          subjects: this.subjectOptions(),
+          includeSubjects: this.settings.includeSubjects,
           inbox: this.inbox,
         });
         await this.mergeReferenceRecords(report.newReferenceRecords, vault);
@@ -1728,111 +1658,44 @@ ${content.slice(marker)}`;
     await this.addByIds(rawValue, "inbox");
   }
 
-  async copyIdentifier(file: TFile): Promise<void> {
+  private doiForFile(file: TFile): string | undefined {
     const cache = this.app.metadataCache.getFileCache(file);
     const frontmatter = cache?.frontmatter ?? {};
-    const identifier =
-      (frontmatter.doi as string | undefined) ??
-      (frontmatter.url as string | undefined) ??
-      (Array.isArray(frontmatter["origin-ids"])
-        ? (frontmatter["origin-ids"][0] as string)
-        : undefined);
-    if (!identifier) {
-      notify("No identifier recorded on this note.");
-      return;
-    }
-    await navigator.clipboard.writeText(identifier);
-    notify(`Copied ${identifier} — paste it into Zotero's "Add by identifier".`);
+    const property = typeof frontmatter.doi === "string" ? frontmatter.doi.trim() : "";
+    if (property) return property.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
+    if (!Array.isArray(frontmatter["origin-ids"])) return undefined;
+    return (frontmatter["origin-ids"] as unknown[])
+      .find((id): id is string => typeof id === "string" && id.startsWith("doi:"))
+      ?.slice("doi:".length);
   }
 
-  /**
-   * Fetch a source once and report what came back.
-   *
-   * A feed or category that is dead, mistyped, or not actually a feed is
-   * otherwise indistinguishable from one that simply has nothing new — you
-   * find out three empty updates later, if at all. Deliberately ignores the
-   * row's on/off switch: testing before switching a source on is the normal
-   * order.
-   */
-  async testFeeds(onlyUrl?: string): Promise<void> {
-    const urls = (
-      onlyUrl
-        ? [onlyUrl]
-        : this.settings.sources
-            .filter((source) => source.kind === "feed")
-            .map((source) => source.value)
-    )
-      .map((url) => url.trim())
-      .filter(Boolean);
-    if (urls.length === 0) {
-      notify("Add a feed URL first.");
-      return;
-    }
-    await this.reportSources(urls.map((url) => ({ label: url, url })));
+  private async copyDoi(doi: string): Promise<void> {
+    await navigator.clipboard.writeText(doi);
+    notify(`Copied DOI ${doi}.`);
   }
 
-  /**
-   * Fetch each arXiv category once and report what came back.
-   *
-   * A misspelled category is not an error at arXiv's end — `quant-ph` works,
-   * `quantph` simply returns an empty feed. Without a check that is
-   * indistinguishable from a quiet week.
-   */
-  async testArxivCategories(onlyCategory?: string): Promise<void> {
-    const categories = (
-      onlyCategory
-        ? [onlyCategory]
-        : this.settings.sources
-            .filter((source) => source.kind === "arxiv")
-            .map((source) => source.value)
-    )
-      .map((category) => category.trim())
-      .filter(Boolean);
-    if (categories.length === 0) {
-      notify("Enter an arXiv category first, e.g. quant-ph.");
-      return;
+  /** Validate a feed-like source before it is added to settings. */
+  async validateSource(kind: SourceConfig["kind"], value: string): Promise<boolean> {
+    if (kind !== "feed" && kind !== "arxiv") return true;
+    if (kind === "arxiv" && !looksLikeArxivCategory(value)) {
+      notify(`"${value}" is not an arXiv category name.`);
+      return false;
     }
-
-    const targets = categories.map((category) => ({
-      label: category,
-      url: looksLikeArxivCategory(category) ? arxivCategoryFeedUrl(category) : undefined,
-      // arXiv skips Saturday and Sunday: a valid category legitimately shows
-      // zero items on those days, which otherwise looks identical to a typo.
-      emptyHint: "arXiv doesn't publish new listings on Saturdays or Sundays — a category that is otherwise correct can show zero items on those days.",
-    }));
-    await this.reportSources(targets);
+    const url = kind === "arxiv" ? arxivCategoryFeedUrl(value) : value;
+    notify(`Checking ${kind === "arxiv" ? value : "feed"}…`);
+    try {
+      const works = await fetchFeed(this.transport(), url, { maxRetries: 0 });
+      const newest = newestItem(works);
+      const detail = newest?.title ? ` Most recent: ${newest.title}.` : "";
+      notify(`Source is reachable (${works.length} item(s)).${detail}`);
+      return true;
+    } catch (error) {
+      notify(`Could not add source: ${String(error)}`);
+      return false;
+    }
   }
 
-  /** Fetch each target once and show what it returned. */
-  private async reportSources(
-    targets: { label: string; url?: string; emptyHint?: string }[],
-  ): Promise<void> {
-    notify(`Testing ${targets.length} source(s)…`);
-    const results: FeedTestResult[] = [];
-    for (const target of targets) {
-      if (!target.url) {
-        results.push({ url: target.label, count: 0, error: "not an arXiv category name" });
-        continue;
-      }
-      try {
-        // No retries: this is a diagnostic, and a user waiting on a button
-        // wants the answer now rather than three backoffs later.
-        const works = await fetchFeed(this.transport(), target.url, { maxRetries: 0 });
-        const newest = newestItem(works);
-        results.push({
-          url: target.label,
-          count: works.length,
-          newestTitle: newest?.title,
-          newestDate: newest?.date,
-          emptyHint: target.emptyHint,
-        });
-      } catch (error) {
-        results.push({ url: target.label, count: 0, error: String(error) });
-      }
-    }
-    new FeedTestModal(this.app, results).open();
-  }
-
+  /** Preview a topic query before building a starting graph from it. */
   async previewTopic(): Promise<void> {
     const topic = this.settings.openAlexTopic.trim();
     if (!topic) {
@@ -1983,56 +1846,8 @@ class RunReportModal extends Modal {
   }
 }
 
-interface FeedTestResult {
-  url: string;
-  count: number;
-  newestTitle?: string;
-  newestDate?: string;
-  error?: string;
-  emptyHint?: string;
-}
-
 /** What a feed actually returned, per URL — a count alone doesn't tell you
  * whether you subscribed to the right thing. */
-class FeedTestModal extends Modal {
-  constructor(app: App, private readonly results: FeedTestResult[]) {
-    super(app);
-  }
-
-  override onOpen(): void {
-    this.setTitle("Feed test");
-    for (const result of this.results) {
-      const block = this.contentEl.createDiv();
-      block.createEl("p", { text: result.url });
-      if (result.error) {
-        block.createEl("p", {
-          cls: "setting-item-description",
-          text: `Could not be read — ${result.error}`,
-        });
-        continue;
-      }
-      if (result.count === 0) {
-        block.createEl("p", {
-          cls: "setting-item-description",
-          text:
-            result.emptyHint ??
-            "Reachable, but no items — probably not a feed URL, or an empty feed.",
-        });
-        continue;
-      }
-      const dated = result.newestDate ? ` (${result.newestDate})` : "";
-      block.createEl("p", {
-        cls: "setting-item-description",
-        text: `${result.count} item(s). Most recent: ${result.newestTitle ?? "untitled"}${dated}`,
-      });
-    }
-  }
-
-  override onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
 class AddByIdModal extends Modal {
   private value = "";
 

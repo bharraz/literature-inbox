@@ -137,26 +137,7 @@ describe("runUpdate", () => {
     expect(inbox[0]?.arrivedOn).toBe(today);
   });
 
-  it("writes each arrival to folderFor's answer, when supplied", async () => {
-    const adapter = new MemoryVault();
-    const arxivPaper = paper("W1", "From ArXiv");
-    const topicPaper = paper("W2", "From Topic");
-    await runUpdate({
-      fetched: [arxivPaper, topicPaper],
-      vault: emptyVault(),
-      inbox: [],
-      settings,
-      adapter,
-      today,
-      folderFor: (work) => (work === arxivPaper ? "Inbox/ArXiv" : "Inbox"),
-    });
-
-    expect(adapter.files.has("Inbox/ArXiv/From ArXiv.md")).toBe(true);
-    expect(adapter.files.has("Inbox/From Topic.md")).toBe(true);
-    expect(adapter.folders.has("Inbox/ArXiv")).toBe(true);
-  });
-
-  it("falls back to settings.inboxFolder when folderFor is omitted", async () => {
+  it("writes every arrival to the configured inbox tree", async () => {
     const adapter = new MemoryVault();
     await runUpdate({
       fetched: [paper("W1", "Plain Arrival")],

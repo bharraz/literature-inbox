@@ -41,14 +41,14 @@ folders track moves while static tags do not.
 ## Nothing runs on its own
 
 There is no timer, scheduler, or background fetch. Network requests happen
-only when you run an update, add papers, or explicitly test a source. The
-plugin never removes a note.
+only when you run an update or add papers. Feed and arXiv sources are checked
+when you add them. The plugin never removes a note.
 
 ## Sources and their ergonomics
 
-Sources are configurable rows with independent on/off switches, per-run caps,
-and optional inbox subfolders. The plugin fetches extra candidates, removes
-papers already seen or dismissed, then keeps the best results per source.
+Sources are configurable rows with independent on/off switches and per-run
+caps. The plugin fetches extra candidates, removes papers already seen or
+dismissed, then keeps the best results per source.
 
 - **Papers citing my library** — recent papers citing something under
   `Papers/`; connected by construction and ranked by the specificity of those
@@ -78,17 +78,13 @@ and reported rather than duplicated.
 
 ## Starting from your own library
 
-**Add papers to your graph** can start from:
-
-- a topic;
-- pasted DOI or arXiv identifiers;
-- an OpenAlex author or ORCID;
-- references and citers around seed papers; or
-- papers already under `Papers/`, including one subfolder or a selected set.
+**Add papers to your graph** can start from a topic or pasted DOI/arXiv
+identifiers. Pasted papers can optionally bring in their references and
+citers too.
 
 For Zotero, copy a bibliography that includes DOIs and paste it into the seed
-input. **Copy this paper's identifier** provides a DOI or arXiv identifier for
-Zotero's *Add by Identifier*.
+input. **Copy this paper's DOI** copies the active paper's DOI for Zotero's
+*Add by Identifier*; it is available only when the note has a DOI.
 
 ## Privacy and network access
 
@@ -111,7 +107,7 @@ Zotero's *Add by Identifier*.
 | **Add papers to your graph** | Build or expand the kept-paper graph. |
 | **Keep this paper** | Move the active arrival into `Papers/`. |
 | **Add a paper by DOI or arXiv id** | Add one paper on demand. |
-| **Copy this paper's identifier** | Copy its DOI, arXiv identifier, or URL. |
+| **Copy this paper's DOI** | Copy its DOI. |
 
 Right-click papers or folders under `Papers/` and choose **Expand outward** to
 add their references and citers to the shared folder.

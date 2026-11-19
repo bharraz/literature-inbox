@@ -14,7 +14,6 @@
  * one module whose job that is.
  */
 
-import { nestUnder, type SourceConfig } from "./sources";
 import type { InboxRecord } from "./update";
 
 /**
@@ -30,10 +29,6 @@ export function renamedPath(path: string, from: string, to: string): string | un
 export interface RenameState {
   inboxFolder: string;
   papersFolder: string;
-  /** The library subfolder to expand from, relative to `papersFolder`; blank
-   * for the whole library. */
-  librarySubfolder: string;
-  sources: readonly SourceConfig[];
   inbox: readonly InboxRecord[];
 }
 
@@ -60,43 +55,10 @@ export function applyRename(state: RenameState, from: string, to: string): Renam
   const inboxFolder = follow(state.inboxFolder);
   const papersFolder = follow(state.papersFolder);
 
-  // A source's own folder is resolved against the *old* inbox folder, moved,
-  // then stored the way the user wrote it: blank when it is the inbox itself,
-  // relative when they typed it relative.
-  const sources = state.sources.map((source) => {
-    const typed = (source.inboxFolder ?? "").trim();
-    if (!typed) return source;
-    const before = nestUnder(typed, state.inboxFolder);
-    const after = follow(before);
-    if (after === before && inboxFolder === state.inboxFolder) return source;
-    const wasRelative = !typed.replace(/^\/+/, "").startsWith(`${state.inboxFolder}/`);
-    let stored = after;
-    if (after === inboxFolder) stored = "";
-    else if (wasRelative && after.startsWith(`${inboxFolder}/`)) {
-      stored = after.slice(inboxFolder.length + 1);
-    }
-    if (stored === source.inboxFolder) return source;
-    changed = true;
-    return { ...source, inboxFolder: stored };
-  });
-
-  // Stored relative to the library, so renaming the library itself changes
-  // nothing here; a subfolder moved out of the library is no longer one to
-  // expand from, and falls back to the whole library.
-  let librarySubfolder = state.librarySubfolder;
-  if (librarySubfolder.trim()) {
-    const after = follow(nestUnder(librarySubfolder, state.papersFolder));
-    const relative = after.startsWith(`${papersFolder}/`) ? after.slice(papersFolder.length + 1) : "";
-    if (relative !== librarySubfolder) {
-      changed = true;
-      librarySubfolder = relative;
-    }
-  }
-
   const inbox = state.inbox.map((record) => {
     const notePath = follow(record.notePath);
     return notePath === record.notePath ? record : { ...record, notePath };
   });
 
-  return { inboxFolder, papersFolder, librarySubfolder, sources, inbox, changed };
+  return { inboxFolder, papersFolder, inbox, changed };
 }

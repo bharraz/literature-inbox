@@ -82,8 +82,6 @@ export function renderFrontmatter(fields: Array<[string, FrontmatterValue | unde
 
 export interface InboxNoteOptions {
   work: Work;
-  /** Where author names appear in a generated note. */
-  authorPlacement?: AuthorPlacement;
   /** Note filenames (no extension) this work cites that exist in the vault. */
   cites?: string[];
   /** Note filenames that cite this work. */
@@ -91,38 +89,8 @@ export interface InboxNoteOptions {
   /** ISO date the paper arrived, used by the keep window. */
   arrivedOn: string;
   originIds: string[];
-  /** How subject terms reach the note, if at all. */
-  subjects?: SubjectOptions;
-}
-
-export type AuthorPlacement = "off" | "property" | "plaintext";
-
-/** Where subject terms go, and which vocabularies they come from. */
-export interface SubjectOptions {
-  placement: "off" | "property" | "tags";
-  topics?: boolean;
-  keywords?: boolean;
-  concepts?: boolean;
-}
-
-/**
- * Fold a subject term into something usable as an Obsidian tag.
- *
- * Tags cannot contain spaces, and a tag that is entirely numeric is not a
- * valid tag either. Terms that survive neither rule are dropped rather than
- * mangled into nonsense.
- */
-export function tagify(term: string): string | undefined {
-  const slug = term
-    .trim()
-    .toLowerCase()
-    .replace(/['’]/g, "")
-    .replace(/[^a-z0-9/-]+/g, "-")
-    .replace(/-{2,}/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!slug) return undefined;
-  if (/^[\d/-]+$/.test(slug)) return undefined; // a purely numeric tag is invalid
-  return slug;
+  /** Whether OpenAlex Topics appear as a property. */
+  includeSubjects?: boolean;
 }
 
 /**
@@ -132,16 +100,19 @@ export function tagify(term: string): string | undefined {
  */
 export const MAX_NOTE_SUBJECTS = 8;
 
-/** The chosen vocabularies, in the order most-curated first, de-duplicated. */
-export function collectSubjects(work: Work, options: SubjectOptions): string[] {
-  const terms: string[] = [];
-  const push = (list: string[]) => {
-    for (const term of list) if (!terms.includes(term)) terms.push(term);
-  };
-  if (options.topics) push(work.topics);
-  if (options.keywords) push(work.keywords);
-  if (options.concepts) push(work.concepts);
-  return terms.slice(0, MAX_NOTE_SUBJECTS);
+/** OpenAlex Topics, de-duplicated in source order. */
+export function collectSubjects(work: Work): string[] {
+  return [...new Set(work.topics)].slice(0, MAX_NOTE_SUBJECTS);
+}
+
+/** Clickable provenance kept in the readable note body, not frontmatter. */
+function renderSourceLinks(originIds: readonly string[]): string {
+  const links: string[] = [];
+  const openAlex = originIds.find((id) => id.startsWith("openalex:"))?.slice("openalex:".length);
+  const arxiv = originIds.find((id) => id.startsWith("arxiv:"))?.slice("arxiv:".length);
+  if (openAlex) links.push(`[OpenAlex](https://openalex.org/${encodeURIComponent(openAlex)})`);
+  if (arxiv) links.push(`[arXiv](https://arxiv.org/abs/${encodeURI(arxiv)})`);
+  return links.length > 0 ? `**Sources:** ${links.join(" · ")}\n` : "";
 }
 
 function renderCitations(cites: string[], citedBy: string[]): string {
@@ -169,37 +140,22 @@ function renderCitationsBlock(cites: string[], citedBy: string[]): string {
 
 export function renderInboxNote(options: InboxNoteOptions): string {
   const { work, arrivedOn, originIds } = options;
-  const authorPlacement = options.authorPlacement ?? "plaintext";
   const cites = options.cites ?? [];
   const citedBy = options.citedBy ?? [];
-
-  const subjects = options.subjects ?? { placement: "off" };
-  const terms = subjects.placement === "off" ? [] : collectSubjects(work, subjects);
-  const asTags =
-    subjects.placement === "tags"
-      ? terms.map(tagify).filter((tag): tag is string => Boolean(tag))
-      : [];
+  const terms = options.includeSubjects ? collectSubjects(work) : [];
 
   const frontmatter = renderFrontmatter([
     // What a reader looks at first, in the order they look for it. Every
     // author, always — a shortened list would be a wrong record of the paper.
     ["title", work.title],
-    [
-      "authors",
-      authorPlacement === "property" ? work.authors.map(fullName).filter(Boolean) : undefined,
-    ],
+    ["authors", work.authors.map(fullName).filter(Boolean)],
     ["year", workYear(work)],
     ["publication", work.publication],
     ["doi", work.doi],
     ["url", work.url],
-    ["subjects", subjects.placement === "property" ? terms : undefined],
-    ["tags", asTags.length > 0 ? asTags : undefined],
-    // Then what the plugin keeps for itself, last — and folded out of the
-    // properties panel by "Tidy note properties". Provenance: a note always
-    // says where it came from and when, so nothing in the vault is of
-    // mysterious origin.
+    ["subjects", terms.length > 0 ? terms : undefined],
+    // Then what the plugin keeps for itself, last and hidden in compact mode.
     ["item-type", work.itemType],
-    ["source", work.source],
     ["fetched", arrivedOn],
     ["origin-ids", originIds],
     // Deliberately no `inbox`/`kept` tag. The folder is the source of truth
@@ -214,8 +170,8 @@ export function renderInboxNote(options: InboxNoteOptions): string {
   // would split the note's heading in two and orphan the rest of the title.
   const title = (work.title || work.key).replace(/\s+/g, " ").trim();
   const parts = [`# ${title}\n`];
-  const authorLine = work.authors.map(fullName).filter(Boolean).join(", ");
-  if (authorPlacement === "plaintext" && authorLine) parts.push(`**Authors:** ${authorLine}\n`);
+  const sourceLinks = renderSourceLinks(originIds);
+  if (sourceLinks) parts.push(sourceLinks);
   parts.push(`## Abstract\n\n${work.abstract?.trim() || NO_ABSTRACT_PLACEHOLDER}\n`);
   const citations = renderCitationsBlock(cites, citedBy);
   if (citations) parts.push(citations);

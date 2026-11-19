@@ -19,8 +19,6 @@ import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeI
 import {
   mergeCitations,
   renderInboxNote,
-  type AuthorPlacement,
-  type SubjectOptions,
 } from "./notes";
 import { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
@@ -59,8 +57,7 @@ export interface UpdateSettings {
   inboxFolder: string;
   papersFolder: string;
   maxArrivalsPerRun: number;
-  authorPlacement?: AuthorPlacement;
-  subjects?: SubjectOptions;
+  includeSubjects?: boolean;
 }
 
 export type SkipReason =
@@ -145,14 +142,6 @@ export interface UpdateRunInput {
   * a manual add so the explicitly requested paper is always allowed.
    */
   previouslyRemoved?: readonly string[];
-  /**
-   * Where a given work should be written, when it isn't just
-   * `settings.inboxFolder` — a per-source folder override. Must always
-   * return a path nested under (or equal to) `settings.inboxFolder`; see
-   * `effectiveInboxFolder`, which is what a caller should build this from.
-   * Omit to write everything into `settings.inboxFolder` directly.
-   */
-  folderFor?: (work: Work) => string;
   /**
    * Every paper's own reference list, as captured the run it was first
    * written — see `ReferenceRecord`. Omit to skip the retroactive pass
@@ -315,7 +304,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
 
   const accepted: { work: Work; noteName: string; ids: string[]; folder: string }[] = [];
   for (const { work, ids } of kept) {
-    const folder = input.folderFor?.(work) ?? settings.inboxFolder;
+    const folder = settings.inboxFolder;
     const noteName = await allocateUnused(allocator, work, folder, (path) => adapter.exists(path));
     accepted.push({ work, noteName, ids, folder });
   }
@@ -370,12 +359,11 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     const notePath = `${folder}/${entry.noteName}.md`;
     const content = renderInboxNote({
       work: entry.work,
-      authorPlacement: settings.authorPlacement,
+      includeSubjects: settings.includeSubjects,
       cites,
       citedBy,
       arrivedOn: today,
       originIds: entry.ids,
-      subjects: settings.subjects,
     });
     await adapter.write(notePath, content);
     inbox.push({

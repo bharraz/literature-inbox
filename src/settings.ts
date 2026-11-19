@@ -2,7 +2,6 @@ import { PluginSettingTab, Setting, type App } from "obsidian";
 import { ARXIV_CATEGORIES, CUSTOM_ARXIV_CATEGORY, isKnownArxivCategory } from "./core/arxiv-categories";
 import { DEFAULT_RECENCY_WINDOW_DAYS } from "./core/dates";
 import { type FeedConfig } from "./core/feeds";
-import type { AuthorPlacement } from "./core/notes";
 import {
   SOURCE_LABELS,
   SOURCE_PLACEHOLDERS,
@@ -16,14 +15,11 @@ import type LiteratureInboxPlugin from "./main";
  * Ways to build the starting graph. Ordered as the dropdown shows them:
  * cheapest input first, most personal last.
  */
-export type KernelMode = "topic" | "seeds" | "snowball" | "author" | "library";
+export type KernelMode = "topic" | "seeds";
 
 export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
   topic: "Top-cited papers on a topic",
-  seeds: "A list of papers I paste",
-  snowball: "Papers I paste, plus connected citations",
-  author: "Everything by one author",
-  library: "Expand outward from papers I already have",
+  seeds: "Papers I paste",
 };
 
 /** Which question an update asks OpenAlex. */
@@ -74,16 +70,10 @@ export interface LiteratureInboxSettings {
    * and give them their own neighbourhood instead.
    */
   kernelMode: KernelMode;
-  /** Pasted DOIs / arXiv ids, for the `seeds` and `snowball` modes. */
+  /** Pasted DOIs / arXiv ids. */
   kernelSeeds: string;
-  /** OpenAlex author id, ORCID, or name, for the `author` mode. */
-  kernelAuthor: string;
-  /**
-   * For the `library` mode: the subfolder of the library to expand from,
-   * relative to `papersFolder`, and where its results are written. Blank
-   * means the whole library.
-   */
-  kernelLibraryFolder: string;
+  /** Expand pasted papers with their references and citers. */
+  kernelExpandSeeds: boolean;
 
   /**
    * What "new" means, in days back from today — one number for every source.
@@ -95,15 +85,17 @@ export interface LiteratureInboxSettings {
 
   maxArrivalsPerRun: number;
 
-  /** Where OpenAlex's subject terms go in a generated note, if anywhere. */
-  subjectPlacement: "off" | "property" | "tags";
-  subjectTopics: boolean;
-  subjectKeywords: boolean;
-  subjectConcepts: boolean;
+  /** Include OpenAlex's curated Topics as a note property. */
+  includeSubjects: boolean;
 
-  /** Where author names go in generated notes. */
-  authorPlacement: AuthorPlacement;
-  /** Legacy setting migrated to authorPlacement on load. */
+  /** Pre-1.3 note-content and starting-graph settings, removed after migration. */
+  kernelAuthor?: string;
+  kernelLibraryFolder?: string;
+  subjectPlacement?: "off" | "property" | "tags";
+  subjectTopics?: boolean;
+  subjectKeywords?: boolean;
+  subjectConcepts?: boolean;
+  authorPlacement?: "off" | "property" | "plaintext";
   includeAuthors?: boolean;
 
   /** Display-only treatment of the inline properties panel in paper notes. */
@@ -144,19 +136,12 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   kernelSize: 20,
   kernelMode: "topic",
   kernelSeeds: "",
-  kernelAuthor: "",
-  kernelLibraryFolder: "",
+  kernelExpandSeeds: false,
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 3,
-  // Terms as a property by default, never as tags: tags show up in the tag
-  // pane and the graph, and a vault-wide dump of machine-assigned subject
-  // terms is exactly the clutter people rightly fear. Concepts stays off for
-  // the same reason — it is the broadest and noisiest of the three.
-  subjectPlacement: "property",
-  subjectTopics: true,
-  subjectKeywords: true,
-  subjectConcepts: false,
-  authorPlacement: "property",
+  // Topics as a property by default, never as tags: tags show up in the tag
+  // pane and graph, where machine-assigned subjects become clutter.
+  includeSubjects: true,
   propertyDisplay: "hidden",
   openAlexApiKey: "",
   crossrefEnabled: true,
@@ -234,8 +219,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
    *
    * Deliberately in requests rather than currency: the allowance is metered,
    * but the user pays nothing, and a dollar figure implies a bill that does
-   * not exist. Placed here because the expensive actions — building a graph,
-   * snowballing — are two clicks below it.
+   * not exist. Placed here because graph-building actions are two clicks below.
    */
   private renderBudget(containerEl: HTMLElement): void {
     const budget = this.plugin.budgetGauge();
@@ -275,12 +259,8 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   }
 
   /**
-   * The starting graph, in five flavours, plus the library directory itself.
-   *
-   * Only the input the chosen mode actually needs is shown — five modes with
-   * every field visible at once is exactly the settings-page clutter this is
-   * meant to avoid. Changing the mode re-renders the tab, which is cheap and
-   * keeps the page honest about what it will use.
+   * The starting graph and library directory. Only the input the chosen mode
+   * needs is shown; changing mode re-renders the tab.
    */
   private renderStartingGraph(containerEl: HTMLElement): void {
     const mode = this.plugin.settings.kernelMode;
@@ -303,9 +283,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         });
       });
 
-    // The topic field belongs to the modes that use it, not to the top of the
-    // page — it was step 1 of onboarding while doing nothing at all in four of
-    // the five modes.
+    // The topic field belongs to the mode that uses it.
     if (mode === "topic") {
       new Setting(containerEl)
         .setName("Topic")
@@ -334,7 +312,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
         );
     }
 
-    if (mode === "seeds" || mode === "snowball") {
+    if (mode === "seeds") {
       new Setting(containerEl)
         .setName("Papers to start from")
         .setDesc(
@@ -343,11 +321,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
             "select items, right-click → Create Bibliography from Items → a style that " +
             "includes DOIs (APA works) → Copy to Clipboard, then paste here — no export " +
             "file needed. Full URLs are fine. Anything unrecognised is reported, never " +
-            "silently skipped." +
-            (mode === "snowball"
-              ? " Each one is expanded with what it cites and what cites it, so a few " +
-                "papers become a neighbourhood."
-              : ""),
+            "silently skipped.",
         )
         .addTextArea((text) =>
           text
@@ -358,68 +332,30 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
             }),
         );
-    }
 
-    if (mode === "author") {
       new Setting(containerEl)
-        .setName("Author")
+        .setName("Expand around these papers")
         .setDesc(
-          "An OpenAlex author id (A5023888391) or an ORCID is exact. A plain name is a " +
-            "search, so it can merge two people who share one — check the result.",
+          "Also add papers they cite and papers that cite them. Leave this off to add " +
+            "only the identifiers you pasted.",
         )
-        .addText((text) =>
-          text
-            .setPlaceholder("0000-0002-1825-0097")
-            .setValue(this.plugin.settings.kernelAuthor)
-            .onChange(async (value) => {
-              this.plugin.settings.kernelAuthor = value.trim();
-              await this.plugin.saveSettings();
-            }),
-        );
-    }
-
-    if (mode === "library") {
-      containerEl.createEl("p", {
-        cls: "setting-item-description",
-        text:
-          "Takes papers you already have and pulls in what they cite and what cites them. " +
-          "The most personal starting graph available, and it needs no typing. To dig into " +
-          "a few specific papers or folders instead, select them in the file explorer, " +
-          'right-click, and choose "Expand outward".',
-      });
-
-      const papers = this.plugin.settings.papersFolder;
-      const chosen = this.plugin.settings.kernelLibraryFolder;
-      const subfolders = this.plugin.librarySubfolders();
-      new Setting(containerEl)
-        .setName("From")
-        .setDesc(
-          "Your whole library, or one subfolder of it. When it's a subfolder, the new papers " +
-            "are added to that subfolder too.",
-        )
-        .addDropdown((dropdown) => {
-          dropdown.addOption("", `Whole library (${papers}/)`);
-          for (const folder of subfolders) dropdown.addOption(folder, `${papers}/${folder}`);
-          // Renamed or deleted since it was chosen: still shown, rather than
-          // silently snapping back to the whole library.
-          if (chosen && !subfolders.includes(chosen)) {
-            dropdown.addOption(chosen, `${papers}/${chosen} (not found)`);
-          }
-          dropdown.setValue(chosen).onChange(async (value) => {
-            this.plugin.settings.kernelLibraryFolder = value;
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.settings.kernelExpandSeeds).onChange(async (value) => {
+            this.plugin.settings.kernelExpandSeeds = value;
             await this.plugin.saveSettings();
-          });
-        });
+            this.display();
+          }),
+        );
     }
 
     // Hidden in "seeds" mode, where it does nothing: you get exactly the
     // papers you pasted. A control that is present but inert teaches people
     // not to trust the ones next to it.
-    if (mode !== "seeds") {
+    if (mode === "topic" || this.plugin.settings.kernelExpandSeeds) {
       new Setting(containerEl)
         .setName("How many papers to add")
         .setDesc(
-          mode === "snowball" || mode === "library"
+          mode === "seeds"
             ? "A ceiling on what the expansion adds, beyond the papers you started from."
             : "More papers means a denser core, but a longer first run.",
         )
@@ -526,9 +462,9 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Parent inbox folder")
       .setDesc(
-        "Every source's own folder below (and this one, when a source leaves it blank) " +
-          "nests under this one. Together with the library directory (set above), this is " +
-          "the plugin's whole bound — it never reads or writes anywhere else in your vault.",
+        "Every arrival lands somewhere under this tree. Together with the library " +
+          "directory (set above), this is the plugin's whole bound — it never reads or " +
+          "writes anywhere else in your vault.",
       )
       .addText((text) =>
         text
@@ -566,7 +502,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       label("Source");
       label("On/off");
       label("Papers per run");
-      label("Folder");
       label(""); // remove button's column
     }
 
@@ -608,16 +543,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
       );
 
-      row.addText((text) =>
-        text
-          .setPlaceholder("Inbox subfolder for this source")
-          .setValue(source.inboxFolder?.trim() || this.plugin.settings.inboxFolder)
-          .onChange(async (value) => {
-            source.inboxFolder = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
       row.addButton((button) =>
         button
           .setButtonText("Remove")
@@ -639,10 +564,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       });
     }
 
-    // A row being configured, not yet a source: no toggle, no remove button,
-    // because neither means anything until "Add source" commits it. Test
-    // sits right next to Add — and only here, since a real row is watching
-    // something already known to work.
+    // A row being configured, not yet a source: no toggle or remove button.
     const draft = new Setting(containerEl).setName("Add a source");
 
     draft.addDropdown((dropdown) => {
@@ -661,18 +583,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       });
     }
 
-    if (this.draftKind === "feed" || this.draftKind === "arxiv") {
-      draft.addButton((button) =>
-        button
-          .setButtonText("Test")
-          .setTooltip("Fetch this once and report what came back, before adding it")
-          .onClick(() => {
-            if (this.draftKind === "arxiv") void this.plugin.testArxivCategories(this.draftValue);
-            else void this.plugin.testFeeds(this.draftValue);
-          }),
-      );
-    }
-
     draft.addButton((button) =>
       button
         .setButtonText("Add source")
@@ -681,6 +591,7 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           const kind = this.draftKind;
           const value = needsValue(kind) ? this.draftValue.trim() : "";
           if (needsValue(kind) && !value) return; // nothing to add yet
+          if (!(await this.plugin.validateSource(kind, value))) return;
           this.plugin.settings.sources.push({ kind, value, enabled: true });
           this.draftKind = "topic";
           this.draftValue = "";
@@ -712,39 +623,17 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
   private renderNoteContent(containerEl: HTMLElement): void {
     new Setting(containerEl).setName("What goes in a note").setHeading();
     new Setting(containerEl)
-      .setName("Authors")
-      .setDesc("Choose whether author names are note properties, plaintext, or omitted.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("property", "As a note property")
-          .addOption("plaintext", "As plaintext")
-          .addOption("off", "Don't include them")
-          .setValue(this.plugin.settings.authorPlacement)
-          .onChange(async (value) => {
-            this.plugin.settings.authorPlacement = value as AuthorPlacement;
-          await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Subject terms")
+      .setName("Include subject terms")
       .setDesc(
-        "OpenAlex labels each paper with subject terms. As a property they are " +
-          "searchable and stay out of the way; as tags they appear in the tag pane and " +
-          "the graph, which gets noisy fast across a few hundred papers.",
+        "Store OpenAlex's curated Topics as a searchable property. Broad machine-assigned " +
+          "Keywords and Concepts are intentionally omitted.",
       )
-      .addDropdown((dropdown) => {
-        dropdown
-          .addOption("property", "As a note property")
-          .addOption("tags", "As tags")
-          .addOption("off", "Don't include them")
-          .setValue(this.plugin.settings.subjectPlacement)
-          .onChange(async (value) => {
-            this.plugin.settings.subjectPlacement = value as "off" | "property" | "tags";
-            await this.plugin.saveSettings();
-            this.display();
-          });
-      });
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.includeSubjects).onChange(async (value) => {
+          this.plugin.settings.includeSubjects = value;
+          await this.plugin.saveSettings();
+        }),
+      );
 
     new Setting(containerEl)
       .setName("Paper properties in notes")
@@ -766,29 +655,6 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
           }),
       );
 
-    if (this.plugin.settings.subjectPlacement === "off") return;
-
-    const vocabularies: [keyof LiteratureInboxSettings, string, string][] = [
-      ["subjectTopics", "Topics", "A small curated set — the most useful of the three."],
-      ["subjectKeywords", "Keywords", "Close to what an author would write themselves."],
-      [
-        "subjectConcepts",
-        "Concepts",
-        "A large machine-assigned hierarchy. Goes broad fast — expect terms like " +
-          '"Physics" alongside the specific ones.',
-      ],
-    ];
-    for (const [key, name, description] of vocabularies) {
-      new Setting(containerEl)
-        .setName(name)
-        .setDesc(description)
-        .addToggle((toggle) =>
-          toggle.setValue(this.plugin.settings[key] as boolean).onChange(async (value) => {
-            (this.plugin.settings[key] as boolean) = value;
-            await this.plugin.saveSettings();
-          }),
-        );
-    }
   }
 
   private renderIntegrations(containerEl: HTMLElement): void {

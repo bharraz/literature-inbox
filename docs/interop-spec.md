@@ -106,7 +106,7 @@ written blank). Reader-facing keys come first and the plugin's bookkeeping
 last; readers must not depend on order. `authors` is always the complete
 list. Paper notes:
 
-```yaml
+```markdown
 ---
 title: Attention Is All You Need
 authors:
@@ -115,15 +115,18 @@ year: "2017"
 publication: NeurIPS
 doi: 10.5555/Attention
 url: "https://arxiv.org/abs/1706.03762"
-tags:
+subjects:
   - transformers
 item-type: journalArticle
-source: openalex
 fetched: 2026-07-22
 origin-ids:
   - doi:10.5555/attention
   - openalex:W2963403868
 ---
+
+# Attention Is All You Need
+
+**Sources:** [OpenAlex](https://openalex.org/W2963403868) · [arXiv](https://arxiv.org/abs/1706.03762)
 ```
 
 Note that `doi` here preserves source casing while the `doi:` **origin id** is

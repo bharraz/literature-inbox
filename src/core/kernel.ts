@@ -20,7 +20,7 @@
 import { CitationIndex, resolveCitations, type ReferenceRecord } from "./citations";
 import { FilenameAllocator, allocateUnused } from "./filenames";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
-import { renderInboxNote, type AuthorPlacement, type SubjectOptions } from "./notes";
+import { renderInboxNote } from "./notes";
 import type { InboxRecord, VaultAdapter } from "./update";
 import type { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
@@ -43,8 +43,7 @@ export interface KernelRunInput {
   papersFolder: string;
   adapter: VaultAdapter;
   today: string;
-  authorPlacement?: AuthorPlacement;
-  subjects?: SubjectOptions;
+  includeSubjects?: boolean;
   /**
    * Cap on how many of `works` get written. When set and there are more
    * candidates than this, half the slots go to the highest-impact candidates
@@ -52,9 +51,7 @@ export interface KernelRunInput {
    * sort can bury a famous, loosely-cited-within-this-batch paper under
    * obscure ones that happen to interlink) and the rest go to whichever
    * remaining candidates connect best to what's already selected. Unset means
-   * "write everything accepted", the old behaviour, for modes (seeds,
-   * snowball, library) where the caller already fetched exactly what it
-   * wants.
+   * "write everything accepted", used when adding only pasted papers.
    */
   targetCount?: number;
   /** Called as notes are written, so a long run can show progress. */
@@ -241,12 +238,11 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
     const notePath = `${papersFolder}/${entry.noteName}.md`;
     const content = renderInboxNote({
       work: entry.work,
-      authorPlacement: input.authorPlacement,
+      includeSubjects: input.includeSubjects,
       cites,
       citedBy,
       arrivedOn: today,
       originIds: entry.ids,
-      subjects: input.subjects,
     });
     await adapter.write(notePath, content);
     report.written.push({

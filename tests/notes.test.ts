@@ -60,37 +60,16 @@ describe("frontmatter stays parseable whatever the title contains", () => {
     );
   });
 
-  it("omits authors when author inclusion is disabled", () => {
-    const note = renderInboxNote({
-      work: work("A Paper"),
-      authorPlacement: "off",
-      arrivedOn: "2026-08-24",
-      originIds: ["doi:10.1/x"],
-    });
-    expect(note).not.toContain("authors:");
-    expect(note).not.toContain("**Authors:**");
-  });
-
-  it("can place authors in frontmatter or plaintext", () => {
+  it("stores authors as a property", () => {
     const paper = work("A Paper");
     paper.authors = [{ firstName: "Ada", lastName: "Lovelace" }];
-    const property = renderInboxNote({
+    const note = renderInboxNote({
       work: paper,
-      authorPlacement: "property",
       arrivedOn: "2026-08-24",
       originIds: ["doi:10.1/x"],
     });
-    expect(property).toContain("authors:\n  - Ada Lovelace");
-    expect(property).not.toContain("**Authors:**");
-
-    const plaintext = renderInboxNote({
-      work: paper,
-      authorPlacement: "plaintext",
-      arrivedOn: "2026-08-24",
-      originIds: ["doi:10.1/x"],
-    });
-    expect(plaintext).not.toContain("authors:");
-    expect(plaintext).toContain("**Authors:** Ada Lovelace");
+    expect(note).toContain("authors:\n  - Ada Lovelace");
+    expect(note).not.toContain("**Authors:**");
   });
 });
 
@@ -205,7 +184,6 @@ describe("properties a reader sees first", () => {
     big.authors = Array.from({ length: 40 }, (_, i) => ({ firstName: "Author", lastName: `N${i}` }));
     const note = renderInboxNote({
       work: big,
-      authorPlacement: "property",
       arrivedOn: "2026-01-01",
       originIds: ["openalex:W1"],
     });
@@ -222,7 +200,6 @@ describe("properties a reader sees first", () => {
     paper.source = "openalex";
     const note = renderInboxNote({
       work: paper,
-      authorPlacement: "property",
       arrivedOn: "2026-01-01",
       originIds: ["doi:10.1/x"],
     });
@@ -232,7 +209,21 @@ describe("properties a reader sees first", () => {
       .map((line) => line.split(":")[0]);
     expect(keys).toEqual([
       "title", "authors", "year", "publication", "doi",
-      "item-type", "source", "fetched", "origin-ids",
+      "item-type", "fetched", "origin-ids",
     ]);
+  });
+
+  it("puts OpenAlex and arXiv links below the title instead of a source property", () => {
+    const paper = work("A Linked Paper");
+    paper.source = "openalex";
+    const note = renderInboxNote({
+      work: paper,
+      arrivedOn: "2026-01-01",
+      originIds: ["openalex:W123", "arxiv:2401.12345"],
+    });
+    expect(note).not.toContain("source: openalex");
+    expect(note).toContain("[OpenAlex](https://openalex.org/W123)");
+    expect(note).toContain("[arXiv](https://arxiv.org/abs/2401.12345)");
+    expect(note.indexOf("**Sources:**")).toBeLessThan(note.indexOf("## Abstract"));
   });
 });

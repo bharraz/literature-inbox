@@ -327,13 +327,9 @@ suite("a real vault, end to end", () => {
         p.settings.kernelMode = "topic";
         p.settings.kernelSize = 120;
         p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
-        // Both streams on: adjacency ("citing my library") is connected by
-        // construction, topic is the broader, noisier one. Each writes to its
-        // own subfolder, so the two can be measured apart.
-        p.settings.sources = [
-          { kind: "citing", value: "", enabled: true, inboxFolder: "Citing" },
-          { kind: "topic", value: TOPIC, enabled: true, inboxFolder: "Topic" },
-        ];
+        // Adjacency ("citing my library") is connected by construction, so it
+        // is the source that directly tests the product's central claim.
+        p.settings.sources = [{ kind: "citing", value: "", enabled: true }];
         p.settings.maxArrivalsPerRun = 25;
         p.settings.newWindowDays = 30;
       });
@@ -342,8 +338,7 @@ suite("a real vault, end to end", () => {
       const kept = [...app.vault.files.keys()].filter((p) => p.startsWith("Papers/")).length;
 
       await plugin.updateInbox();
-      const citing = connectivity(app, "Inbox/Citing");
-      const topic = connectivity(app, "Inbox/Topic");
+      const citing = connectivity(app, "Inbox");
       const path = dumpVault(app, "openalex");
 
       const lines = (label: string, stats: Connectivity) => [
@@ -355,7 +350,6 @@ suite("a real vault, end to end", () => {
       report("openalex arrivals", [
         `kept papers: ${kept}`,
         ...lines("citing-my-library", citing),
-        ...lines("topic", topic),
         `vault written to: ${path}`,
         `notices: ${notices.join(" | ")}`,
       ]);
@@ -364,12 +358,6 @@ suite("a real vault, end to end", () => {
       // "citing my library" is connected *by construction*, so most of them
       // must carry an edge to a kept paper. Measured at 25/25 on 2026-08-06.
       //
-      // Asserted for that source alone. The topic row is reported, not
-      // asserted: OpenAlex has no reference list yet for most new papers
-      // (0 of 15 from the past fortnight, measured 2026-10-21), so its
-      // arrivals mostly land as isolated dots until backfill connects them.
-      // Mixing the two once made this check pass or fail on how many topic
-      // matches a given month happened to have.
       expect(citing.arrivals).toBeGreaterThan(0);
       expect(citing.withKeptEdge / citing.arrivals).toBeGreaterThan(0.5);
     },

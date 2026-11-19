@@ -163,7 +163,7 @@ describe("plugin load", () => {
       "build-kernel",
       "keep-paper",
       "add-by-doi",
-      "copy-identifier",
+      "copy-doi",
     ]);
   });
 
@@ -216,6 +216,31 @@ describe("plugin load", () => {
   });
 });
 
+describe("copy DOI", () => {
+  it("copies a DOI property and is unavailable on notes without a DOI", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const { app, plugin } = await bootPlugin();
+    const file = new TFile("Papers/With DOI.md");
+    app.workspace.activeFile = file;
+    app.metadataCache.frontmatter.set(file.path, { doi: "https://doi.org/10.1234/Example" });
+
+    await runCommand(plugin, "copy-doi");
+
+    expect(writeText).toHaveBeenCalledWith("10.1234/Example");
+    expect(notices).toContain("Copied DOI 10.1234/Example.");
+
+    app.metadataCache.frontmatter.set(file.path, { "origin-ids": ["arxiv:2401.12345"] });
+    const command = (plugin as never as {
+      commands: { id: string; checkCallback?: (checking: boolean) => boolean }[];
+    }).commands.find((entry) => entry.id === "copy-doi");
+    expect(command?.checkCallback?.(true)).toBe(false);
+  });
+});
+
 // --- the update run -----------------------------------------------------------------
 
 describe("update inbox", () => {
@@ -260,7 +285,8 @@ describe("update inbox", () => {
     expect(note).toContain("<!-- literature-inbox:generated:start -->");
     expect(note).toContain("<!-- literature-inbox:generated:end -->");
     expect(note).toContain("doi: 10.1234/one");
-    expect(note).toContain("source: openalex");
+    expect(note).toContain("[OpenAlex](https://openalex.org/W1)");
+    expect(note).not.toContain("source: openalex");
   });
 
   it("wires citation edges between arrivals", async () => {
@@ -731,19 +757,13 @@ describe("starting-graph modes", () => {
     expect(notices.some((n) => n.includes("10.1234/missing"))).toBe(true);
   });
 
-  it("refuses each mode without its input, rather than fetching nothing", async () => {
-    for (const [mode, field] of [
-      ["seeds", "DOIs"],
-      ["author", "author"],
-    ] as const) {
-      clearNotices();
-      const { app, plugin } = await bootPlugin((p) => {
-        p.settings.kernelMode = mode;
-      });
-      await plugin.buildKernel();
-      expect(notices.join(" ").toLowerCase()).toContain(field.toLowerCase());
-      expect(app.vault.files.size).toBe(0);
-    }
+  it("refuses pasted-paper mode without identifiers", async () => {
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "seeds";
+    });
+    await plugin.buildKernel();
+    expect(notices.join(" ").toLowerCase()).toContain("doi");
+    expect(app.vault.files.size).toBe(0);
   });
 
   it("snowballs a seed into its references and citers", async () => {
@@ -764,7 +784,8 @@ describe("starting-graph modes", () => {
     });
 
     const { app, plugin } = await bootPlugin((p) => {
-      p.settings.kernelMode = "snowball";
+      p.settings.kernelMode = "seeds";
+      p.settings.kernelExpandSeeds = true;
       p.settings.kernelSeeds = "10.1234/seed";
       p.settings.kernelSize = 10;
     });
@@ -776,63 +797,6 @@ describe("starting-graph modes", () => {
     expect(app.vault.files.has("Papers/A Paper Citing It.md")).toBe(true);
   });
 
-  it("builds from one author", async () => {
-    respondWith(openAlexPage([openAlexWork("W1", "Something She Wrote", [], "10.1234/one")]));
-    const { app, plugin } = await bootPlugin((p) => {
-      p.settings.kernelMode = "author";
-      p.settings.kernelAuthor = "A5023888391";
-    });
-
-    await plugin.buildKernel();
-
-    expect(app.vault.files.has("Papers/Something She Wrote.md")).toBe(true);
-    expect(requestedUrls[0]).toContain("authorships.author.id");
-  });
-
-  it("expands outward from papers already in the vault", async () => {
-    const { app, plugin } = await bootPlugin((p) => {
-      p.settings.kernelMode = "library";
-      p.settings.kernelSize = 10;
-    });
-    await app.vault.createFolder("Papers");
-    await app.vault.create(
-      "Papers/An Existing Paper.md",
-      keptNoteContent("An Existing Paper", "openalex:W1"),
-    );
-
-    let call = 0;
-    setRequestResponder(() => {
-      call += 1;
-      // 1: resolve the library seed; 2: its references; 3: its citers.
-      if (call === 1) {
-        return {
-          status: 200,
-          text: openAlexPage([openAlexWork("W1", "An Existing Paper", ["W10"])]),
-        };
-      }
-      if (call === 2) {
-        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Foundational Paper")]) };
-      }
-      return { status: 200, text: openAlexPage([openAlexWork("W20", "A Recent Follow-Up", ["W1"])]) };
-    });
-
-    await plugin.buildKernel();
-
-    expect(app.vault.files.has("Papers/A Foundational Paper.md")).toBe(true);
-    expect(app.vault.files.has("Papers/A Recent Follow-Up.md")).toBe(true);
-    // The paper it started from is not duplicated.
-    expect(app.vault.files.has("Papers/An Existing Paper 2.md")).toBe(false);
-  });
-
-  it("says so when the library is empty rather than building nothing quietly", async () => {
-    const { plugin } = await bootPlugin((p) => {
-      p.settings.kernelMode = "library";
-    });
-
-    await plugin.buildKernel();
-
-    expect(notices.some((n) => n.includes("No papers with a usable identifier"))).toBe(true);
-  });
 });
 
 describe("expanding from a specific selection (context menu)", () => {
@@ -867,8 +831,8 @@ describe("expanding from a specific selection (context menu)", () => {
       "Papers/Selected Paper.md",
       keptNoteContent("Selected Paper", "openalex:W1"),
     );
-    // Present in the library but NOT selected — must play no part in the
-    // expansion, unlike the "library" kernel mode which would include it.
+    // Present in the library but NOT selected — it must play no part in the
+    // expansion.
     await app.vault.create(
       "Papers/Unrelated Kept Paper.md",
       keptNoteContent("Unrelated Kept Paper", "openalex:W99"),
@@ -1517,6 +1481,43 @@ describe("per-feed settings", () => {
     expect(plugin.settings.feeds).toBeUndefined();
   });
 
+  it("migrates removed graph, subject, and source-folder settings", async () => {
+    const app = new App();
+    const plugin = new LiteratureInboxPlugin(app as never, {} as never);
+    await plugin.saveData({
+      settings: {
+        ...plugin.settings,
+        kernelMode: "snowball",
+        includeSubjects: undefined,
+        subjectPlacement: "off",
+        propertyDisplay: "compact",
+        crossrefMailto: "reader@example.com",
+        sources: [
+          {
+            kind: "feed",
+            value: "https://example.org/feed.xml",
+            enabled: true,
+            inboxFolder: "Feeds",
+          },
+        ],
+      },
+      inbox: [],
+    });
+
+    await plugin.onload();
+
+    expect(plugin.settings.kernelMode).toBe("seeds");
+    expect(plugin.settings.kernelExpandSeeds).toBe(true);
+    expect(plugin.settings.includeSubjects).toBe(false);
+    expect(plugin.settings.propertyDisplay).toBe("compact");
+    expect(plugin.settings.crossrefMailto).toBe("reader@example.com");
+    expect(plugin.settings.sources[0]).toEqual({
+      kind: "feed",
+      value: "https://example.org/feed.xml",
+      enabled: true,
+    });
+  });
+
   it("renders one row per source, whatever its kind", async () => {
     const { plugin } = await bootPlugin((p) => {
       p.settings.sources = [
@@ -1531,11 +1532,10 @@ describe("per-feed settings", () => {
     );
     expect(rows).toHaveLength(2);
     // "Papers citing my library" has nothing to type, so no value box: papers
-    // per run and folder are the only text fields.
-    expect(rows[0]?.texts).toHaveLength(2);
-    // A feed adds the URL box on top of those two.
-    expect(rows[1]?.texts).toHaveLength(3);
-    // Test only ever shows on the add-source draft now, not an added row.
+    // Papers per run is its only text field.
+    expect(rows[0]?.texts).toHaveLength(1);
+    // A feed adds its URL box.
+    expect(rows[1]?.texts).toHaveLength(2);
     expect(rows[1]?.buttons).toHaveLength(1);
     expect(rows[1]?.buttons[0]?.text).toBe("Remove");
   });
@@ -1556,7 +1556,7 @@ describe("per-feed settings", () => {
     expect(existingRow?.buttons.some((b) => b.text === "Remove")).toBe(true);
   });
 
-  it("only ever shows Test on the draft, never on an added row, even for arxiv/feed", async () => {
+  it("does not expose a separate Test button", async () => {
     const { plugin } = await bootPlugin((p) => {
       p.settings.sources = [
         { kind: "arxiv", value: "cs.CL", enabled: true },
@@ -1571,11 +1571,10 @@ describe("per-feed settings", () => {
     for (const row of rows) expect(row.buttons.some((b) => b.text === "Test")).toBe(false);
 
     const draft = allSettings.find((s: Setting) => s.name === "Add a source");
-    // Default draft kind is "topic", which has no Test button either.
     expect(draft?.buttons.some((b) => b.text === "Test")).toBe(false);
   });
 
-  it("shows a real per-run default and folder value, not just a greyed hint", async () => {
+  it("shows a real per-run default, not just a greyed hint", async () => {
     const { plugin } = await bootPlugin((p) => {
       p.settings.inboxFolder = "Inbox";
       p.settings.maxArrivalsPerRun = 3;
@@ -1586,9 +1585,8 @@ describe("per-feed settings", () => {
     const row = allSettings.find((s: Setting) =>
       s.settingEl.classList.contains("literature-inbox-feed-row"),
     );
-    // Unset, so both fields show the resolved default as real, editable text.
+    // Unset, so the field shows the resolved default as real, editable text.
     expect(row?.texts[0]?.value).toBe("3");
-    expect(row?.texts[1]?.value).toBe("Inbox");
   });
 
   it("has no leftover column-legend text once the header exists", async () => {
@@ -1621,6 +1619,11 @@ describe("per-feed settings", () => {
 
     const draftAfterCategory = allSettings.find((s: Setting) => s.name === "Add a source");
     const addButton = draftAfterCategory?.buttons.find((b) => b.text === "Add source");
+    respondWith(
+      '<?xml version="1.0"?><rss version="2.0"><channel><title>arXiv</title>' +
+        '<item><title>A Paper</title><link>https://arxiv.org/abs/2601.00001</link></item>' +
+        "</channel></rss>",
+    );
     clearSettings();
     await addButton?.simulateClick();
 
@@ -1645,43 +1648,6 @@ describe("per-feed settings", () => {
     expect(plugin.settings.sources).toEqual([]);
   });
 });
-
-describe("per-source inbox folders", () => {
-  it("writes an arrival into its source's own subfolder, nested under the parent", async () => {
-    respondWith(openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]));
-    const { app, plugin } = await bootPlugin((p) => {
-      p.settings.sources = [
-        { kind: "topic", value: "transformers", enabled: true, inboxFolder: "ArXiv" },
-      ];
-    });
-
-    await plugin.updateInbox();
-
-    expect(app.vault.files.has("Inbox/ArXiv/A Topic Paper.md")).toBe(true);
-    expect(app.vault.files.has("Inbox/A Topic Paper.md")).toBe(false);
-  });
-
-  it("reconciles a deleted arrival in a per-source subfolder", async () => {
-    const response = openAlexPage([openAlexWork("W1", "A Topic Paper", [], "10.1234/one")]);
-    respondWith(response);
-    const { app, plugin } = await bootPlugin((p) => {
-      p.settings.sources = [
-        { kind: "topic", value: "transformers", enabled: true, inboxFolder: "ArXiv" },
-      ];
-    });
-
-    await plugin.updateInbox();
-    app.vault.files.delete("Inbox/ArXiv/A Topic Paper.md");
-    respondWith(response);
-    await plugin.updateInbox();
-
-    expect((plugin as never as { inbox: unknown[] }).inbox).toHaveLength(0);
-    expect((plugin as never as { previouslyRemoved: string[] }).previouslyRemoved).toContain(
-      "doi:10.1234/one",
-    );
-  });
-});
-
 
 describe("settings page: layout details", () => {
   it("preserves scroll position across a re-render", async () => {
@@ -1748,47 +1714,35 @@ describe("what counts as new", () => {
   });
 });
 
-describe("testing feeds before trusting them", () => {
+describe("validating sources when they are added", () => {
   const feedXml = (title: string) =>
     `<?xml version="1.0"?><rss version="2.0"><channel><title>A Journal</title>` +
     `<item><title>${title}</title><link>https://example.org/a</link></item>` +
     `</channel></rss>`;
 
-  it("says so rather than silently doing nothing when no feeds are set", async () => {
+  it("rejects an invalid arXiv category without a request", async () => {
     const { plugin } = await bootPlugin();
-    await plugin.testFeeds();
-    expect(notices.some((n) => n.includes("feed URL"))).toBe(true);
+    await expect(plugin.validateSource("arxiv", "not a category")).resolves.toBe(false);
     expect(requestedUrls).toHaveLength(0);
   });
 
-  it("fetches every configured feed once, even with the source switched off", async () => {
+  it("accepts a reachable feed", async () => {
     // Testing a feed before enabling the source is the normal order — you
     // paste a URL, check it works, then turn it on.
     respondWith(feedXml("A Recent Paper"));
-    const { plugin } = await bootPlugin((p) => {
-      p.settings.sources = [
-        { kind: "feed", value: "https://example.org/one.xml", enabled: false },
-        { kind: "feed", value: "https://example.org/two.xml", enabled: false },
-      ];
-    });
-
-    await plugin.testFeeds();
-
-    expect(requestedUrls).toEqual([
-      "https://example.org/one.xml",
-      "https://example.org/two.xml",
-    ]);
+    const { plugin } = await bootPlugin();
+    await expect(plugin.validateSource("feed", "https://example.org/one.xml")).resolves.toBe(true);
+    expect(requestedUrls).toEqual(["https://example.org/one.xml"]);
+    expect(notices.some((n) => n.includes("Source is reachable"))).toBe(true);
   });
 
-  it("reports a dead feed instead of throwing", async () => {
+  it("rejects a dead feed instead of saving it", async () => {
     setRequestResponder(() => {
       throw new Error("ENOTFOUND");
     });
-    const { plugin } = await bootPlugin((p) => {
-      p.settings.sources = [{ kind: "feed", value: "https://example.org/dead.xml", enabled: true }];
-    });
-
-    await expect(plugin.testFeeds()).resolves.toBeUndefined();
+    const { plugin } = await bootPlugin();
+    await expect(plugin.validateSource("feed", "https://example.org/dead.xml")).resolves.toBe(false);
+    expect(notices.some((n) => n.includes("Could not add source"))).toBe(true);
   });
 });
 
@@ -2538,22 +2492,4 @@ describe("expanding from a folder, or from a mixed selection", () => {
     );
   });
 
-  it("lets the library mode start from one subfolder, and writes the results there", async () => {
-    const { app, plugin } = await bootPlugin((p) => {
-      p.settings.kernelMode = "library";
-      p.settings.kernelLibraryFolder = "Ions";
-    });
-    await libraryWithIons(app);
-    respondToExpansion();
-
-    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
-    const from = allSettings.find((s: Setting) => s.name === "From");
-    expect([...(from?.dropdowns[0]?.options.keys() ?? [])]).toEqual(["", "Ions"]);
-    expect(from?.dropdowns[0]?.value).toBe("Ions");
-
-    await plugin.buildKernel();
-
-    expect(requestedUrls[0]).not.toContain("W99");
-    expect(app.vault.files.has("Papers/Ions/A Reference.md")).toBe(true);
-  });
 });
