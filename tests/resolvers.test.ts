@@ -168,3 +168,19 @@ describe("doiResolver", () => {
     await expect(resolver.worksByDois(["10.1/a"])).resolves.toEqual([]);
   });
 });
+
+describe("doiResolver and arXiv's own DOIs", () => {
+  it("never asks the fallback about an arXiv DOI, which only DataCite holds", async () => {
+    // Crossref answers 404 to every 10.48550 DOI, one paced request at a
+    // time — and every arXiv arrival was looked up that way on every run.
+    const seen: string[][] = [];
+    const resolver = doiResolver(
+      { async worksByDois() { return []; } },
+      { async worksByDois(dois) { seen.push(dois); return []; } },
+    );
+
+    await resolver.worksByDois(["10.48550/arxiv.2401.12345", "10.1/real"]);
+
+    expect(seen).toEqual([["10.1/real"]]);
+  });
+});

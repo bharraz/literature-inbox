@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   OpenAlexClient,
+  OpenAlexKeyError,
   passesSanityFilters,
   reconstructAbstract,
   workFromOpenAlex,
@@ -88,9 +89,10 @@ describe("workByDoi against a real recorded response", () => {
 });
 
 /** A concept-search response: {@link OpenAlexClient} resolves free text to
- * this before searching, so most topic tests need one queued first. */
-const conceptFound = (id: string) =>
-  JSON.stringify({ results: [{ id: `https://openalex.org/${id}` }] });
+ * this before a starting-graph search, so those tests need one queued first.
+ * Only a hit whose name is the term itself is accepted. */
+const conceptFound = (id: string, name: string) =>
+  JSON.stringify({ results: [{ id: `https://openalex.org/${id}`, display_name: name }] });
 const noConceptMatch = JSON.stringify({ results: [] });
 
 describe("topWorks pagination", () => {
@@ -101,7 +103,7 @@ describe("topWorks pagination", () => {
     // the word "quantum" — a consciousness-studies paper, a phosphor paper —
     // regardless of field. concepts.id scopes to an actual field.
     const { client, transport } = clientWith([
-      conceptFound("C41008148"),
+      conceptFound("C41008148", "Machine learning"),
       load("openalex_top_works_page1.json"),
     ]);
     await client.topWorks("machine learning", 3);
@@ -110,7 +112,43 @@ describe("topWorks pagination", () => {
     expect(queryOf(transport.requested[1] as string).filter).toContain("concepts.id:C41008148");
   });
 
-  it("falls back to a quoted full-text phrase when no concept matches", async () => {
+  it("refuses a concept that is merely the search's top hit, not the term", async () => {
+    // Verified live: "diffusion models" -> "Relativistic heat conduction",
+    // "graph neural networks" -> "Recurrent neural network". Accepting the top
+    // hit built a starting graph from the wrong discipline, with no warning.
+    const { client, transport } = clientWith([
+      conceptFound("C43818450", "Relativistic heat conduction"),
+      load("openalex_top_works_page1.json"),
+    ]);
+    await client.topWorks("diffusion models", 3);
+
+    const filter = queryOf(transport.requested[1] as string).filter;
+    expect(filter).not.toContain("concepts.id");
+    expect(filter).toContain('title_and_abstract.search:"diffusion models"');
+    expect(await client.unresolvedTopics("diffusion models")).toEqual(["diffusion models"]);
+  });
+
+  it("takes the hit whose name matches even when it is not the first", async () => {
+    const { client, transport } = clientWith([
+      JSON.stringify({
+        results: [
+          { id: "https://openalex.org/C1", display_name: "Electrical grid" },
+          { id: "https://openalex.org/C10558101", display_name: "Smart grid" },
+        ],
+      }),
+      load("openalex_top_works_page1.json"),
+    ]);
+    await client.topWorks("smart grids", 3); // plural still names the field
+
+    expect(queryOf(transport.requested[0] as string)["per-page"]).toBe("5");
+    expect(queryOf(transport.requested[1] as string).filter).toContain("concepts.id:C10558101");
+    expect(await client.topicMatches("smart grids")).toEqual([
+      { term: "smart grids", concept: { id: "C10558101", name: "Smart grid" } },
+    ]);
+    expect(transport.requested).toHaveLength(2); // the match is memoized, not re-asked
+  });
+
+  it("falls back to a quoted title-and-abstract phrase when no concept matches", async () => {
     // Regression: unquoted default.search is an OR across every word, so
     // "trapped ion quantum simulation" pulled in ~82k works — anything
     // containing just "simulation" — sorted by raw citation count, surfacing
@@ -123,8 +161,11 @@ describe("topWorks pagination", () => {
     ]);
     await client.topWorks("machine learning", 3);
 
+    // Not `default.search`, which also matches full text: there, "diffusion
+    // models" ranked AlphaFold 3 and a radiocarbon calibration curve first --
+    // highly cited papers that merely mention the phrase somewhere.
     expect(queryOf(transport.requested[1] as string).filter).toContain(
-      'default.search:"machine learning"',
+      'title_and_abstract.search:"machine learning"',
     );
   });
 
@@ -168,30 +209,90 @@ describe("topWorks pagination", () => {
   });
 });
 
-describe("worksSince recency basis", () => {
+describe("worksSince — what a topic source asks for", () => {
+  const today = new Date("2026-07-19T12:00:00Z");
+
   it("filters on publication date, the only window the free tier allows", async () => {
     // `from_created_date` would be the better signal — OpenAlex indexes papers
     // weeks after publication — but it is a paid-plan filter that answers 429
     // "Plan upgrade required" for everyone else. Verified live, after it broke
     // every update for a free-tier user.
-    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
     await client.worksSince("quantum", "2026-07-01");
-    const filter = queryOf(transport.requested[1] as string).filter ?? "";
+    const filter = queryOf(transport.requested[0] as string).filter ?? "";
     expect(filter).toContain("from_publication_date:2026-07-01");
     expect(filter).not.toContain("from_created_date");
   });
 
-  it("still sorts newest-published first, so a capped run gets recent papers", async () => {
-    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
+  it("matches every word in the title or abstract, ranked by relevance, not by date", async () => {
+    // Measured live for "quantum error correction": newest-first over the
+    // concept tag put future-dated records and crank repository uploads first
+    // (2 genuine papers in the top 12); relevance over the title and abstract
+    // gave 10 of 12. Every word rather than the exact phrase: over a month,
+    // "trapped ion quantum computing" as a phrase matched 2 papers, as words
+    // 30. And no concept lookup: that is a second search-priced request, spent
+    // on a tag too liberal to rank by.
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
+    await client.worksSince("quantum error correction", "2026-07-01");
+
+    expect(transport.requested).toHaveLength(1);
+    const query = queryOf(transport.requested[0] as string);
+    expect(query.filter).toContain("title_and_abstract.search:quantum error correction,");
+    expect(query.sort).toBe("relevance_score:desc");
+  });
+
+  it("keeps a term the user quoted as an exact phrase", async () => {
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
+    await client.worksSince('"surface code", decoder', "2026-07-01");
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      'title_and_abstract.search:"surface code",title_and_abstract.search:decoder,',
+    );
+  });
+
+  it("never asks for papers dated after today", async () => {
+    // In any recency query a future-dated record outranks everything real.
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
     await client.worksSince("quantum", "2026-07-01");
-    expect(queryOf(transport.requested[1] as string).sort).toBe("publication_date:desc");
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "to_publication_date:2026-07-19",
+    );
+  });
+
+  it("keeps newest-first for a bare concept id, which has nothing to rank by", async () => {
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
+    await client.worksSince("C41008148", "2026-07-01");
+    const query = queryOf(transport.requested[0] as string);
+    expect(query.filter).toContain("concepts.id:C41008148");
+    expect(query.sort).toBe("publication_date:desc");
   });
 
   it("uses index date only when asked explicitly, for anyone with a plan", async () => {
-    const { client, transport } = clientWith([noConceptMatch, load("openalex_works_since.json")]);
+    const { client, transport } = clientWith([load("openalex_works_since.json")], today);
     await client.worksSince("quantum", "2026-07-01", 500, "created");
-    expect(queryOf(transport.requested[1] as string).filter).toContain(
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
       "from_created_date:2026-07-01",
+    );
+  });
+});
+
+describe("free text inside a filter", () => {
+  const empty = JSON.stringify({ results: [], meta: { next_cursor: null } });
+
+  it("keeps a title's commas from splitting the filter", async () => {
+    // Verified live: `title.search:Attention, please` is a 400. Every feed
+    // item whose title had a comma failed its lookup.
+    const { client, transport } = clientWith([empty]);
+    await client.workByTitle("Attention, please: a | survey");
+    expect(queryOf(transport.requested[0] as string).filter).toBe(
+      "title.search:Attention please: a survey",
+    );
+  });
+
+  it("keeps a bibliography-style author name in one clause", async () => {
+    const { client, transport } = clientWith([empty]);
+    await client.worksByAuthor("Lovelace, Ada", 5);
+    expect(queryOf(transport.requested[0] as string).filter).toContain(
+      "raw_author_name.search:Lovelace Ada,type:",
     );
   });
 });
@@ -294,6 +395,22 @@ describe("adjacency selection", () => {
 
     expect(transport.requested).toHaveLength(2); // 50 anchors per batch
     expect(works).toHaveLength(1);
+  });
+
+  it("asks every batch even when the first fills the pool", async () => {
+    // Stopping at the first full batch meant a library past 50 papers only
+    // ever drew arrivals from whichever 50 its folder happened to list first.
+    const anchors = Array.from({ length: 60 }, (_, i) => `W${i}`);
+    const { client, transport } = clientWith([
+      page([record("X1"), record("X2")]),
+      page([record("X3")]),
+    ]);
+
+    const works = await client.worksCitingSince(anchors, "2026-07-01", 2);
+
+    expect(transport.requested).toHaveLength(2);
+    expect(queryOf(transport.requested[1] as string).filter).toContain("cites:W50|");
+    expect(works.map((work) => work.key)).toEqual(["X1", "X2", "X3"]);
   });
 });
 
@@ -414,14 +531,55 @@ describe("being rate limited", () => {
   });
 });
 
+describe("a 401 from OpenAlex", () => {
+  // Bodies as OpenAlex sent them on 2026-10-21.
+  const badKey = {
+    status: 401,
+    text: '{"error":"Invalid or missing API key","message":"API key not found. Get a free key at https://openalex.org/settings/api-key."}',
+  };
+  const pagingNeedsKey = {
+    status: 401,
+    text: '{"error":"API key required for cursor paging","message":"Paging past the first page with cursor= needs a free API key."}',
+  };
+  const page = (ids: string[], cursor: string | null) =>
+    JSON.stringify({
+      results: ids.map((id) => ({ id: `https://openalex.org/${id}`, title: id, type: "article" })),
+      meta: { next_cursor: cursor },
+    });
+
+  it("says the key was rejected, and stops asking for the rest of the run", async () => {
+    const { client, transport } = clientWith([badKey]);
+
+    const first = await client.workByDoi("10.1/a").catch((error: unknown) => error);
+    expect(first).toBeInstanceOf(OpenAlexKeyError);
+    expect((first as OpenAlexKeyError).reason).toBe("invalid");
+
+    // Every request would fail the same way: no second one is sent.
+    await expect(client.workByDoi("10.1/b")).rejects.toBeInstanceOf(OpenAlexKeyError);
+    expect(transport.requested).toHaveLength(1);
+  });
+
+  it("keeps the first page when paging past it needs a key", async () => {
+    const partials: unknown[] = [];
+    const transport = new SequenceTransport([page(["W1", "W2"], "next"), pagingNeedsKey]);
+    const client = new OpenAlexClient(transport, {
+      sleep: noSleep,
+      onPartialFetch: (error) => partials.push(error),
+    });
+
+    const works = await client.worksByAuthor("A5023888391", 300);
+
+    expect(works.map((work) => work.key)).toEqual(["W1", "W2"]);
+    expect(partials).toHaveLength(1);
+    expect((partials[0] as OpenAlexKeyError).reason).toBe("required");
+  });
+});
+
 describe("junk filtering against real bad data", () => {
   it("drops entries with implausible future publication dates", async () => {
     // This fixture holds five REAL OpenAlex records dated 2027-2050, plus one
     // hand-added valid control entry. Only the control should survive.
-    const { client } = clientWith(
-      [noConceptMatch, load("openalex_works_since.json")],
-      new Date("2026-07-19"),
-    );
+    const { client } = clientWith([load("openalex_works_since.json")], new Date("2026-07-19"));
     const works = await client.worksSince("quantum", "2026-01-01");
     expect(works).toHaveLength(1);
     expect(works[0]?.title).toBe("A Perfectly Ordinary Control Paper");

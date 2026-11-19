@@ -13,7 +13,9 @@ import { RateLimiter, buildUrl, getWithRetry, type Transport } from "./http";
 import { childText, collapseWhitespace, parseXml } from "./xml";
 import { emptyWork, type Author, type Work } from "./types";
 
-export const ARXIV_BASE_URL = "http://export.arxiv.org/api/query";
+// https, not http: nothing here needs to travel in the clear, and mobile
+// platforms can refuse plain-http requests — the plugin is not desktop-only.
+export const ARXIV_BASE_URL = "https://export.arxiv.org/api/query";
 
 function splitName(displayName: string): Author {
   const parts = displayName.trim().split(/\s+/);

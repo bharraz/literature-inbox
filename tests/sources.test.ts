@@ -4,9 +4,12 @@ import {
   effective,
   effectiveInboxFolder,
   emptySource,
+  foldersOverlap,
   isUsable,
   migrateSources,
   needsValue,
+  nestUnder,
+  sharedFolder,
   withinWindow,
 } from "../src/core/sources";
 import { emptyWork, type Work } from "../src/core/types";
@@ -161,5 +164,42 @@ describe("effectiveInboxFolder — every source folder nests under the parent", 
 
   it("tolerates stray leading or trailing slashes", () => {
     expect(effectiveInboxFolder(source("/ArXiv/"), "Inbox")).toBe("Inbox/ArXiv");
+  });
+});
+
+describe("foldersOverlap — the inbox and the library must be disjoint", () => {
+  it("catches the same folder, a nested one either way, and case differences", () => {
+    expect(foldersOverlap("Inbox", "Inbox")).toBe(true);
+    expect(foldersOverlap("Papers/Inbox", "Papers")).toBe(true);
+    expect(foldersOverlap("Inbox", "Inbox/Kept")).toBe(true);
+    expect(foldersOverlap("inbox", "Inbox/")).toBe(true);
+  });
+
+  it("does not confuse a shared prefix for nesting", () => {
+    expect(foldersOverlap("Paper", "Papers")).toBe(false);
+    expect(foldersOverlap("Inbox", "Papers")).toBe(false);
+  });
+});
+
+describe("nestUnder", () => {
+  it("keeps a folder the user names inside the tree the plugin scans", () => {
+    expect(nestUnder("Reading", "Papers")).toBe("Papers/Reading");
+    expect(nestUnder("Papers/Reading", "Papers")).toBe("Papers/Reading");
+    expect(nestUnder("", "Papers")).toBe("Papers");
+  });
+});
+
+describe("sharedFolder — where an expansion of a selection lands", () => {
+  const note = (path: string) => ({ path, isFolder: false });
+  const folder = (path: string) => ({ path, isFolder: true });
+
+  it("is the folder itself for one folder, and a note's own folder for one note", () => {
+    expect(sharedFolder([folder("Papers/Ions")])).toBe("Papers/Ions");
+    expect(sharedFolder([note("Papers/Ions/A.md")])).toBe("Papers/Ions");
+  });
+
+  it("is the deepest folder everything shares", () => {
+    expect(sharedFolder([note("Papers/Ions/A.md"), note("Papers/Ions/Traps/B.md")])).toBe("Papers/Ions");
+    expect(sharedFolder([note("Papers/Ions/A.md"), folder("Papers/Atoms")])).toBe("Papers");
   });
 });

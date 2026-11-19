@@ -2,8 +2,8 @@
  * The kernel run: build the starting graph.
  *
  * Why this exists. On an empty vault, arrivals have nothing to connect to —
- * every new paper lands as an isolated dot, the "why you're seeing this"
- * signal never fires, and the product's whole premise is invisible. The most
+ * every new paper lands as an isolated dot and the product's whole premise is
+ * invisible. The most
  * cited papers in a field are also the ones everything else cites, so
  * fetching a few hundred of them produces a densely connected core that later
  * arrivals attach themselves to. That core *is* the triage surface.
@@ -18,10 +18,10 @@
  */
 
 import { CitationIndex, resolveCitations, type ReferenceRecord } from "./citations";
-import { FilenameAllocator } from "./filenames";
+import { FilenameAllocator, allocateUnused } from "./filenames";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
 import { renderInboxNote, type AuthorPlacement, type SubjectOptions } from "./notes";
-import type { VaultAdapter } from "./update";
+import type { InboxRecord, VaultAdapter } from "./update";
 import type { VaultIndex } from "./vault-state";
 import type { Work } from "./types";
 
@@ -45,7 +45,6 @@ export interface KernelRunInput {
   today: string;
   authorPlacement?: AuthorPlacement;
   subjects?: SubjectOptions;
-  readStatus?: string;
   /**
    * Cap on how many of `works` get written. When set and there are more
    * candidates than this, half the slots go to the highest-impact candidates
@@ -60,6 +59,13 @@ export interface KernelRunInput {
   targetCount?: number;
   /** Called as notes are written, so a long run can show progress. */
   onProgress?: (written: number, total: number) => void;
+  /**
+   * Arrivals still waiting in the inbox. A paper among them is skipped like
+   * one already kept — writing it into the papers folder as well would give
+   * one paper two notes and make every link to it ambiguous — and the rest
+   * still resolve as citation targets, so a seeded paper links to them.
+   */
+  inbox?: readonly InboxRecord[];
 }
 
 const EMPTY_NEIGHBORS: ReadonlySet<string> = new Set();
@@ -132,8 +138,13 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
     newReferenceRecords: [],
   };
 
+  const inbox = input.inbox ?? [];
   const allocator = new FilenameAllocator();
   for (const name of vault.noteBaseNames()) allocator.reserve(name);
+  for (const record of inbox) {
+    const base = record.notePath.split("/").pop();
+    if (base?.endsWith(".md")) allocator.reserve(base.slice(0, -3));
+  }
 
   const accepted: { work: Work; noteName: string; ids: string[] }[] = [];
   for (const work of works) {
@@ -148,13 +159,17 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       report.skipped += 1;
       continue;
     }
+    if (inbox.some((record) => idsIntersect(ids, record.originIds))) {
+      report.skipped += 1;
+      continue;
+    }
     if (accepted.some((entry) => idsIntersect(ids, entry.ids))) {
       report.skipped += 1;
       continue;
     }
 
-    const { filename } = allocator.allocate(work);
-    accepted.push({ work, noteName: filename, ids });
+    const noteName = await allocateUnused(allocator, work, papersFolder, (path) => adapter.exists(path));
+    accepted.push({ work, noteName, ids });
   }
 
   // Index the papers already in the vault *and* everything being seeded, so
@@ -162,7 +177,11 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
   // what makes a top-cited set into a connected graph rather than a list.
   const index = new CitationIndex();
   const vaultNoteNames = new Set<string>();
-  for (const entry of vault.entriesForIndex()) {
+  const existingNotes = [
+    ...vault.entriesForIndex(),
+    ...inbox.map((record) => ({ notePath: record.notePath, originIds: record.originIds })),
+  ];
+  for (const entry of existingNotes) {
     const base = entry.notePath.split("/").pop();
     if (base?.endsWith(".md")) {
       const noteName = base.slice(0, -3);
@@ -228,7 +247,6 @@ export async function runKernel(input: KernelRunInput): Promise<KernelReport> {
       arrivedOn: today,
       originIds: entry.ids,
       subjects: input.subjects,
-      readStatus: input.readStatus,
     });
     await adapter.write(notePath, content);
     report.written.push({

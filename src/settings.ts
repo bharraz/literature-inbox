@@ -29,6 +29,9 @@ export const KERNEL_MODE_LABELS: Record<KernelMode, string> = {
 /** Which question an update asks OpenAlex. */
 export type ArrivalSelection = "both" | "adjacent" | "topic";
 
+/** How Obsidian's inline properties panel appears in paper notes. */
+export type PropertyDisplay = "hidden" | "compact" | "all";
+
 export const ARRIVAL_SELECTION_LABELS: Record<ArrivalSelection, string> = {
   both: "Both",
   adjacent: "Only papers that cite my library",
@@ -75,6 +78,12 @@ export interface LiteratureInboxSettings {
   kernelSeeds: string;
   /** OpenAlex author id, ORCID, or name, for the `author` mode. */
   kernelAuthor: string;
+  /**
+   * For the `library` mode: the subfolder of the library to expand from,
+   * relative to `papersFolder`, and where its results are written. Blank
+   * means the whole library.
+   */
+  kernelLibraryFolder: string;
 
   /**
    * What "new" means, in days back from today — one number for every source.
@@ -97,15 +106,10 @@ export interface LiteratureInboxSettings {
   /** Legacy setting migrated to authorPlacement on load. */
   includeAuthors?: boolean;
 
-  /**
-   * Track a read-status property on each paper note.
-   *
-   * Off by default: an unused property in every note is clutter, and this only
-   * earns its place once you are reading regularly. When on, notes gain
-   * `read-status: to-read`, and "What should I read?" skips anything marked
-   * read or reference.
-   */
-  readStatusEnabled: boolean;
+  /** Display-only treatment of the inline properties panel in paper notes. */
+  propertyDisplay: PropertyDisplay;
+  /** Legacy toggle, migrated to `propertyDisplay` on load. */
+  tidyProperties?: boolean;
 
   /**
    * A free OpenAlex API key. Blank by default — never a hardcoded one.
@@ -141,6 +145,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   kernelMode: "topic",
   kernelSeeds: "",
   kernelAuthor: "",
+  kernelLibraryFolder: "",
   newWindowDays: DEFAULT_RECENCY_WINDOW_DAYS,
   maxArrivalsPerRun: 3,
   // Terms as a property by default, never as tags: tags show up in the tag
@@ -152,7 +157,7 @@ export const DEFAULT_SETTINGS: LiteratureInboxSettings = {
   subjectKeywords: true,
   subjectConcepts: false,
   authorPlacement: "property",
-  readStatusEnabled: false,
+  propertyDisplay: "hidden",
   openAlexApiKey: "",
   crossrefEnabled: true,
   crossrefMailto: "",
@@ -377,13 +382,34 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       containerEl.createEl("p", {
         cls: "setting-item-description",
         text:
-          `Takes the papers already in ${this.plugin.settings.papersFolder}/ and pulls in ` +
-          "what they cite and what cites them. The most personal starting graph available, " +
-          "and it needs no typing. Does nothing if that folder is empty. To dig into a " +
-          "handful of specific papers instead of your whole library, select them in the " +
-          "file explorer or graph view and use \"Expand outward from these papers\" in the " +
-          "right-click menu.",
+          "Takes papers you already have and pulls in what they cite and what cites them. " +
+          "The most personal starting graph available, and it needs no typing. To dig into " +
+          "a few specific papers or folders instead, select them in the file explorer, " +
+          'right-click, and choose "Expand outward".',
       });
+
+      const papers = this.plugin.settings.papersFolder;
+      const chosen = this.plugin.settings.kernelLibraryFolder;
+      const subfolders = this.plugin.librarySubfolders();
+      new Setting(containerEl)
+        .setName("From")
+        .setDesc(
+          "Your whole library, or one subfolder of it. When it's a subfolder, the new papers " +
+            "are added to that subfolder too.",
+        )
+        .addDropdown((dropdown) => {
+          dropdown.addOption("", `Whole library (${papers}/)`);
+          for (const folder of subfolders) dropdown.addOption(folder, `${papers}/${folder}`);
+          // Renamed or deleted since it was chosen: still shown, rather than
+          // silently snapping back to the whole library.
+          if (chosen && !subfolders.includes(chosen)) {
+            dropdown.addOption(chosen, `${papers}/${chosen} (not found)`);
+          }
+          dropdown.setValue(chosen).onChange(async (value) => {
+            this.plugin.settings.kernelLibraryFolder = value;
+            await this.plugin.saveSettings();
+          });
+        });
     }
 
     // Hidden in "seeds" mode, where it does nothing: you get exactly the
@@ -667,8 +693,10 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       cls: "setting-item-description",
       text:
         "“Papers citing my library” is the one only OpenAlex can answer, and the " +
-        "one where every result is guaranteed to connect to something you kept. Topic " +
-        "search covers work that has not cited you yet. Feeds and arXiv are fastest to " +
+        "one where every result is guaranteed to connect to something you kept. A topic " +
+        "finds recent papers with all of its words in the title or abstract (put a phrase " +
+        "in quotes to require it exactly), most relevant first — work that has not cited " +
+        "you yet. Feeds and arXiv are fastest to " +
         "publish but carry no reference lists, so those arrive unconnected and are " +
         "wired up on a later run.",
     });
@@ -719,19 +747,23 @@ export class LiteratureInboxSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Track whether you have read a paper")
+      .setName("Paper properties in notes")
       .setDesc(
-        "Adds a read-status property — to-read, read, or reference — which " +
-          '"What should I read?" uses to skip what you are done with. Obsidian has no ' +
-          "select property type, so it is a text field, but it autocompletes the values " +
-          "it has already seen. Off by default: an unused property in every note is " +
-          "clutter.",
+        "Hidden puts the title and abstract first while keeping every property searchable " +
+          "and available in Obsidian's Properties sidebar and source mode. Compact shows " +
+          "the useful bibliographic fields but folds away plugin bookkeeping. This affects " +
+          "Literature Inbox paper notes only, not Obsidian's global property setting.",
       )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.readStatusEnabled).onChange(async (value) => {
-          this.plugin.settings.readStatusEnabled = value;
-          await this.plugin.saveSettings();
-        }),
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("hidden", "Hidden (abstract first)")
+          .addOption("compact", "Compact")
+          .addOption("all", "Show all")
+          .setValue(this.plugin.settings.propertyDisplay)
+          .onChange(async (value) => {
+            this.plugin.settings.propertyDisplay = value as PropertyDisplay;
+            await this.plugin.saveSettings();
+          }),
       );
 
     if (this.plugin.settings.subjectPlacement === "off") return;

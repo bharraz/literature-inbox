@@ -49,11 +49,54 @@ export interface SourceConfig {
  * folder is only ever a way of organizing what's inside that bound.
  */
 export function effectiveInboxFolder(source: SourceConfig, parentInboxFolder: string): string {
-  const override = (source.inboxFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
-  if (!override || override === parentInboxFolder) return parentInboxFolder;
-  return override.startsWith(`${parentInboxFolder}/`)
-    ? override
-    : `${parentInboxFolder}/${override}`;
+  return nestUnder(source.inboxFolder ?? "", parentInboxFolder);
+}
+
+/**
+ * *folder*, placed under *parent* unless it already is there. Blank means the
+ * parent itself. Used for every folder a user may name for a subset of
+ * papers, so whatever they type stays inside the tree the plugin scans.
+ */
+export function nestUnder(folder: string, parent: string): string {
+  const override = folder.trim().replace(/^\/+|\/+$/g, "");
+  if (!override || override === parent) return parent;
+  return override.startsWith(`${parent}/`) ? override : `${parent}/${override}`;
+}
+
+/**
+ * The deepest folder holding everything in *paths* — a folder's own path
+ * counts as itself, a note counts as the folder it sits in. Where an
+ * expansion of those items lands by default, so new papers join the subfolder
+ * the user was working in.
+ */
+export function sharedFolder(paths: readonly { path: string; isFolder: boolean }[]): string {
+  const folders = paths.map(({ path, isFolder }) =>
+    isFolder ? path : path.split("/").slice(0, -1).join("/"),
+  );
+  if (folders.length === 0) return "";
+  let shared = folders[0]!.split("/");
+  for (const folder of folders.slice(1)) {
+    const parts = folder.split("/");
+    let i = 0;
+    while (i < shared.length && i < parts.length && shared[i] === parts[i]) i++;
+    shared = shared.slice(0, i);
+  }
+  return shared.join("/");
+}
+
+/**
+ * Whether two folders are the same or one contains the other.
+ *
+ * The inbox and the papers folder must be disjoint: everything rests on a
+ * note's folder saying whether it is an arrival or kept, and a note in both
+ * trees at once is both. Case-insensitive, as the filesystems under most
+ * vaults are.
+ */
+export function foldersOverlap(a: string, b: string): boolean {
+  const fold = (path: string) => path.trim().replace(/^\/+|\/+$/g, "").toLowerCase();
+  const x = fold(a);
+  const y = fold(b);
+  return x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`);
 }
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {

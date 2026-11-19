@@ -12,10 +12,19 @@
  * citizen of APIs that ask for no key at all.
  */
 
-export const USER_AGENT = "literature-inbox/0.1 (Obsidian plugin)";
+// No version number: it went stale at 0.1 for every release after. The URL is
+// the contact point API operators ask clients to identify themselves with.
+export const USER_AGENT =
+  "literature-inbox (Obsidian plugin; https://github.com/bharraz/literature-inbox)";
 
 export class FetchError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(
+    message: string,
+    readonly status?: number,
+    /** The start of the response body, for a client that knows how to read
+     * its own service's errors (see `OpenAlexKeyError`). */
+    readonly body?: string,
+  ) {
     super(message);
     this.name = "FetchError";
   }
@@ -187,7 +196,11 @@ export async function getWithRetry(
       continue;
     }
 
-    lastError = new FetchError(`HTTP ${response.status} for ${url}`, response.status);
+    lastError = new FetchError(
+      `HTTP ${response.status} for ${url}`,
+      response.status,
+      response.text.slice(0, 500),
+    );
     if (!isRetryable(response.status) || attempt === maxRetries) break;
     await sleep(backoffSeconds * 2 ** attempt * 1000);
   }

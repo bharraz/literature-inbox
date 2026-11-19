@@ -8,7 +8,7 @@
  * rather than `fetch` (which would hit CORS).
  */
 
-import { Notice, TFile, normalizePath, requestUrl, type App, type Vault } from "obsidian";
+import { Notice, TFile, TFolder, normalizePath, requestUrl, type App, type Vault } from "obsidian";
 import type { Transport, TransportResponse } from "./core/http";
 import { USER_AGENT } from "./core/http";
 import type { VaultAdapter } from "./core/update";
@@ -82,6 +82,16 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     return this.vault
       .getFiles()
       .filter((file) => file.path.startsWith(prefix) && file.extension === "md")
+      .map((file) => file.path);
+  }
+
+  /** Every folder below *folder*, at any depth. Synchronous — Obsidian keeps
+   * the tree in memory — so a settings page can list them while rendering. */
+  listFolders(folder: string): string[] {
+    const prefix = `${normalizePath(folder)}/`;
+    return this.vault
+      .getAllLoadedFiles()
+      .filter((file): file is TFolder => file instanceof TFolder && file.path.startsWith(prefix))
       .map((file) => file.path);
   }
 

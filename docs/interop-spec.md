@@ -74,8 +74,9 @@ leading newlines, re-append it below the freshly generated block.
 A note is **untouched** iff its current content still matches what was
 generated for it (tracked as a hash in the plugin's own `data.json`, never
 in the note itself). Any edit at all — including ticking a checkbox — makes
-it touched. Cleanup never removes anything that is not untouched, and even
-then moves to Obsidian's trash rather than deleting.
+it touched. A touched note is never regenerated or marked; the plugin only
+ever adds links inside its citations block (§2.2). The plugin never deletes
+a note at all.
 
 ### 2.2 Citations sub-block markers (additive)
 
@@ -89,9 +90,9 @@ second, narrower marker pair:
 <!-- literature-inbox:citations:end -->
 ```
 
-Purpose: the outer generated-section markers guard the *whole* note for
-cleanup — any edit anywhere inside them freezes the note from cleanup, by
-design. That all-or-nothing rule would also freeze the citations list the
+Purpose: the outer generated-section markers guard the *whole* note — any
+edit anywhere inside them makes the note the user's, by design. That
+all-or-nothing rule would also freeze the citations list the
 moment the user wrote so much as a personal tag elsewhere in the note. This
 inner block lets the plugin always find and *add to* just the citations
 content, regardless of anything else going on in the note — additively
@@ -101,7 +102,9 @@ inside the block exactly where it is.
 ### 2.3 Frontmatter
 
 A `---`-delimited YAML block. Keys are omitted entirely when empty (never
-written blank). Paper notes:
+written blank). Reader-facing keys come first and the plugin's bookkeeping
+last; readers must not depend on order. `authors` is always the complete
+list. Paper notes:
 
 ```yaml
 ---
@@ -109,17 +112,17 @@ title: Attention Is All You Need
 authors:
   - Ashish Vaswani
 year: "2017"
+publication: NeurIPS
 doi: 10.5555/Attention
 url: "https://arxiv.org/abs/1706.03762"
-publication: NeurIPS
+tags:
+  - transformers
 item-type: journalArticle
 source: openalex
 fetched: 2026-07-22
 origin-ids:
   - doi:10.5555/attention
   - openalex:W2963403868
-tags:
-  - transformers
 ---
 ```
 
@@ -142,7 +145,9 @@ reader must **parse the YAML, not string-match** it.
    `LPT1`–`LPT9`, case-insensitive) → prefix with `_`.
 
 **Collisions** are resolved deterministically against a case-insensitive set of
-already-assigned names, allocating in a stable order (works sorted by key):
+already-assigned names, allocating in a stable order (works sorted by key).
+A file already on disk at the target path counts as assigned, whether or not
+the plugin can identify it — a new note never replaces an existing file:
 1. `Name` if free;
 2. else `Name (year)` if a year exists and it's free;
 3. else `Name (key)`;
@@ -150,8 +155,9 @@ already-assigned names, allocating in a stable order (works sorted by key):
 
 ## 3. Never inbox what the vault already has
 
-Before creating an inbox note, the plugin scans the papers folder, reads each
-note's frontmatter, and checks the fetched work's ids against what it finds —
+Before creating an inbox note, the plugin scans the papers and inbox folders,
+reads each note's frontmatter, and checks the fetched work's ids against what
+it finds —
 by `origin-ids` intersection first, then by normalized title — skipping
 anything already present and **listing the skip in the run report** so it's
 visible rather than mysterious.
@@ -161,8 +167,18 @@ visible rather than mysterious.
 The user keeps a paper by moving the note out of `Inbox/` into `Papers/` — by
 hand or via a one-click command; both are identical, because **the folder is
 the source of truth**, not a command having been run. Obsidian rewrites inbound
-wikilinks on move, so nothing dangles. The plugin only ever prunes notes still
-in `Inbox/`; a note that has left is no longer its business.
+wikilinks on move, so nothing dangles.
+
+The folders decide everything, at the start of every run:
+
+- Any note under the inbox folder (subfolders included) that carries
+  `origin-ids` is an arrival — one the user renamed or moved within the inbox
+  keeps its tracked state, matched by id, and one with no tracked state is
+  adopted as if the user had edited it.
+- Any note under the papers folder is kept.
+- An arrival found in neither was deleted, or moved somewhere the plugin
+  does not look. Its ids are remembered, and that paper is never inboxed
+  again.
 
 Recognising a kept note again is by identity, never by filename: the plugin
 scans the papers folder and reads each note's frontmatter, matching

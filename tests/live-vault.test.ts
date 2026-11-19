@@ -259,17 +259,25 @@ interface Connectivity {
  *
  * `withKeptEdge` is the one that matters: an arrival linked only to other
  * unread arrivals tells you nothing, while one linked to a paper you kept is
- * the entire "why you're seeing this" signal.
+ * the useful relevance signal.
  */
 function connectivity(app: App, inboxFolder: string): Connectivity {
   const result: Connectivity = { arrivals: 0, withAnyEdge: 0, withKeptEdge: 0, isolated: 0 };
+  const kept = new Set(
+    [...app.vault.files.keys()]
+      .filter((path) => path.startsWith("Papers/") && path.endsWith(".md"))
+      .map((path) => path.split("/").pop()!.slice(0, -3)),
+  );
   for (const [path, content] of app.vault.files) {
     if (!path.startsWith(`${inboxFolder}/`) || path.endsWith("_Inbox.md")) continue;
     result.arrivals += 1;
     const hasEdges = content.includes("## Citations");
     if (hasEdges) result.withAnyEdge += 1;
     else result.isolated += 1;
-    if (content.includes("Why you're seeing this")) result.withKeptEdge += 1;
+    const linksToKept = [...content.matchAll(/\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g)].some(
+      (match) => kept.has(match[1]!.split("/").pop()!.replace(/\.md$/i, "")),
+    );
+    if (linksToKept) result.withKeptEdge += 1;
   }
   return result;
 }
@@ -320,10 +328,11 @@ suite("a real vault, end to end", () => {
         p.settings.kernelSize = 120;
         p.settings.openAlexApiKey = process.env.LIVE_OPENALEX_KEY ?? "";
         // Both streams on: adjacency ("citing my library") is connected by
-        // construction, topic is the broader, noisier one.
+        // construction, topic is the broader, noisier one. Each writes to its
+        // own subfolder, so the two can be measured apart.
         p.settings.sources = [
-          { kind: "citing", value: "", enabled: true },
-          { kind: "topic", value: TOPIC, enabled: true },
+          { kind: "citing", value: "", enabled: true, inboxFolder: "Citing" },
+          { kind: "topic", value: TOPIC, enabled: true, inboxFolder: "Topic" },
         ];
         p.settings.maxArrivalsPerRun = 25;
         p.settings.newWindowDays = 30;
@@ -333,24 +342,36 @@ suite("a real vault, end to end", () => {
       const kept = [...app.vault.files.keys()].filter((p) => p.startsWith("Papers/")).length;
 
       await plugin.updateInbox();
-      const stats = connectivity(app, "Inbox");
+      const citing = connectivity(app, "Inbox/Citing");
+      const topic = connectivity(app, "Inbox/Topic");
       const path = dumpVault(app, "openalex");
 
+      const lines = (label: string, stats: Connectivity) => [
+        `${label} arrivals: ${stats.arrivals}`,
+        `  with any citation edge: ${stats.withAnyEdge}`,
+        `  with an edge to a KEPT paper: ${stats.withKeptEdge}`,
+        `  isolated dots: ${stats.isolated}`,
+      ];
       report("openalex arrivals", [
         `kept papers: ${kept}`,
-        `arrivals: ${stats.arrivals}`,
-        `with any citation edge: ${stats.withAnyEdge}`,
-        `with an edge to a KEPT paper (why-line fires): ${stats.withKeptEdge}`,
-        `isolated dots: ${stats.isolated}`,
+        ...lines("citing-my-library", citing),
+        ...lines("topic", topic),
         `vault written to: ${path}`,
         `notices: ${notices.join(" | ")}`,
       ]);
 
-      // The product's claim, asserted rather than hoped: with the "citing my
-      // library" source on, an arrival is connected *by construction*, so
-      // most of them must carry a why-line. Measured at 25/25 on 2026-08-06.
-      expect(stats.arrivals).toBeGreaterThan(0);
-      expect(stats.withKeptEdge / stats.arrivals).toBeGreaterThan(0.5);
+      // The product's claim, asserted rather than hoped: an arrival from
+      // "citing my library" is connected *by construction*, so most of them
+      // must carry an edge to a kept paper. Measured at 25/25 on 2026-08-06.
+      //
+      // Asserted for that source alone. The topic row is reported, not
+      // asserted: OpenAlex has no reference list yet for most new papers
+      // (0 of 15 from the past fortnight, measured 2026-10-21), so its
+      // arrivals mostly land as isolated dots until backfill connects them.
+      // Mixing the two once made this check pass or fail on how many topic
+      // matches a given month happened to have.
+      expect(citing.arrivals).toBeGreaterThan(0);
+      expect(citing.withKeptEdge / citing.arrivals).toBeGreaterThan(0.5);
     },
     TIMEOUT,
   );
@@ -384,7 +405,7 @@ suite("a real vault, end to end", () => {
         `feed: ${FEED}`,
         `arrivals: ${stats.arrivals}`,
         `with any citation edge: ${stats.withAnyEdge}`,
-        `with an edge to a KEPT paper (why-line fires): ${stats.withKeptEdge}`,
+        `with an edge to a KEPT paper: ${stats.withKeptEdge}`,
         `isolated dots: ${stats.isolated}`,
         `vault written to: ${path}`,
       ]);

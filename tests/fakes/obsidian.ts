@@ -107,12 +107,34 @@ export function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/|\/$/g, "");
 }
 
+type VaultListener = (...args: unknown[]) => unknown;
+
 export class Vault {
   /** path -> contents */
   readonly files = new Map<string, string>();
   readonly folders = new Set<string>();
   /** Every mutating call, so tests can assert on write amplification. */
   readonly log: string[] = [];
+  private readonly listeners = new Map<string, VaultListener[]>();
+
+  on(name: string, callback: VaultListener): { name: string } {
+    const list = this.listeners.get(name) ?? [];
+    list.push(callback);
+    this.listeners.set(name, list);
+    return { name };
+  }
+
+  trigger(name: string, ...args: unknown[]): void {
+    for (const callback of this.listeners.get(name) ?? []) callback(...args);
+  }
+
+  /** Every file and folder, like the real in-memory tree. */
+  getAllLoadedFiles(): TAbstractFile[] {
+    return [
+      ...[...this.folders].map((path) => new TFolder(path)),
+      ...[...this.files.keys()].map((path) => new TFile(path)),
+    ];
+  }
 
   getAbstractFileByPath(path: string): TAbstractFile | null {
     const normalized = normalizePath(path);
@@ -178,14 +200,51 @@ export class FileManager {
     this.trashed.push(normalized);
   }
 
-  async renameFile(file: TFile, newPath: string): Promise<void> {
+  /**
+   * Like the real one: a move never replaces what is already at the target,
+   * and the TFile/TFolder handed in has its path updated *in place*
+   * (Obsidian's file objects are long-lived, so code holding one sees the new
+   * path after the move). A `rename` event fires for the item and, for a
+   * folder, for every file that moved with it — whether the real vault
+   * reports the children too is not something to rely on, so the plugin's
+   * handler must be correct from the folder's event alone (see
+   * tests/renames.test.ts) and harmless when the children follow.
+   */
+  async renameFile(file: TAbstractFile, newPath: string): Promise<void> {
     const from = normalizePath(file.path);
     const to = normalizePath(newPath);
+    if (this.vault.files.has(to) || this.vault.folders.has(to)) {
+      throw new Error("Destination file already exists!");
+    }
+
+    if (this.vault.folders.has(from)) {
+      const moved: [string, string][] = [];
+      for (const path of [...this.vault.files.keys()]) {
+        if (!path.startsWith(`${from}/`)) continue;
+        const target = `${to}${path.slice(from.length)}`;
+        this.vault.files.set(target, this.vault.files.get(path) as string);
+        this.vault.files.delete(path);
+        moved.push([path, target]);
+      }
+      for (const folder of [...this.vault.folders]) {
+        if (folder !== from && !folder.startsWith(`${from}/`)) continue;
+        this.vault.folders.delete(folder);
+        this.vault.folders.add(`${to}${folder.slice(from.length)}`);
+      }
+      file.path = to;
+      this.vault.log.push(`rename ${from} -> ${to}`);
+      this.vault.trigger("rename", file, from);
+      for (const [oldPath, newChild] of moved) this.vault.trigger("rename", new TFile(newChild), oldPath);
+      return;
+    }
+
     const content = this.vault.files.get(from);
     if (content === undefined) throw new Error(`ENOENT: ${from}`);
     this.vault.files.delete(from);
     this.vault.files.set(to, content);
+    file.path = to;
     this.vault.log.push(`rename ${from} -> ${to}`);
+    this.vault.trigger("rename", file, from);
   }
 }
 
@@ -222,9 +281,31 @@ export class Menu {
 
 type WorkspaceListener = (...args: unknown[]) => unknown;
 
+export class MarkdownView {
+  readonly containerEl = document.createElement("div");
+  readonly contentEl = document.createElement("div");
+
+  constructor(public file: TFile | null) {
+    this.containerEl.appendChild(this.contentEl);
+  }
+}
+
+export class WorkspaceLeaf {
+  constructor(
+    public view: unknown,
+    private readonly resolveView?: () => unknown,
+  ) {}
+
+  async loadIfDeferred(): Promise<void> {
+    if (this.resolveView) this.view = this.resolveView();
+  }
+}
+
 export class Workspace {
   activeFile: TFile | null = null;
+  activeLeaf: WorkspaceLeaf | null = null;
   readonly opened: string[] = [];
+  readonly leaves: WorkspaceLeaf[] = [];
   private readonly listeners = new Map<string, WorkspaceListener[]>();
 
   getActiveFile(): TFile | null {
@@ -246,16 +327,25 @@ export class Workspace {
     return { name };
   }
 
+  iterateAllLeaves(callback: (leaf: WorkspaceLeaf) => unknown): void {
+    for (const leaf of this.leaves) callback(leaf);
+  }
+
+  /** Test helper for ordinary workspace events such as file-open. */
+  trigger(name: string, ...args: unknown[]): void {
+    for (const callback of this.listeners.get(name) ?? []) callback(...args);
+  }
+
   /** Test helper: build the context menu Obsidian would show for a
    * multi-file selection, so a test can find and click an added item. */
-  triggerFilesMenu(files: TFile[]): Menu {
+  triggerFilesMenu(files: TAbstractFile[]): Menu {
     const menu = new Menu();
     for (const cb of this.listeners.get("files-menu") ?? []) cb(menu, files, "test");
     return menu;
   }
 
-  /** Same, for a single-file right-click. */
-  triggerFileMenu(file: TFile): Menu {
+  /** Same, for a single right-click — on a file or a folder. */
+  triggerFileMenu(file: TAbstractFile): Menu {
     const menu = new Menu();
     for (const cb of this.listeners.get("file-menu") ?? []) cb(menu, file, "test");
     return menu;
@@ -265,6 +355,19 @@ export class Workspace {
 export class MetadataCache {
   /** path -> frontmatter, populated by tests. */
   readonly frontmatter = new Map<string, Record<string, unknown>>();
+  private readonly listeners = new Map<string, WorkspaceListener[]>();
+
+  on(name: string, callback: WorkspaceListener): { name: string } {
+    const list = this.listeners.get(name) ?? [];
+    list.push(callback);
+    this.listeners.set(name, list);
+    return { name };
+  }
+
+  /** Test helper: report that a file's metadata was parsed or changed. */
+  trigger(name: string, ...args: unknown[]): void {
+    for (const callback of this.listeners.get(name) ?? []) callback(...args);
+  }
 
   getFileCache(file: TFile): { frontmatter?: Record<string, unknown> } | null {
     const fm = this.frontmatter.get(normalizePath(file.path));

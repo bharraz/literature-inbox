@@ -148,3 +148,44 @@ describe("runKernel targetCount — balanced trimming", () => {
     expect(report.written).toHaveLength(2);
   });
 });
+
+describe("runKernel never duplicates or overwrites", () => {
+  it("skips a paper that is waiting in the inbox, and still links to it", async () => {
+    // Writing it into the papers folder as well gave one paper two notes,
+    // and every [[link]] to it two possible targets.
+    const vault = new MemoryVault();
+    const report = await runKernel({
+      works: [paper("W1", "Already An Arrival"), paper("W2", "Cites The Arrival", ["W1"])],
+      vault: emptyVault,
+      papersFolder: "Papers",
+      adapter: vault,
+      today: "2026-08-24",
+      inbox: [{
+        notePath: "Inbox/Already An Arrival.md",
+        originIds: ["openalex:W1"],
+        arrivedOn: "2026-08-20",
+        contentHash: "h",
+      }],
+    });
+
+    expect(report.skipped).toBe(1);
+    expect(vault.files.has("Papers/Already An Arrival.md")).toBe(false);
+    expect(vault.files.get("Papers/Cites The Arrival.md")).toContain("[[Already An Arrival]]");
+  });
+
+  it("never replaces a note in the papers folder it could not identify", async () => {
+    const vault = new MemoryVault();
+    vault.files.set("Papers/Deep Residual Learning.md", "a note the user wrote, no ids");
+
+    const report = await runKernel({
+      works: [paper("W1", "Deep Residual Learning")],
+      vault: emptyVault,
+      papersFolder: "Papers",
+      adapter: vault,
+      today: "2026-08-24",
+    });
+
+    expect(vault.files.get("Papers/Deep Residual Learning.md")).toBe("a note the user wrote, no ids");
+    expect(report.written[0]?.notePath).toBe("Papers/Deep Residual Learning (W1).md");
+  });
+});

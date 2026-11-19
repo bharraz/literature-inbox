@@ -16,11 +16,13 @@ import {
   bareOpenAlexId,
   makeId,
   normalizeDoi,
+  normalizeTitle,
   ARXIV,
   DOI,
   OPENALEX,
 } from "./ids";
 import {
+  FetchError,
   RateLimiter,
   RateLimitError,
   buildUrl,
@@ -28,6 +30,7 @@ import {
   NotFoundError,
   type Transport,
 } from "./http";
+import { isoDate } from "./dates";
 import { emptyWork, type Author, type Work } from "./types";
 
 export const OPENALEX_BASE_URL = "https://api.openalex.org/works";
@@ -216,10 +219,78 @@ export interface OpenAlexOptions {
   onPartialFetch?: (error: unknown, fetched: number) => void;
 }
 
+/**
+ * OpenAlex answered 401, which means one of two different things, neither
+ * fixed by waiting — so neither is retried, and each gets its own wording
+ * instead of a bare "HTTP 401" and a URL.
+ *
+ *  - `invalid`: the API key in settings is wrong ("Invalid or missing API
+ *    key"). Every request would fail the same way.
+ *  - `required`: the request needs a key the user doesn't have. Measured
+ *    2026-10-21: keyless requests may no longer page past the first page of
+ *    results ("API key required for cursor paging"), so without a key a fetch
+ *    stops at 200.
+ */
+export class OpenAlexKeyError extends FetchError {
+  readonly reason: "invalid" | "required";
+
+  constructor(body: string) {
+    const reason =
+      !/required for cursor paging|past the first page/i.test(body) &&
+      /invalid or missing api key|api key not found/i.test(body)
+        ? "invalid"
+        : "required";
+    super(
+      reason === "invalid"
+        ? "OpenAlex rejected the API key"
+        : "OpenAlex only returns the first 200 results without a free API key",
+      401,
+      body,
+    );
+    this.name = "OpenAlexKeyError";
+    this.reason = reason;
+  }
+}
+
 /** Strips embedded quotes before a term goes inside a quoted-phrase filter
  * value, so a user typing their own quotes can't produce a malformed filter. */
 function quotedPhrase(term: string): string {
-  return term.replace(/"/g, "");
+  return filterValue(term.replace(/"/g, ""));
+}
+
+/**
+ * Make free text safe to embed in a `filter=` value. A comma separates filter
+ * clauses and a pipe means OR, so a title like "Attention, please" sent as-is
+ * is a malformed query — OpenAlex answers 400, verified live. Both are word
+ * separators to the search behind these filters, so a space loses nothing.
+ */
+function filterValue(text: string): string {
+  return text.replace(/[,|]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Whether a concept the search returned is actually the thing the user typed.
+ *
+ * OpenAlex's concept search always offers *something*, and its top hit is
+ * often a different field entirely — verified live: "diffusion models"
+ * resolved to "Relativistic heat conduction", "graph neural networks" to
+ * "Recurrent neural network". Accepting those silently built a starting graph
+ * from the wrong discipline. Only a name match (case, punctuation and a
+ * trailing plural aside) is trusted; anything else falls back to a phrase
+ * search, which is at least about the words the user wrote.
+ */
+export function conceptNameMatches(term: string, displayName: unknown): boolean {
+  if (typeof displayName !== "string") return false;
+  const fold = (value: string) => normalizeTitle(value).replace(/s$/, "");
+  const folded = fold(term);
+  return folded.length > 0 && folded === fold(displayName);
+}
+
+/** How one comma-separated topic term was turned into a filter. */
+export interface TopicTermMatch {
+  term: string;
+  /** The OpenAlex concept it matched, when it matched one by name. */
+  concept?: { id: string; name: string };
 }
 
 export class OpenAlexClient {
@@ -237,8 +308,8 @@ export class OpenAlexClient {
    * A topic box may hold several comma-separated terms — "Smart Grid, AI" —
    * meant as an intersection ("papers at the intersection of both"), not
    * several separate searches. OpenAlex ANDs filter clauses joined by commas,
-   * so each term becomes its own `concepts.id:` (or `default.search:` when it
-   * doesn't resolve to a concept) clause, and joining them all with commas
+   * so each term becomes its own `concepts.id:` (or `title_and_abstract.search:`
+   * when it doesn't resolve to a concept) clause, and joining them all with commas
    * narrows to works matching every term at once.
    */
   private static splitTopics(topic: string): string[] {
@@ -250,65 +321,95 @@ export class OpenAlexClient {
 
   /**
    * Resolves every comma-separated term in *topic* to its own filter clause
-   * and ANDs them together. `unresolved` lists the terms that had no matching
-   * OpenAlex concept and fell back to unscoped full-text search — the
-   * settings preview uses this to warn before a fetch runs on that path.
+   * and ANDs them together.
+   *
+   * `scoped` (the starting graph) tries to match each term to an OpenAlex
+   * concept by name, because "most cited" only means something within a
+   * field, and falls back to the exact phrase — sorted by citations, a looser
+   * match lets in famous papers that merely use the words.
+   *
+   * `words` (the inbox) never uses concepts: they are assigned liberally to
+   * new work — crank uploads tagged "Quantum error correction" were measured
+   * among the newest results — and a concept filter offers no relevance
+   * ranking to push them down. Instead every word must appear in the title or
+   * abstract, ranked by relevance, which skips the concept lookup's own
+   * search-priced request too. Words, not the exact phrase: measured over a
+   * month, "trapped ion quantum computing" as a phrase matched 2 papers and
+   * as words 30, nearly all about trapped-ion quantum computing — and
+   * relevance ranking keeps the looser ones at the bottom. A term the user
+   * puts in quotes is still matched as an exact phrase.
+   *
+   * `unresolved` lists the terms that became a phrase search where a concept
+   * was wanted — the settings preview warns about those.
    */
   private async resolveTopicFilter(
     topic: string,
-  ): Promise<{ filter: string; unresolved: string[] }> {
+    mode: "scoped" | "words" = "scoped",
+  ): Promise<{ filter: string; unresolved: string[]; matches: TopicTermMatch[]; searched: boolean }> {
     const terms = OpenAlexClient.splitTopics(topic);
     if (terms.length === 0) {
       const trimmed = topic.trim();
       return {
-        filter: `default.search:"${quotedPhrase(trimmed)}"`,
+        filter: `title_and_abstract.search:"${quotedPhrase(trimmed)}"`,
         unresolved: trimmed ? [trimmed] : [],
+        matches: trimmed ? [{ term: trimmed }] : [],
+        searched: true,
       };
     }
 
-    const resolved = await Promise.all(
-      terms.map(async (term) => {
-        if (OpenAlexClient.isConceptId(term)) return { term, conceptId: term };
-        return { term, conceptId: await this.resolveConceptId(term) };
+    const matches: TopicTermMatch[] = await Promise.all(
+      terms.map(async (term): Promise<TopicTermMatch> => {
+        if (OpenAlexClient.isConceptId(term)) return { term, concept: { id: term, name: term } };
+        if (mode === "words") return { term };
+        return { term, concept: await this.resolveConcept(term) };
       }),
     );
 
-    const filter = resolved
-      .map((r) => (r.conceptId ? `concepts.id:${r.conceptId}` : `default.search:"${quotedPhrase(r.term)}"`))
+    const filter = matches
+      .map((m) => {
+        if (m.concept) return `concepts.id:${m.concept.id}`;
+        const quoted = /^".+"$/.test(m.term);
+        return mode === "words" && !quoted
+          ? `title_and_abstract.search:${filterValue(m.term)}`
+          : `title_and_abstract.search:"${quotedPhrase(m.term)}"`;
+      })
       .join(",");
-    const unresolved = resolved.filter((r) => !r.conceptId).map((r) => r.term);
-    return { filter, unresolved };
+    const unresolved = mode === "scoped" ? matches.filter((m) => !m.concept).map((m) => m.term) : [];
+    return { filter, unresolved, matches, searched: matches.some((m) => !m.concept) };
   }
 
   /**
-   * Free text resolved once to a concept id, memoized for the run.
+   * Free text resolved once to a concept, memoized for the run.
    *
-   * `default.search` unquoted matches *any* of the words anywhere in
-   * title/abstract/fulltext — sorting those hits by citation count surfaces
-   * the most-cited paper in the whole corpus that happens to contain just the
-   * word "simulation" (a biomolecular simulation package, a DFT code),
-   * regardless of field. `concepts.id` scopes to an actual field, so "most
-   * cited" means something, and is tried first. Falls back to full-text
-   * (returning undefined) if no concept matches or the lookup itself fails —
-   * quoted as an exact phrase (see `topicFilter`'s caller), which turns that
-   * fallback from "contains any of these words" into "contains this phrase",
-   * a real precision fix confirmed live: an OR match across "trapped ion
-   * quantum simulation" pulled in 82k works sorted by raw citation count
-   * (unrelated top-cited papers dominate); the same string quoted as a phrase
-   * narrows to 347, all genuinely on topic. A topic search degrading to
-   * quoted full-text beats a kernel build failing outright.
+   * `concepts.id` scopes to an actual field, so "most cited" means something,
+   * and is tried first — but only accepted when the concept's name is the term
+   * itself (see `conceptNameMatches`). Otherwise this returns undefined and
+   * the caller falls back to an exact phrase in the title or abstract. Quoting
+   * matters: an unquoted search is an OR across every word, and "trapped ion
+   * quantum simulation" pulled in 82k works sorted by raw citation count; as a
+   * phrase, 347, all on topic. Title and abstract rather than `default.search`,
+   * which also matches full text — "diffusion models" there ranked AlphaFold 3
+   * and a radiocarbon calibration curve first, papers that merely mention it.
    */
-  private conceptIdCache = new Map<string, string | undefined>();
+  private conceptCache = new Map<string, { id: string; name: string } | undefined>();
 
-  private async resolveConceptId(topic: string): Promise<string | undefined> {
+  private async resolveConcept(topic: string): Promise<{ id: string; name: string } | undefined> {
     const key = topic.trim().toLowerCase();
-    if (this.conceptIdCache.has(key)) return this.conceptIdCache.get(key);
+    if (this.conceptCache.has(key)) return this.conceptCache.get(key);
     try {
-      const url = this.buildUrl(OPENALEX_CONCEPTS_URL, { search: topic, "per-page": "1" });
+      // Five, not one: the name match is often the second or third hit, and a
+      // search costs the same whatever the page size.
+      const url = this.buildUrl(OPENALEX_CONCEPTS_URL, {
+        search: topic,
+        "per-page": "5",
+        select: "id,display_name",
+      });
       const data = await this.getJson(url);
-      const id = data.results?.[0]?.id;
-      const resolved = typeof id === "string" ? bareOpenAlexId(id) : undefined;
-      this.conceptIdCache.set(key, resolved);
+      const hit = ((data.results ?? []) as any[]).find(
+        (result) => typeof result?.id === "string" && conceptNameMatches(topic, result.display_name),
+      );
+      const resolved = hit ? { id: bareOpenAlexId(hit.id), name: String(hit.display_name) } : undefined;
+      this.conceptCache.set(key, resolved);
       return resolved;
     } catch (error) {
       // A rate limit here must latch exactly like it does inside `paginated`,
@@ -327,13 +428,27 @@ export class OpenAlexClient {
 
   private async getJson(url: string): Promise<any> {
     if (this.rateLimited) throw this.rateLimited;
+    if (this.rejectedKey) throw this.rejectedKey;
     await this.limiter.wait();
-    const body = await getWithRetry(this.transport, url, {
-      maxRetries: this.options.maxRetries,
-      sleep: this.options.sleep,
-    });
+    let body: string;
+    try {
+      body = await getWithRetry(this.transport, url, {
+        maxRetries: this.options.maxRetries,
+        sleep: this.options.sleep,
+      });
+    } catch (error) {
+      if (!(error instanceof FetchError) || error.status !== 401) throw error;
+      const keyError = new OpenAlexKeyError(error.body ?? "");
+      // A rejected key fails every request identically, so the rest of the
+      // run stops asking — like a rate limit, it latches for this client.
+      if (keyError.reason === "invalid") this.rejectedKey = keyError;
+      throw keyError;
+    }
     return JSON.parse(body);
   }
+
+  /** Set once OpenAlex has refused the configured key. Latches for the run. */
+  private rejectedKey?: OpenAlexKeyError;
 
   private buildUrl(base: string, params: Record<string, string | undefined>): string {
     return buildUrl(base, { ...params, api_key: this.options.apiKey });
@@ -408,13 +523,28 @@ export class OpenAlexClient {
 
   /**
    * Which comma-separated terms in *topic* have no matching OpenAlex concept
-   * and would fall back to unscoped full-text search (see `resolveConceptId`'s
-   * doc comment). Empty means every term resolved. Used by the settings
+   * and fall back to a phrase search (see `resolveConcept`'s doc comment).
+   * Empty means every term resolved. Used by the settings
    * preview to warn before a fetch runs on the unscoped path, where "most
    * cited" stops meaning "most cited in your field."
    */
   async unresolvedTopics(topic: string): Promise<string[]> {
     return (await this.resolveTopicFilter(topic)).unresolved;
+  }
+
+  /**
+   * How each term of a starting-graph topic was interpreted — which OpenAlex
+   * field it matched, if any — so the preview can show the mapping instead of
+   * leaving the user to infer it from a title list. Memoized with the search
+   * itself, so asking after a `topWorks` costs nothing.
+   */
+  async topicMatches(topic: string): Promise<TopicTermMatch[]> {
+    return (await this.resolveTopicFilter(topic)).matches;
+  }
+
+  /** Today, as OpenAlex's upper date bound for "new" papers. */
+  private todayIso(): string {
+    return isoDate(this.options.today?.() ?? new Date());
   }
 
   /**
@@ -437,8 +567,22 @@ export class OpenAlexClient {
   }
 
   /**
-   * Works matching *topic* published on/after `since` (YYYY-MM-DD), newest
-   * first.
+   * Works matching *topic* published between `since` (YYYY-MM-DD) and today,
+   * most relevant first. Matching means every word of each term in the title
+   * or abstract, or the exact phrase if the user quoted it — see
+   * `resolveTopicFilter`.
+   *
+   * Relevance, not recency, decides the order. Measured live for "quantum
+   * error correction" over two weeks: newest-first put future-dated records
+   * and a run of crank repository uploads ahead of everything real — 2 of the
+   * first 12 were genuine — while relevance order put genuine papers in 10 of
+   * 12. Everything inside the window is new by definition; what the order
+   * decides is which of them a capped run keeps. (A bare concept id has no
+   * search to rank by, so it alone falls back to newest-first.)
+   *
+   * The upper bound is today because OpenAlex carries publication dates in the
+   * future — journal issues dated next month, and outright errors — and in a
+   * newest-first order those sort above everything published so far.
    *
    * `basis` defaults to `publication`, and **`created` is not usable on the
    * free tier**: `from_created_date` is a paid-plan filter, and OpenAlex
@@ -457,9 +601,14 @@ export class OpenAlexClient {
     basis: RecencyBasis = "publication",
   ): Promise<Work[]> {
     const dateFilter = basis === "created" ? "from_created_date" : "from_publication_date";
-    const { filter: topicFilter } = await this.resolveTopicFilter(topic);
-    const filter = [topicFilter, this.typeFilter(), `${dateFilter}:${since}`].join(",");
-    return this.paginated(filter, "publication_date:desc", limit);
+    const { filter: topicFilter, searched } = await this.resolveTopicFilter(topic, "words");
+    const filter = [
+      topicFilter,
+      this.typeFilter(),
+      `${dateFilter}:${since}`,
+      `to_publication_date:${this.todayIso()}`,
+    ].join(",");
+    return this.paginated(filter, searched ? "relevance_score:desc" : "publication_date:desc", limit);
   }
 
   /** Resolve one work by DOI, or undefined when OpenAlex doesn't have it. */
@@ -479,8 +628,10 @@ export class OpenAlexClient {
    * arrived without one. Returns undefined rather than guessing when the
    * top hit's title doesn't actually match. */
   async workByTitle(title: string): Promise<Work | undefined> {
+    const query = filterValue(title);
+    if (!query) return undefined;
     const url = this.buildUrl(OPENALEX_BASE_URL, {
-      filter: `title.search:${title}`,
+      filter: `title.search:${query}`,
       "per-page": "1",
     });
     const data = await this.getJson(url);
@@ -522,6 +673,12 @@ export class OpenAlexClient {
    * user's library, which is the entire premise of the plugin.
    *
    * Sorted newest-first, unlike `worksCiting`, which wants influence.
+   *
+   * *limit* applies per batch of anchors, and every batch is asked. Stopping
+   * once the first batch filled the pool meant a library past 50 papers only
+   * ever drew arrivals from whichever 50 its folder listed first. The caller
+   * ranks the union by connection, so a second batch costs one request and
+   * can only improve the pick.
    */
   async worksCitingSince(
     ids: string[],
@@ -536,17 +693,19 @@ export class OpenAlexClient {
 
     return this.tolerant(results, async () => {
       for (const chunk of chunked(ids, ADJACENCY_BATCH)) {
-        if (results.length >= limit || this.rateLimited) break;
+        if (this.rateLimited) break;
+        // Bounded at today for the same reason as `worksSince`: in a
+        // newest-first order, a future-dated record outranks everything real.
         const filter = [
           `cites:${chunk.join("|")}`,
           this.typeFilter(),
           `${dateFilter}:${since}`,
+          `to_publication_date:${this.todayIso()}`,
         ].join(",");
         for (const work of await this.paginated(filter, "publication_date:desc", limit)) {
           if (seen.has(work.key)) continue;
           seen.add(work.key);
           results.push(work);
-          if (results.length >= limit) break;
         }
       }
     });
@@ -595,7 +754,9 @@ export class OpenAlexClient {
       const orcid = trimmed.replace(/^https?:\/\/orcid\.org\//i, "");
       authorFilter = `authorships.author.orcid:https://orcid.org/${orcid}`;
     } else {
-      authorFilter = `raw_author_name.search:${trimmed}`;
+      // "Lovelace, Ada" is how bibliographies write names, and an unescaped
+      // comma would end the filter clause mid-name.
+      authorFilter = `raw_author_name.search:${filterValue(trimmed)}`;
     }
     return this.paginated(`${authorFilter},${this.typeFilter()}`, "cited_by_count:desc", n);
   }

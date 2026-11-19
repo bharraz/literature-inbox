@@ -36,8 +36,16 @@ describe("origin id normalization (spec §3.1)", () => {
   });
 
   it("does not mistake a non-numeric v for a version marker", () => {
-    expect(bareArxivId("cond-mat/9901001")).toBe("9901001");
     expect(bareArxivId("hep-thv")).toBe("hep-thv");
+  });
+
+  it("keeps the archive of a pre-2007 id, which is half of its identity", () => {
+    // Dropping it turned `cond-mat/9901001` into `9901001` — an id arXiv
+    // cannot resolve and OpenAlex never records, so the paper deduped
+    // against nothing and its derived DOI pointed nowhere.
+    expect(bareArxivId("cond-mat/9901001")).toBe("cond-mat/9901001");
+    expect(bareArxivId("http://arxiv.org/abs/hep-th/9901001v2")).toBe("hep-th/9901001");
+    expect(bareArxivId("math.AG/0601001v1")).toBe("math.AG/0601001");
   });
 });
 

@@ -13,7 +13,7 @@ import {
   type CitationEdge,
   type ReferenceRecord,
 } from "./citations";
-import { FilenameAllocator } from "./filenames";
+import { FilenameAllocator, allocateUnused } from "./filenames";
 import { contentHash } from "./hash";
 import { idsIntersect, isDistinctiveTitle, normalizeTitle, originIds, serializeId } from "./ids";
 import {
@@ -61,8 +61,6 @@ export interface UpdateSettings {
   maxArrivalsPerRun: number;
   authorPlacement?: AuthorPlacement;
   subjects?: SubjectOptions;
-  /** Initial read-status for new notes, when the feature is on. */
-  readStatus?: string;
 }
 
 export type SkipReason =
@@ -77,7 +75,11 @@ export interface UpdateReport {
   /** Fetch failures, by source — a source being down is "no update from that
    * source this run", never a failed run. */
   sourceErrors: { source: string; message: string }[];
+  /** Set when the run-wide `maxArrivalsPerRun` ceiling stopped selection. */
   cappedAt?: number;
+  /** New candidates left unwritten by any cap — still candidates next run,
+   * for as long as their source keeps returning them. */
+  heldBack?: number;
   /** Already-known papers whose note gained a "Cites" link to one of today's
    * arrivals, discovered via the persisted reference index rather than a
    * fresh fetch. */
@@ -160,6 +162,19 @@ export interface UpdateRunInput {
   /** Which source row a given work came from, for the per-source breakdown
    * in the run report. Omit to leave `arrived[].source` unset. */
   sourceFor?: (work: Work) => string;
+  /**
+   * The source row a work came from and that row's own "papers per run".
+   * Each group's cap is applied to its own best candidates, after dedup — so
+   * a row set to 10 delivers up to 10 however the others are set, and a row's
+   * already-seen papers never use up its slots. Omit for one shared cap.
+   */
+  capFor?: (work: Work) => { group: string; cap: number };
+  /**
+   * The source's own ranking for a work, lower first — a topic search's
+   * relevance order, which date order would otherwise throw away. Consulted
+   * only between equally connected candidates. Omit to rank ties by date.
+   */
+  orderFor?: (work: Work) => number;
 }
 
 export interface UpdateRunOutput {
@@ -194,8 +209,8 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
   // survive, not after.
   const index = new CitationIndex();
   // Note names that belong to papers the user kept, as opposed to arrivals
-  // still sitting in the inbox. Only these count as "why you're seeing this",
-  // and as a rank signal below: connecting to five unread arrivals means
+  // still sitting in the inbox. Only these count as a rank signal below:
+  // connecting to five unread arrivals means
   // nothing, connecting to five papers you deliberately kept is the entire
   // signal.
   const keptNames = new Set<string>();
@@ -223,11 +238,11 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
 
   // First pass: drop what's already known — in the vault, in the inbox, or
   // previously removed — then rank what's left by how well it connects to
-  // the *kept* library, newest first as a tiebreak. The cap then keeps the
-  // best candidates rather than whichever a source happened to list first,
-  // so repeatedly pressing fetch surfaces progressively less-connected
-  // candidates instead of the same tier every time.
-  const candidates: { work: Work; ids: string[]; connectedKeptCount: number }[] = [];
+  // the *kept* library. The cap then keeps the best candidates rather than
+  // whichever a source happened to list first, so repeatedly pressing fetch
+  // surfaces progressively less-connected candidates instead of the same
+  // tier every time.
+  const candidates: { work: Work; ids: string[]; keptTargets: string[]; order: number }[] = [];
   for (const work of fetched) {
     const existing = findExisting(work, vault, inbox, previouslyRemoved);
     if (existing) {
@@ -248,24 +263,61 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
     // A placeholder note name: this candidate has none yet, and one can never
     // collide with it since a real note name is never the empty string.
     const { edges } = resolveCitations(work, "", index);
-    const connectedKeptCount = edges.filter((edge) => keptNames.has(edge.targetKey)).length;
-    candidates.push({ work, ids, connectedKeptCount });
+    const keptTargets = edges.map((edge) => edge.targetKey).filter((name) => keptNames.has(name));
+    candidates.push({ work, ids, keptTargets, order: input.orderFor?.(work) ?? 0 });
   }
 
-  candidates.sort((a, b) => {
-    if (b.connectedKeptCount !== a.connectedKeptCount) {
-      return b.connectedKeptCount - a.connectedKeptCount;
+  // Not every connection is equal evidence. A kept paper that much of the pool
+  // cites — a field's survey, its famous result — says little about any one
+  // candidate; one that a single candidate cites says a lot. Measured live on
+  // a starting graph seeded from "quantum error correction": of 50 recent
+  // papers citing it, 18 cited the same NISQ survey and 16 the same
+  // variational-algorithms review, and most of those were quantum machine
+  // learning or applications papers linked by nothing else. So each kept
+  // paper is weighted by how rare citing it is within this run's pool
+  // (log((N + 1) / df), which never reaches zero: any connection still beats
+  // none). With every kept paper cited once, this is the plain count.
+  const citers = new Map<string, number>();
+  for (const candidate of candidates) {
+    for (const name of candidate.keptTargets) citers.set(name, (citers.get(name) ?? 0) + 1);
+  }
+  const specificity = (name: string) =>
+    Math.log((candidates.length + 1) / (citers.get(name) ?? 1));
+  const ranked = candidates.map((candidate) => ({
+    ...candidate,
+    score: candidate.keptTargets.reduce((sum, name) => sum + specificity(name), 0),
+  }));
+
+  ranked.sort(
+    (a, b) =>
+      b.score - a.score ||
+      b.keptTargets.length - a.keptTargets.length ||
+      a.order - b.order ||
+      (b.work.date ?? "").localeCompare(a.work.date ?? ""),
+  );
+
+  const kept: typeof ranked = [];
+  const takenByGroup = new Map<string, number>();
+  for (const candidate of ranked) {
+    if (kept.length >= settings.maxArrivalsPerRun) {
+      report.cappedAt = settings.maxArrivalsPerRun;
+      break;
     }
-    return (b.work.date ?? "").localeCompare(a.work.date ?? "");
-  });
+    const limit = input.capFor?.(candidate.work);
+    if (limit) {
+      const taken = takenByGroup.get(limit.group) ?? 0;
+      if (taken >= limit.cap) continue;
+      takenByGroup.set(limit.group, taken + 1);
+    }
+    kept.push(candidate);
+  }
+  if (kept.length < ranked.length) report.heldBack = ranked.length - kept.length;
 
-  const kept = candidates.slice(0, settings.maxArrivalsPerRun);
-  if (kept.length < candidates.length) report.cappedAt = settings.maxArrivalsPerRun;
-
-  const accepted: { work: Work; noteName: string; ids: string[] }[] = [];
+  const accepted: { work: Work; noteName: string; ids: string[]; folder: string }[] = [];
   for (const { work, ids } of kept) {
-    const { filename } = allocator.allocate(work);
-    accepted.push({ work, noteName: filename, ids });
+    const folder = input.folderFor?.(work) ?? settings.inboxFolder;
+    const noteName = await allocateUnused(allocator, work, folder, (path) => adapter.exists(path));
+    accepted.push({ work, noteName, ids, folder });
   }
 
   // A candidate can also connect to a fellow arrival in this same batch —
@@ -310,7 +362,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
   for (const entry of accepted) {
     const cites = citesByNote.get(entry.noteName) ?? [];
     const citedBy = retroCitedByNew.get(entry.noteName) ?? [];
-    const folder = input.folderFor?.(entry.work) ?? settings.inboxFolder;
+    const folder = entry.folder;
     if (!ensuredFolders.has(folder)) {
       await adapter.ensureFolder(folder);
       ensuredFolders.add(folder);
@@ -323,9 +375,7 @@ export async function runUpdate(input: UpdateRunInput): Promise<UpdateRunOutput>
       citedBy,
       arrivedOn: today,
       originIds: entry.ids,
-      connectedKept: [...cites, ...citedBy].filter((name) => keptNames.has(name)),
       subjects: settings.subjects,
-      readStatus: settings.readStatus,
     });
     await adapter.write(notePath, content);
     inbox.push({

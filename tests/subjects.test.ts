@@ -153,3 +153,13 @@ describe("reading subject terms from OpenAlex", () => {
     expect(work.keywords).toEqual(["real"]);
   });
 });
+
+describe("subject terms in a note", () => {
+  it("stops at eight, most curated first, so they don't bury the abstract", () => {
+    const item = emptyWork("W1");
+    item.topics = ["T1", "T2", "T3"];
+    item.keywords = Array.from({ length: 10 }, (_, i) => `K${i}`);
+    const terms = collectSubjects(item, { placement: "property", topics: true, keywords: true });
+    expect(terms).toEqual(["T1", "T2", "T3", "K0", "K1", "K2", "K3", "K4"]);
+  });
+});

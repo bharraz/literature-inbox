@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 import { ArxivClient } from "../src/core/arxiv";
-import { OpenAlexClient } from "../src/core/openalex";
+import { OpenAlexClient, OpenAlexKeyError } from "../src/core/openalex";
 import { CrossrefClient } from "../src/core/crossref";
 import type { Transport, TransportResponse } from "../src/core/http";
 
@@ -36,8 +36,13 @@ class NodeTransport implements Transport {
 const transport = new NodeTransport();
 const TIMEOUT = 45_000;
 
+/** Optional: a real OpenAlex key, for the checks that need one — the same
+ * variable the vault and simulation harnesses read. Never committed; set it
+ * in the environment for a run. */
+const API_KEY = process.env.LIVE_OPENALEX_KEY || undefined;
+
 suite("OpenAlex, live", () => {
-  const client = () => new OpenAlexClient(transport, { minIntervalMs: 250 });
+  const client = () => new OpenAlexClient(transport, { minIntervalMs: 250, apiKey: API_KEY });
 
   it(
     "still returns works for a topic search",
@@ -48,6 +53,39 @@ suite("OpenAlex, live", () => {
         expect(work.title).toBeTruthy();
         expect(work.ids.some((id) => id.namespace === "openalex")).toBe(true);
       }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keeps a topic source's arrivals on topic and dated no later than today",
+    async () => {
+      // The update path: every word in the title or abstract, ranked by
+      // relevance. Newest-first over a concept tag led with crank uploads and
+      // future-dated records when this was last measured.
+      const today = new Date().toISOString().slice(0, 10);
+      const since = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+      const works = await client().worksSince("quantum error correction", since, 10);
+      expect(works.length).toBeGreaterThan(0);
+      const onTopic = works.filter((work) => {
+        const text = `${work.title} ${work.abstract ?? ""}`;
+        return /error/i.test(text) && /correct/i.test(text) && /quantum/i.test(text);
+      });
+      expect(onTopic.length / works.length).toBeGreaterThanOrEqual(0.8);
+      for (const work of works) expect((work.date ?? "") <= today).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "refuses a concept whose name is not the topic, and accepts one that is",
+    async () => {
+      // "diffusion models" once resolved, silently, to "Relativistic heat
+      // conduction" — the concept search's top hit.
+      const live = client();
+      expect(await live.topicMatches("diffusion models")).toEqual([{ term: "diffusion models" }]);
+      const [smartGrid] = await live.topicMatches("smart grid");
+      expect(smartGrid?.concept?.name.toLowerCase()).toBe("smart grid");
     },
     TIMEOUT,
   );
@@ -121,9 +159,25 @@ suite("OpenAlex, live", () => {
   it(
     "still paginates by cursor",
     async () => {
-      // More than one page's worth, to force a second request.
-      const works = await client().topWorks("quantum computing", 120);
-      expect(works.length).toBeGreaterThan(100);
+      // More than one page's worth — a page holds at most 200 — so a second
+      // request really happens. (This asked for 120 once pages grew to 200,
+      // and quietly stopped testing anything.) Since October 2026 OpenAlex
+      // refuses a keyless second page, so without LIVE_OPENALEX_KEY set this
+      // fails — with the plugin's own wording — and that failure is the
+      // finding.
+      const works = await client().topWorks("quantum computing", 250);
+      expect(works.length).toBeGreaterThan(200);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "recognises a rejected key for what it is",
+    async () => {
+      const keyed = new OpenAlexClient(transport, { minIntervalMs: 250, apiKey: "not-a-real-key" });
+      const error = await keyed.workByDoi("10.1109/cvpr.2016.90").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(OpenAlexKeyError);
+      expect((error as OpenAlexKeyError).reason).toBe("invalid");
     },
     TIMEOUT,
   );
@@ -185,6 +239,16 @@ suite("arXiv, live", () => {
       expect(work?.title).toContain("Attention Is All You Need");
       expect(work?.abstract).toBeTruthy();
       expect(work?.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keeps the archive of a pre-2007 id",
+    async () => {
+      const work = await client().workById("hep-th/9711200");
+      expect(work?.title).toMatch(/large N limit/i);
+      expect(work?.ids).toContainEqual({ namespace: "arxiv", value: "hep-th/9711200" });
     },
     TIMEOUT,
   );

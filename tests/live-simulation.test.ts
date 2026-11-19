@@ -98,6 +98,19 @@ function inboxNotes(app: App): string[] {
   );
 }
 
+function connectsToKeptPaper(app: App, content: string): boolean {
+  const kept = new Set(
+    [...app.vault.files.keys()]
+      .filter((path) => path.startsWith("Papers/") && path.endsWith(".md"))
+      .map((path) => path.split("/").pop()!.slice(0, -3)),
+  );
+  for (const match of content.matchAll(/\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g)) {
+    const name = match[1]!.split("/").pop()!.replace(/\.md$/i, "");
+    if (kept.has(name)) return true;
+  }
+  return false;
+}
+
 interface FieldResult {
   field: string;
   kernel: number;
@@ -105,7 +118,7 @@ interface FieldResult {
   keptByHand: number;
   reappeared: string[];
   duplicates: number;
-  finalWhyRate: number;
+  finalKeptEdgeRate: number;
 }
 
 async function simulateField(field: string): Promise<FieldResult> {
@@ -120,8 +133,11 @@ async function simulateField(field: string): Promise<FieldResult> {
   });
 
   // Two live requests per field: the starting graph, and a month of papers.
+  // A month is one page (200) without a key: since October 2026 OpenAlex
+  // refuses to page further keyless, and a broad field has more than that.
   const kernelWorks = await client.topWorks(field, 100);
-  const monthWorks = await client.worksSince(field, isoDaysAgo(DAYS), 300);
+  const monthLimit = process.env.LIVE_OPENALEX_KEY ? 300 : 200;
+  const monthWorks = await client.worksSince(field, isoDaysAgo(DAYS), monthLimit);
 
   // Partition the month by publication date, so each simulated day serves the
   // papers that genuinely appeared that day.
@@ -172,7 +188,7 @@ async function simulateField(field: string): Promise<FieldResult> {
     let connected = 0;
     for (const path of fresh) {
       const text = app.vault.files.get(path) as string;
-      if (text.includes("Why you're seeing this")) connected += 1;
+      if (connectsToKeptPaper(app, text)) connected += 1;
     }
 
     days.push({
@@ -200,8 +216,8 @@ async function simulateField(field: string): Promise<FieldResult> {
   const duplicates = inboxNotes(app).length - beforeRepeat;
 
   const finalNotes = inboxNotes(app);
-  const withWhy = finalNotes.filter((p) =>
-    (app.vault.files.get(p) as string).includes("Why you're seeing this"),
+  const withKeptEdge = finalNotes.filter((p) =>
+    connectsToKeptPaper(app, app.vault.files.get(p) as string),
   ).length;
 
   return {
@@ -211,7 +227,7 @@ async function simulateField(field: string): Promise<FieldResult> {
     keptByHand: keptPaths.length,
     reappeared,
     duplicates,
-    finalWhyRate: finalNotes.length ? withWhy / finalNotes.length : 0,
+    finalKeptEdgeRate: finalNotes.length ? withKeptEdge / finalNotes.length : 0,
   };
 }
 
@@ -238,7 +254,7 @@ suite("a simulated month, across fields", () => {
             `kept by hand during the month: ${result.keptByHand}`,
             `kept papers that came back: ${result.reappeared.length}`,
             `duplicates on re-running the same day: ${duplicates}`,
-            `why-line rate across the final inbox: ${(result.finalWhyRate * 100).toFixed(0)}%`,
+            `kept-edge rate across the final inbox: ${(result.finalKeptEdgeRate * 100).toFixed(0)}%`,
           ].join("\n"),
         );
 

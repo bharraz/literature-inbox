@@ -179,3 +179,60 @@ describe("mergeCitations", () => {
     expect(mergeCitations(base, [], [])).toBe(base);
   });
 });
+
+describe("mergeCitations after a rename", () => {
+  const base = renderInboxNote({
+    work: work("A Paper"),
+    arrivedOn: "2026-01-01",
+    originIds: ["openalex:W1"],
+  });
+
+  it("recognises a link Obsidian rewrote with a path, alias or heading", () => {
+    // Renaming a note can leave links to it as [[Papers/Name]] or
+    // [[Name|Old name]]; read as a different note, the same link was added
+    // a second time.
+    for (const rewritten of ["Papers/Some Paper", "Some Paper|Old Title", "Some Paper#Abstract"]) {
+      const withRewrite = mergeCitations(base, [rewritten], []);
+      expect(mergeCitations(withRewrite, ["Some Paper"], [])).toBe(withRewrite);
+    }
+  });
+});
+
+describe("properties a reader sees first", () => {
+  it("keeps every author, however many there are", () => {
+    // A shortened list would be a wrong record of the paper.
+    const big = work("A Large Collaboration Paper");
+    big.authors = Array.from({ length: 40 }, (_, i) => ({ firstName: "Author", lastName: `N${i}` }));
+    const note = renderInboxNote({
+      work: big,
+      authorPlacement: "property",
+      arrivedOn: "2026-01-01",
+      originIds: ["openalex:W1"],
+    });
+    for (let i = 0; i < 40; i++) expect(note).toContain(`  - Author N${i}\n`);
+    expect(note).not.toContain("et al");
+  });
+
+  it("puts the reader's fields first and the plugin's bookkeeping last", () => {
+    const paper = work("An Ordered Paper Title");
+    paper.authors = [{ firstName: "Ada", lastName: "Lovelace" }];
+    paper.date = "2024-01-01";
+    paper.doi = "10.1/x";
+    paper.publication = "A Journal";
+    paper.source = "openalex";
+    const note = renderInboxNote({
+      work: paper,
+      authorPlacement: "property",
+      arrivedOn: "2026-01-01",
+      originIds: ["doi:10.1/x"],
+    });
+    const keys = frontmatterOf(note)
+      .split("\n")
+      .filter((line) => /^[a-z-]+:/.test(line))
+      .map((line) => line.split(":")[0]);
+    expect(keys).toEqual([
+      "title", "authors", "year", "publication", "doi",
+      "item-type", "source", "fetched", "origin-ids",
+    ]);
+  });
+});

@@ -13,9 +13,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   App,
+  MarkdownView,
   Platform,
   Setting,
   TFile,
+  TFolder,
+  WorkspaceLeaf,
   allSettings,
   clearNotices,
   clearRequests,
@@ -160,7 +163,6 @@ describe("plugin load", () => {
       "build-kernel",
       "keep-paper",
       "add-by-doi",
-      "suggest-paper",
       "copy-identifier",
     ]);
   });
@@ -416,70 +418,6 @@ describe("degenerate and failure cases", () => {
 
 // --- keeping ---------------------------------------------------------------------------
 
-describe("what should I read?", () => {
-  it("suggests a paper from the inbox", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { plugin } = await bootPlugin(enableOpenAlex);
-    await plugin.updateInbox();
-
-    await plugin.suggestPaper();
-
-    // The modal names a real arrival rather than failing quietly.
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(false);
-  });
-
-  it("says so when there is nothing to suggest", async () => {
-    const { plugin } = await bootPlugin();
-    await plugin.suggestPaper();
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
-  });
-
-  it("ignores notes the user wrote themselves", async () => {
-    // A prose note has no identity and is none of this command's business.
-    const { app, plugin } = await bootPlugin();
-    await app.vault.createFolder("Papers");
-    await app.vault.create("Papers/My Thoughts.md", "# My Thoughts\n\nprose\n");
-
-    await plugin.suggestPaper();
-
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
-  });
-
-  it("skips papers already marked read", async () => {
-    const { app, plugin } = await bootPlugin();
-    await app.vault.createFolder("Papers");
-    await app.vault.create(
-      "Papers/A Read Paper.md",
-"---\ntitle: A Read Paper\norigin-ids:\n  - doi:10.1/x\nread-status: read\n---\n\nbody\n",
-    );
-
-    await plugin.suggestPaper();
-
-    expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
-  });
-
-  it("writes no read-status property unless the feature is on", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
-    await plugin.updateInbox();
-
-    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
-    expect(note).not.toContain("read-status");
-  });
-
-  it("seeds the property when the feature is on", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.readStatusEnabled = true;
-    });
-    await plugin.updateInbox();
-
-    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
-    expect(note).toContain("read-status: to-read");
-  });
-});
-
 describe("keeping a paper", () => {
   it("moves the note out of the inbox", async () => {
     respondWith(DEFAULT_RESPONSE);
@@ -517,6 +455,80 @@ describe("keeping a paper", () => {
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(false);
     expect(app.vault.files.has("Papers/A Paper About Transformers.md")).toBe(true);
+  });
+
+  it("says why, and moves nothing, when the library already has that name", async () => {
+    // Obsidian refuses to move onto an existing file; the refusal used to
+    // escape as an unhandled rejection, so the command just seemed to do
+    // nothing at all.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+    await app.vault.createFolder("Papers");
+    await app.vault.create("Papers/A Paper About Transformers.md", "a different note");
+
+    app.workspace.activeFile = new TFile("Inbox/A Paper About Transformers.md");
+    await runCommand(plugin, "keep-paper");
+
+    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
+    expect(app.vault.files.get("Papers/A Paper About Transformers.md")).toBe("a different note");
+    expect(notices.some((n) => n.includes("already has a note"))).toBe(true);
+  });
+});
+
+describe("the folders are the source of truth", () => {
+  it("follows an arrival the user renamed inside the inbox", async () => {
+    // Treated as a deletion, a rename dropped the record and filed the paper
+    // under "removed" — while its note sat right there in the inbox.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    await app.fileManager.renameFile(
+      new TFile("Inbox/A Paper About Attention.md"),
+      "Inbox/Read later/Attention.md",
+    );
+    respondWith(DEFAULT_RESPONSE);
+    await runCommand(plugin, "update-inbox");
+
+    const state = plugin as never as { inbox: { notePath: string }[]; previouslyRemoved: string[] };
+    expect(state.inbox.map((r) => r.notePath).sort()).toEqual([
+      "Inbox/A Paper About Transformers.md",
+      "Inbox/Read later/Attention.md",
+    ]);
+    expect(state.previouslyRemoved).toEqual([]);
+    expect(app.vault.files.has("Inbox/A Paper About Attention.md")).toBe(false); // not re-added
+  });
+
+  it("neither duplicates nor overwrites inbox notes it has no record of", async () => {
+    // Plugin data is per-device. A vault synced without it, or a reinstall,
+    // used to see its own inbox as empty: the same papers were fetched again
+    // and written straight over the notes — including what the user wrote.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+    const path = "Inbox/A Paper About Transformers.md";
+    app.vault.files.set(path, `${app.vault.files.get(path)}\nMy notes on this paper.\n`);
+    (plugin as never as { inbox: unknown[] }).inbox = [];
+
+    respondWith(DEFAULT_RESPONSE);
+    await runCommand(plugin, "update-inbox");
+
+    expect(app.vault.files.get(path)).toContain("My notes on this paper.");
+    expect([...app.vault.files.keys()].filter((p) => p.startsWith("Inbox/"))).toHaveLength(2);
+    expect(plugin.status().inboxCount).toBe(2);
+  });
+
+  it("refuses to run while the inbox sits inside the library", async () => {
+    const { plugin } = await bootPlugin((p) => {
+      enableOpenAlex(p);
+      p.settings.inboxFolder = "Papers/Inbox";
+    });
+
+    await plugin.updateInbox();
+
+    expect(requestedUrls).toHaveLength(0);
+    expect(notices.some((n) => n.includes("overlap"))).toBe(true);
   });
 });
 
@@ -623,7 +635,7 @@ describe("building the starting graph", () => {
 
   it("gives arrivals something to connect to", async () => {
     // The whole reason the kernel exists: without it, the first arrival is an
-    // isolated dot and "why you're seeing this" can never fire.
+    // isolated dot.
     respondWith(KERNEL_RESPONSE);
     const { app, plugin } = await bootPlugin(enableOpenAlex);
     await runCommand(plugin, "build-kernel");
@@ -634,7 +646,7 @@ describe("building the starting graph", () => {
     await runCommand(plugin, "update-inbox");
 
     const arrival = app.vault.files.get("Inbox/A Newly Published Paper.md") as string;
-    expect(arrival).toContain("Why you're seeing this");
+    expect(arrival).toContain("## Citations");
     expect(arrival).toContain("[[The Foundational Paper]]");
   });
 
@@ -915,6 +927,33 @@ describe("expanding from a specific selection (context menu)", () => {
     expect(app.vault.files.has("Papers/A Reference.md")).toBe(false);
   });
 
+  it("keeps a custom folder inside the library, where later updates can see it", async () => {
+    // Written anywhere else, the expansion was invisible to the next update's
+    // dedup, which then fetched the same papers back into the inbox.
+    const { app, plugin } = await bootPlugin();
+    await app.vault.createFolder("Papers");
+    const selected = await app.vault.create(
+      "Papers/Selected Paper.md",
+      keptNoteContent("Selected Paper", "openalex:W1"),
+    );
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return { status: 200, text: openAlexPage([openAlexWork("W1", "Selected Paper", ["W10"])]) };
+      }
+      if (call === 2) {
+        return { status: 200, text: openAlexPage([openAlexWork("W10", "A Reference")]) };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+
+    await plugin.expandFromNotes([selected as never], { count: 1, folder: "Trapped Ions" });
+
+    expect(app.vault.files.has("Papers/Trapped Ions/A Reference.md")).toBe(true);
+    expect(app.vault.files.has("Trapped Ions/A Reference.md")).toBe(false);
+  });
+
   it("says so when nothing in the selection is a usable paper", async () => {
     const { app, plugin } = await bootPlugin();
     await app.vault.createFolder("Inbox");
@@ -1008,7 +1047,7 @@ describe("choosing arrivals by citation adjacency", () => {
     expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
   });
 
-  it("wires the arrival to the paper it cited, so the why-line fires", async () => {
+  it("wires the arrival to the paper it cited", async () => {
     // The entire point: an arrival chosen this way is connected by
     // construction rather than by hoping an edge exists.
     respondWith(openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]));
@@ -1017,7 +1056,7 @@ describe("choosing arrivals by citation adjacency", () => {
     await plugin.updateInbox();
 
     const arrival = app.vault.files.get("Inbox/A Paper Citing Yours.md") as string;
-    expect(arrival).toContain("Why you're seeing this");
+    expect(arrival).toContain("## Citations");
     expect(arrival).toContain("[[An Existing Paper]]");
   });
 
@@ -1061,18 +1100,20 @@ describe("choosing arrivals by citation adjacency", () => {
     expect(notices.some((n) => n.includes("source error"))).toBe(true);
   });
 
-  it("puts citing papers ahead of topic matches, so the cap keeps the better ones", async () => {
-    // When maxArrivalsPerRun bites, connectivity to your kept library decides
-    // what survives — not which source listed it first. A paper citing your
-    // library has a real edge; one that merely matched a topic string has
-    // none, so it loses the cap regardless of source order.
+  it("gives each source row its own cap, so one row cannot starve another", async () => {
+    // The row's "Papers per run" is the only cap the settings page shows. It
+    // used to be overridden by a hidden run-wide cap of 3, so a row set to 10
+    // delivered 3, and two rows set to 1 delivered 1 between them.
     let call = 0;
     setRequestResponder(() => {
       call += 1;
       if (call === 1) {
         return {
           status: 200,
-          text: openAlexPage([openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine")]),
+          text: openAlexPage([
+            openAlexWork("W9", "A Paper Citing Yours", ["W1"], "10.1234/nine"),
+            openAlexWork("W7", "Another Paper Citing Yours", ["W1"], "10.1234/seven"),
+          ]),
         };
       }
       return {
@@ -1082,7 +1123,7 @@ describe("choosing arrivals by citation adjacency", () => {
     });
     const { app, plugin } = await vaultWithKeptPaper((p) => {
       p.settings.sources = [
-        { kind: "citing", value: "", enabled: true },
+        { kind: "citing", value: "", enabled: true, maxPerRun: 2 },
         { kind: "topic", value: "transformers", enabled: true },
       ];
       p.settings.maxArrivalsPerRun = 1;
@@ -1091,7 +1132,80 @@ describe("choosing arrivals by citation adjacency", () => {
     await plugin.updateInbox();
 
     expect(app.vault.files.has("Inbox/A Paper Citing Yours.md")).toBe(true);
-    expect(app.vault.files.has("Inbox/A Topic Match.md")).toBe(false);
+    expect(app.vault.files.has("Inbox/Another Paper Citing Yours.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/A Topic Match.md")).toBe(true);
+  });
+
+  it("keeps the most relevant topic matches, not the newest", async () => {
+    // A topic search comes back in relevance order; date order among equally
+    // unconnected candidates would throw that ranking away.
+    respondWith(
+      openAlexPage([
+        openAlexWork("W1", "The Most Relevant Match", [], "10.1234/one", "2026-05-01"),
+        openAlexWork("W2", "A Newer But Weaker Match", [], "10.1234/two", "2026-05-09"),
+      ]),
+    );
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [{ kind: "topic", value: "transformers", enabled: true, maxPerRun: 1 }];
+    });
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/The Most Relevant Match.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/A Newer But Weaker Match.md")).toBe(false);
+  });
+
+  it("reaches past papers already seen instead of reporting nothing new", async () => {
+    // The feed was cut to the row's cap *before* dedup, so once the newest
+    // items had arrived every later run reported "0 new" while unseen ones
+    // sat just below them.
+    const feed = (titles: string[]) =>
+      `<?xml version="1.0"?><rss version="2.0"><channel><title>J</title>` +
+      titles
+        .map(
+          (title, i) =>
+            `<item><title>${title}</title><guid>g${i}</guid>` +
+            `<pubDate>${new Date(Date.now() - i * 3_600_000).toUTCString()}</pubDate></item>`,
+        )
+        .join("") +
+      `</channel></rss>`;
+    respondWith(feed(["Newest Feed Item Here", "Second Feed Item Here", "Third Feed Item Here"]));
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/feed.xml", enabled: true, maxPerRun: 1 },
+      ];
+    });
+
+    await plugin.updateInbox();
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/Newest Feed Item Here.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Second Feed Item Here.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Third Feed Item Here.md")).toBe(false);
+  });
+
+  it("ranks a connection to a rarely-cited kept paper above one to a hub", async () => {
+    // Measured live: in a pool of recent citers of a quantum-computing
+    // library, a third cited the same NISQ survey. Citing what everyone cites
+    // says little; citing what only one candidate cites says a lot.
+    respondWith(
+      openAlexPage([
+        openAlexWork("W10", "Cites Only The Hub One", ["W1"], "10.1234/ten", "2026-05-09"),
+        openAlexWork("W11", "Cites Only The Hub Two", ["W1"], "10.1234/eleven", "2026-05-09"),
+        openAlexWork("W12", "Cites The Niche Paper", ["W2"], "10.1234/twelve", "2026-05-01"),
+      ]),
+    );
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [{ kind: "citing", value: "", enabled: true, maxPerRun: 1 }];
+    });
+    app.vault.folders.add("Papers");
+    app.vault.files.set("Papers/The Hub.md", keptNoteContent("The Hub", "openalex:W1"));
+    app.vault.files.set("Papers/The Niche Paper.md", keptNoteContent("The Niche Paper", "openalex:W2"));
+
+    await plugin.updateInbox();
+
+    expect(app.vault.files.has("Inbox/Cites The Niche Paper.md")).toBe(true);
+    expect(app.vault.files.has("Inbox/Cites Only The Hub One.md")).toBe(false);
   });
 
   it("over-fetches citing papers so connectivity selects beyond the first N", async () => {
@@ -1118,7 +1232,8 @@ describe("choosing arrivals by citation adjacency", () => {
 
     expect(app.vault.files.has("Inbox/Older Strong Connection.md")).toBe(true);
     expect(app.vault.files.has("Inbox/Recent Weak Connection.md")).toBe(false);
-    expect(requestedUrls[0]).toContain("per-page=4");
+    // A pool well beyond the cap: credits are per request, not per result.
+    expect(requestedUrls[0]).toContain("per-page=25");
   });
 
   it("skips the adjacency query entirely in topic-only mode", async () => {
@@ -1285,70 +1400,6 @@ describe("run report transparency", () => {
 
     const modal = openModals[openModals.length - 1];
     expect(modal.contentEl.querySelectorAll("ul li").length).toBe(0);
-  });
-});
-
-describe("what should I read?", () => {
-  it("suggests a paper from the inbox", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { plugin } = await bootPlugin(enableOpenAlex);
-    await plugin.updateInbox();
-
-    await plugin.suggestPaper();
-
-    // The modal names a real arrival rather than failing quietly.
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(false);
-  });
-
-  it("says so when there is nothing to suggest", async () => {
-    const { plugin } = await bootPlugin();
-    await plugin.suggestPaper();
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
-  });
-
-  it("ignores notes the user wrote themselves", async () => {
-    // A prose note has no identity and is none of this command's business.
-    const { app, plugin } = await bootPlugin();
-    await app.vault.createFolder("Papers");
-    await app.vault.create("Papers/My Thoughts.md", "# My Thoughts\n\nprose\n");
-
-    await plugin.suggestPaper();
-
-    expect(notices.some((n) => n.includes("No papers yet"))).toBe(true);
-  });
-
-  it("skips papers already marked read", async () => {
-    const { app, plugin } = await bootPlugin();
-    await app.vault.createFolder("Papers");
-    await app.vault.create(
-      "Papers/A Read Paper.md",
-"---\ntitle: A Read Paper\norigin-ids:\n  - doi:10.1/x\nread-status: read\n---\n\nbody\n",
-    );
-
-    await plugin.suggestPaper();
-
-    expect(notices.some((n) => n.includes("marked read or reference"))).toBe(true);
-  });
-
-  it("writes no read-status property unless the feature is on", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
-    await plugin.updateInbox();
-
-    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
-    expect(note).not.toContain("read-status");
-  });
-
-  it("seeds the property when the feature is on", async () => {
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin((p) => {
-      enableOpenAlex(p);
-      p.settings.readStatusEnabled = true;
-    });
-    await plugin.updateInbox();
-
-    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
-    expect(note).toContain("read-status: to-read");
   });
 });
 
@@ -1771,6 +1822,21 @@ describe("the plugin's visible surface", () => {
     expect(requestedUrls[0]).not.toContain("default.search");
   });
 
+  it("says the API key was rejected, rather than showing a bare HTTP 401", async () => {
+    respondWith(
+      '{"error":"Invalid or missing API key","message":"API key not found."}',
+      401,
+    );
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.openAlexApiKey = "mistyped-key";
+    });
+
+    await plugin.refreshBudget();
+
+    expect(notices.some((n) => n.includes("OpenAlex rejected your API key"))).toBe(true);
+    expect(notices.some((n) => n.includes("HTTP 401"))).toBe(false);
+  });
+
   it("renders every settings section without throwing", async () => {
     const { plugin } = await bootPlugin();
     const tab = (plugin as never as { settingTab: { display: () => void } }).settingTab;
@@ -1805,38 +1871,6 @@ describe("the plugin's visible surface", () => {
     await waitForIdle(plugin);
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
-  });
-});
-
-describe("why am I seeing this", () => {
-  it("names the kept papers an arrival connects to", async () => {
-    respondWith(openAlexPage([openAlexWork("W1", "A Brand New Arrival", ["W99"], "10.1234/new")]));
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
-    // A paper the user kept: it lives in Papers/, not the inbox.
-    await app.vault.createFolder("Papers");
-    await app.vault.create(
-      "Papers/A Paper I Kept.md",
-      keptNoteContent("A Paper I Kept", "openalex:W99"),
-    );
-
-    await runCommand(plugin, "update-inbox");
-
-    const note = app.vault.files.get("Inbox/A Brand New Arrival.md") as string;
-    expect(note).toContain("Why you're seeing this");
-    expect(note).toContain("[[A Paper I Kept]]");
-  });
-
-  it("stays quiet when an arrival only connects to other arrivals", async () => {
-    // Connecting to unread arrivals says nothing about relevance, so claiming
-    // it would be noise rather than signal.
-    respondWith(DEFAULT_RESPONSE);
-    const { app, plugin } = await bootPlugin(enableOpenAlex);
-
-    await runCommand(plugin, "update-inbox");
-
-    const note = app.vault.files.get("Inbox/A Paper About Transformers.md") as string;
-    expect(note).toContain("[[A Paper About Attention]]"); // the edge exists
-    expect(note).not.toContain("Why you're seeing this"); // but it isn't a signal
   });
 });
 
@@ -1920,6 +1954,73 @@ describe("citation backfill", () => {
     clearRequests();
     await runCommand(plugin, "update-inbox");
     expect(requestedUrls.some((url) => url.includes("title.search"))).toBe(true);
+  });
+
+  /** An arXiv item from a feed: no DOI and no references, but an exact id. */
+  const arxivFeed =
+    `<?xml version="1.0"?><rss version="2.0"><channel><title>arXiv</title>` +
+    `<item><title>An ArXiv Preprint Title</title>` +
+    `<link>https://arxiv.org/abs/2601.00001</link><guid>oai:2601.00001</guid>` +
+    `<pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`;
+
+  it("stops asking about an arXiv arrival once the 30-day window passes", async () => {
+    // Exact ids used to be re-asked on every run forever — and with nothing
+    // ever cleaning the inbox, that cost only grew.
+    setRequestResponder((url) =>
+      url.includes("example.org")
+        ? { status: 200, text: arxivFeed }
+        : { status: 200, text: openAlexPage([]) },
+    );
+    const { plugin } = await bootPlugin((p) => {
+      p.settings.sources = [{ kind: "feed", value: "https://example.org/feed.xml", enabled: true }];
+    });
+    await runCommand(plugin, "update-inbox");
+
+    ageBackfillState(plugin, 29);
+    clearRequests();
+    await runCommand(plugin, "update-inbox");
+    expect(requestedUrls.some((url) => url.includes("10.48550"))).toBe(true);
+
+    ageBackfillState(plugin, 2);
+    clearRequests();
+    await runCommand(plugin, "update-inbox");
+    expect(requestedUrls.some((url) => url.includes("10.48550"))).toBe(false);
+    // ...and Crossref is never asked about an arXiv DOI at all.
+    expect(requestedUrls.some((url) => url.includes("crossref"))).toBe(false);
+  });
+
+  it("remembers references found later, so a later arrival it cites links back", async () => {
+    let phase = 0;
+    setRequestResponder((url) => {
+      if (url.includes("example.org")) return { status: 200, text: arxivFeed };
+      if (phase === 1 && url.includes("doi%3A10.48550")) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W5", "An ArXiv Preprint Title", ["W77"], "10.48550/arxiv.2601.00001"),
+          ]),
+        };
+      }
+      if (phase === 2 && url.includes("title_and_abstract.search")) {
+        return { status: 200, text: openAlexPage([openAlexWork("W77", "The Paper It Cites")]) };
+      }
+      return { status: 200, text: openAlexPage([]) };
+    });
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.sources = [
+        { kind: "feed", value: "https://example.org/feed.xml", enabled: true },
+        { kind: "topic", value: "anything", enabled: true },
+      ];
+    });
+    await runCommand(plugin, "update-inbox"); // the preprint arrives, no references yet
+    phase = 1;
+    await runCommand(plugin, "update-inbox"); // OpenAlex now has them; none in the vault
+    phase = 2;
+    await runCommand(plugin, "update-inbox"); // a paper it cites arrives
+
+    expect(app.vault.files.get("Inbox/An ArXiv Preprint Title.md")).toContain(
+      "[[The Paper It Cites]]",
+    );
   });
 
   it("gives up once the 30-day window passes, and says so on the note", async () => {
@@ -2205,5 +2306,254 @@ describe("mobile compatibility", () => {
     await runCommand(plugin, "update-inbox");
 
     expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(true);
+  });
+});
+
+describe("renames, as Obsidian reports them", () => {
+  it("follows the inbox folder when it is renamed in the file explorer", async () => {
+    // The setting used to keep pointing at "Inbox", so the next run found
+    // every arrival gone and remembered each one as deliberately let go.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    await app.fileManager.renameFile(new TFolder("Inbox"), "Arrivals");
+    expect(plugin.settings.inboxFolder).toBe("Arrivals");
+
+    respondWith(DEFAULT_RESPONSE);
+    await runCommand(plugin, "update-inbox");
+
+    expect((plugin as never as { previouslyRemoved: string[] }).previouslyRemoved).toEqual([]);
+    expect([...app.vault.files.keys()].sort()).toEqual([
+      "Arrivals/A Paper About Attention.md",
+      "Arrivals/A Paper About Transformers.md",
+    ]);
+    expect(plugin.status().inboxCount).toBe(2);
+  });
+
+  it("follows the library folder, so what you kept still blocks a re-fetch", async () => {
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await app.vault.createFolder("Papers");
+    await app.vault.create(
+      "Papers/A Paper About Transformers.md",
+      keptNoteContent("A Paper About Transformers", "openalex:W1"),
+    );
+
+    await app.fileManager.renameFile(new TFolder("Papers"), "Library");
+    await runCommand(plugin, "update-inbox");
+
+    expect(plugin.settings.papersFolder).toBe("Library");
+    expect(app.vault.files.has("Inbox/A Paper About Transformers.md")).toBe(false);
+  });
+
+  it("stops counting a kept paper as an arrival the moment Keep moves it", async () => {
+    // Obsidian updates a file's path in place when it moves, so Keep's own
+    // bookkeeping — written against the path after the move — never matched.
+    respondWith(DEFAULT_RESPONSE);
+    const { app, plugin } = await bootPlugin(enableOpenAlex);
+    await runCommand(plugin, "update-inbox");
+
+    app.workspace.activeFile = new TFile("Inbox/A Paper About Transformers.md");
+    await runCommand(plugin, "keep-paper");
+
+    expect(plugin.status().inboxCount).toBe(1);
+    expect((plugin as never as { inbox: unknown[] }).inbox).toHaveLength(1);
+  });
+});
+
+describe("paper properties in notes", () => {
+  function openView(app: App, path: string, frontmatter?: Record<string, unknown>) {
+    const file = new TFile(path);
+    if (frontmatter) app.metadataCache.frontmatter.set(path, frontmatter);
+    const view = new MarkdownView(file);
+    app.workspace.leaves.push(new WorkspaceLeaf(view));
+    app.workspace.trigger("file-open", file);
+    return view;
+  }
+
+  it("hides properties by default in paper views only", async () => {
+    const { app } = await bootPlugin();
+    const paper = openView(app, "Inbox/Paper.md");
+    const ordinary = openView(app, "Notes/Thought.md", { tags: ["thought"] });
+
+    expect(paper.contentEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(true);
+    expect(paper.containerEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(
+      true,
+    );
+    expect(ordinary.contentEl.className).toBe("");
+    expect(ordinary.containerEl.className).toBe("");
+    expect(document.body.className).not.toContain("literature-inbox");
+  });
+
+  it("recognises kept papers from their folder without waiting for metadata", async () => {
+    const { app } = await bootPlugin();
+    const view = openView(app, "Papers/Kept.md");
+
+    expect(view.contentEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(true);
+    expect(view.containerEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(
+      true,
+    );
+  });
+
+  it("styles the active paper after Obsidian resolves its deferred view", async () => {
+    const { app } = await bootPlugin();
+    const file = new TFile("Inbox/Deferred.md");
+    app.metadataCache.frontmatter.set(file.path, { "origin-ids": ["doi:10.1/deferred"] });
+    const resolved = new MarkdownView(file);
+    const leaf = new WorkspaceLeaf({ deferred: true }, () => resolved);
+    app.workspace.leaves.push(leaf);
+    app.workspace.activeLeaf = leaf;
+
+    app.workspace.trigger("active-leaf-change", leaf);
+    await vi.waitFor(() => {
+      expect(resolved.contentEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(
+        true,
+      );
+      expect(
+        resolved.containerEl.classList.contains("literature-inbox-paper-properties-hidden"),
+      ).toBe(true);
+    });
+  });
+
+  it("switches between hidden, compact and all without changing the note", async () => {
+    const { app, plugin } = await bootPlugin();
+    const view = openView(app, "Papers/Paper.md", { "origin-ids": ["openalex:W1"] });
+
+    plugin.settings.propertyDisplay = "compact";
+    await plugin.saveSettings();
+    expect(view.contentEl.classList.contains("literature-inbox-paper-properties-hidden")).toBe(false);
+    expect(view.contentEl.classList.contains("literature-inbox-paper-properties-compact")).toBe(true);
+
+    plugin.settings.propertyDisplay = "all";
+    await plugin.saveSettings();
+    expect(view.contentEl.className).toBe("");
+    expect(view.containerEl.className).toBe("");
+
+    plugin.settings.propertyDisplay = "hidden";
+    await plugin.saveSettings();
+    plugin.onunload();
+    expect(view.contentEl.className).toBe("");
+    expect(view.containerEl.className).toBe("");
+  });
+
+  it("offers the three display choices in settings", async () => {
+    const { plugin } = await bootPlugin();
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+    const setting = allSettings.find((s: Setting) => s.name === "Paper properties in notes");
+
+    expect([...(setting?.dropdowns[0]?.options.keys() ?? [])]).toEqual(["hidden", "compact", "all"]);
+    expect(setting?.dropdowns[0]?.value).toBe("hidden");
+  });
+});
+
+describe("expanding from a folder, or from a mixed selection", () => {
+  async function libraryWithIons(app: App) {
+    await app.vault.createFolder("Papers/Ions");
+    await app.vault.create("Papers/Ions/Ion Paper One.md", keptNoteContent("Ion Paper One", "openalex:W1"));
+    await app.vault.create("Papers/Ions/Ion Paper Two.md", keptNoteContent("Ion Paper Two", "openalex:W2"));
+    await app.vault.create("Papers/Unrelated.md", keptNoteContent("Unrelated", "openalex:W99"));
+  }
+
+  /** Seeds come back citing W10; W10 is the one paper the expansion finds. */
+  function respondToExpansion() {
+    let call = 0;
+    setRequestResponder(() => {
+      call += 1;
+      if (call === 1) {
+        return {
+          status: 200,
+          text: openAlexPage([
+            openAlexWork("W1", "Ion Paper One", ["W10"]),
+            openAlexWork("W2", "Ion Paper Two"),
+            openAlexWork("W99", "Unrelated"),
+          ]),
+        };
+      }
+      if (call === 2) return { status: 200, text: openAlexPage([openAlexWork("W10", "A Reference")]) };
+      return { status: 200, text: openAlexPage([]) };
+    });
+  }
+
+  async function confirmModal(plugin: LiteratureInboxPlugin) {
+    const expand = allSettings.find((s: Setting) => s.buttons.some((b) => b.text === "Expand"));
+    await expand?.buttons.find((b) => b.text === "Expand")?.simulateClick();
+    await waitForIdle(plugin);
+  }
+
+  it("right-click on a library subfolder expands from its papers, into that subfolder", async () => {
+    const { app, plugin } = await bootPlugin();
+    await libraryWithIons(app);
+    respondToExpansion();
+
+    const item = app.workspace
+      .triggerFileMenu(new TFolder("Papers/Ions"))
+      .items.find((i) => i.title.includes("Expand outward"));
+    expect(item?.title).toBe("Expand outward from papers in Papers/Ions/…");
+
+    clearSettings();
+    item?.click();
+    expect(allSettings.find((s: Setting) => s.name === "Add to folder")?.texts[0]?.value).toBe(
+      "Papers/Ions",
+    );
+    await confirmModal(plugin);
+
+    expect(requestedUrls[0]).toContain("W1");
+    expect(requestedUrls[0]).toContain("W2");
+    expect(requestedUrls[0]).not.toContain("W99"); // outside the folder: no part in it
+    expect(app.vault.files.has("Papers/Ions/A Reference.md")).toBe(true);
+  });
+
+  it("offers the same for several papers and folders selected together", async () => {
+    const { app, plugin } = await bootPlugin();
+    await libraryWithIons(app);
+    respondToExpansion();
+
+    const item = app.workspace
+      .triggerFilesMenu([new TFolder("Papers/Ions"), new TFile("Papers/Unrelated.md")])
+      .items.find((i) => i.title.includes("Expand outward"));
+    expect(item?.title).toBe("Expand outward from 1 paper and 1 folder…");
+
+    clearSettings();
+    item?.click();
+    // The deepest folder the selection shares.
+    expect(allSettings.find((s: Setting) => s.name === "Add to folder")?.texts[0]?.value).toBe(
+      "Papers",
+    );
+    await confirmModal(plugin);
+
+    expect(requestedUrls[0]).toContain("W99");
+    expect(requestedUrls[0]).toContain("W1");
+    expect(app.vault.files.has("Papers/A Reference.md")).toBe(true);
+  });
+
+  it("files a single paper's expansion in that paper's own subfolder by default", async () => {
+    const { app } = await bootPlugin();
+    await libraryWithIons(app);
+
+    app.workspace.triggerFileMenu(new TFile("Papers/Ions/Ion Paper One.md")).items[0]?.click();
+
+    expect(allSettings.find((s: Setting) => s.name === "Add to folder")?.texts[0]?.value).toBe(
+      "Papers/Ions",
+    );
+  });
+
+  it("lets the library mode start from one subfolder, and writes the results there", async () => {
+    const { app, plugin } = await bootPlugin((p) => {
+      p.settings.kernelMode = "library";
+      p.settings.kernelLibraryFolder = "Ions";
+    });
+    await libraryWithIons(app);
+    respondToExpansion();
+
+    (plugin as never as { settingTab: { display: () => void } }).settingTab.display();
+    const from = allSettings.find((s: Setting) => s.name === "From");
+    expect([...(from?.dropdowns[0]?.options.keys() ?? [])]).toEqual(["", "Ions"]);
+    expect(from?.dropdowns[0]?.value).toBe("Ions");
+
+    await plugin.buildKernel();
+
+    expect(requestedUrls[0]).not.toContain("W99");
+    expect(app.vault.files.has("Papers/Ions/A Reference.md")).toBe(true);
   });
 });

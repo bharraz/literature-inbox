@@ -301,6 +301,81 @@ describe("runUpdate", () => {
     expect(report.arrived[0]?.title).toBe("Newer Equally Connected Paper");
   });
 
+  it("never writes over a file it was not told about", async () => {
+    // An inbox note with no record (plugin data reset, or another device), or
+    // a note the user wrote with no ids: the allocator could not know about
+    // either, and the old write path replaced the file wholesale.
+    const adapter = new MemoryVault();
+    adapter.files.set("Inbox/A Paper Already Here.md", "my own notes on this");
+
+    const { report } = await runUpdate({
+      fetched: [paper("W1", "A Paper Already Here", { date: "2024-03-01" })],
+      vault: emptyVault(), inbox: [], settings, adapter, today,
+    });
+
+    expect(adapter.files.get("Inbox/A Paper Already Here.md")).toBe("my own notes on this");
+    expect(report.arrived[0]?.notePath).toBe("Inbox/A Paper Already Here (2024).md");
+  });
+
+  it("applies each source's own cap to that source's best candidates", async () => {
+    const adapter = new MemoryVault();
+    const fromA = [paper("W1", "Row A First Paper"), paper("W2", "Row A Second Paper")];
+    const fromB = [paper("W3", "Row B First Paper"), paper("W4", "Row B Second Paper")];
+    const group = new Map<Work, string>([
+      ...fromA.map((w) => [w, "a"] as const),
+      ...fromB.map((w) => [w, "b"] as const),
+    ]);
+
+    const { report } = await runUpdate({
+      fetched: [...fromA, ...fromB], vault: emptyVault(), inbox: [],
+      settings: { ...settings, maxArrivalsPerRun: 100 }, adapter, today,
+      capFor: (work) => ({ group: group.get(work) as string, cap: group.get(work) === "a" ? 2 : 1 }),
+    });
+
+    expect(report.arrived.map((a) => a.title).sort()).toEqual([
+      "Row A First Paper", "Row A Second Paper", "Row B First Paper",
+    ]);
+    expect(report.heldBack).toBe(1);
+    expect(report.cappedAt).toBeUndefined(); // no run-wide ceiling was involved
+  });
+
+  it("prefers the source's own order over recency between equals", async () => {
+    const adapter = new MemoryVault();
+    const best = paper("W1", "Most Relevant Older Paper", { date: "2026-01-01" });
+    const newer = paper("W2", "Less Relevant Newer Paper", { date: "2026-07-01" });
+    const order = new Map<Work, number>([[best, 0], [newer, 1]]);
+
+    const { report } = await runUpdate({
+      fetched: [newer, best], vault: emptyVault(), inbox: [],
+      settings: { ...settings, maxArrivalsPerRun: 1 }, adapter, today,
+      orderFor: (work) => order.get(work) ?? 0,
+    });
+
+    expect(report.arrived[0]?.title).toBe("Most Relevant Older Paper");
+  });
+
+  it("weights a connection by how rare it is in the pool", async () => {
+    const adapter = new MemoryVault();
+    const vault = vaultWith({
+      "Papers/Survey.md": { origin_ids: ["openalex:W90"], title: "Survey" },
+      "Papers/Niche.md": { origin_ids: ["openalex:W91"], title: "Niche" },
+    });
+    const cites = (key: string, title: string, refs: string[], date: string) =>
+      paper(key, title, { date, references: refs.map((value) => ({ namespace: "openalex", value })) });
+
+    const { report } = await runUpdate({
+      fetched: [
+        cites("W1", "Survey Citer One Here", ["W90"], "2026-07-10"),
+        cites("W2", "Survey Citer Two Here", ["W90"], "2026-07-10"),
+        cites("W3", "Survey Citer Three Here", ["W90"], "2026-07-10"),
+        cites("W4", "The Niche Citer Here", ["W91"], "2026-07-01"),
+      ],
+      vault, inbox: [], settings: { ...settings, maxArrivalsPerRun: 1 }, adapter, today,
+    });
+
+    expect(report.arrived[0]?.title).toBe("The Niche Citer Here");
+  });
+
   it("records every origin id on the arrival, for later dedup", async () => {
     const adapter = new MemoryVault();
     const work = paper("W1", "A Paper With Several Ids");

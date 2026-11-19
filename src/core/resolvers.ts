@@ -72,6 +72,17 @@ export function titleResolver(
 }
 
 /**
+ * arXiv's own DOIs are registered with DataCite, so a Crossref lookup for one
+ * is a guaranteed 404 — and Crossref has no batch form, so each costs a paced
+ * round trip of a second or more. Every arXiv arrival is looked up by such a
+ * DOI on each run until it connects, which made an update's backfill slower in
+ * step with the inbox for no possible gain.
+ */
+function isArxivDoi(doi: string): boolean {
+  return doi.toLowerCase().startsWith("10.48550/");
+}
+
+/**
  * Ask *primary* for a batch of DOIs, then top up from *fallback*.
  *
  * The fallback is only asked about DOIs the primary either missed entirely or
@@ -98,6 +109,7 @@ export function doiResolver(
       }
 
       const unresolved = dois.filter((doi) => {
+        if (isArxivDoi(doi)) return false;
         const hit = found.get(doi);
         return !hit || hit.references.length === 0;
       });

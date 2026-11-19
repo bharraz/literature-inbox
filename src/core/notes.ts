@@ -91,22 +91,8 @@ export interface InboxNoteOptions {
   /** ISO date the paper arrived, used by the keep window. */
   arrivedOn: string;
   originIds: string[];
-  /**
-   * Of the notes this work connects to, the ones that are papers the user
-   * *kept* — i.e. live outside the inbox — rather than fellow arrivals.
-   *
-   * This is the "why am I seeing this" signal, and it is the product thesis
-   * in one line: a paper connected to work you already care about is worth a
-   * look; one connected only to other unread arrivals is not.
-   */
-  connectedKept?: string[];
   /** How subject terms reach the note, if at all. */
   subjects?: SubjectOptions;
-  /**
-   * Seed the note with a read-status property. Off unless the user turned the
-   * feature on — an unused property in every note is just clutter.
-   */
-  readStatus?: string;
 }
 
 export type AuthorPlacement = "off" | "property" | "plaintext";
@@ -139,6 +125,13 @@ export function tagify(term: string): string | undefined {
   return slug;
 }
 
+/**
+ * At most this many subject terms reach a note. Machine-assigned and ranked,
+ * so past the head they tail off into terms too broad to say anything, while
+ * each one is another line in the properties panel above the abstract.
+ */
+export const MAX_NOTE_SUBJECTS = 8;
+
 /** The chosen vocabularies, in the order most-curated first, de-duplicated. */
 export function collectSubjects(work: Work, options: SubjectOptions): string[] {
   const terms: string[] = [];
@@ -148,7 +141,7 @@ export function collectSubjects(work: Work, options: SubjectOptions): string[] {
   if (options.topics) push(work.topics);
   if (options.keywords) push(work.keywords);
   if (options.concepts) push(work.concepts);
-  return terms;
+  return terms.slice(0, MAX_NOTE_SUBJECTS);
 }
 
 function renderCitations(cites: string[], citedBy: string[]): string {
@@ -174,20 +167,6 @@ function renderCitationsBlock(cites: string[], citedBy: string[]): string {
   return `${CITATIONS_START}\n${inner}${CITATIONS_END}\n`;
 }
 
-/**
- * The "why am I seeing this" line, phrased in terms of the papers the user
- * already kept rather than a raw edge count — a count says nothing about
- * whether the connection is to anything they care about.
- */
-function renderWhy(connectedKept: readonly string[]): string {
-  if (connectedKept.length === 0) return "";
-  const links = connectedKept.map((name) => `[[${name}]]`);
-  const shown = links.slice(0, 5).join(", ");
-  const rest = links.length > 5 ? `, and ${links.length - 5} more` : "";
-  const noun = links.length === 1 ? "a paper you kept" : "papers you kept";
-  return `> **Why you're seeing this:** it connects to ${noun} — ${shown}${rest}.\n`;
-}
-
 export function renderInboxNote(options: InboxNoteOptions): string {
   const { work, arrivedOn, originIds } = options;
   const authorPlacement = options.authorPlacement ?? "plaintext";
@@ -202,24 +181,27 @@ export function renderInboxNote(options: InboxNoteOptions): string {
       : [];
 
   const frontmatter = renderFrontmatter([
+    // What a reader looks at first, in the order they look for it. Every
+    // author, always — a shortened list would be a wrong record of the paper.
     ["title", work.title],
     [
       "authors",
       authorPlacement === "property" ? work.authors.map(fullName).filter(Boolean) : undefined,
     ],
     ["year", workYear(work)],
+    ["publication", work.publication],
     ["doi", work.doi],
     ["url", work.url],
-    ["publication", work.publication],
+    ["subjects", subjects.placement === "property" ? terms : undefined],
+    ["tags", asTags.length > 0 ? asTags : undefined],
+    // Then what the plugin keeps for itself, last — and folded out of the
+    // properties panel by "Tidy note properties". Provenance: a note always
+    // says where it came from and when, so nothing in the vault is of
+    // mysterious origin.
     ["item-type", work.itemType],
-    // Provenance: a note always says where it came from and when, so nothing
-    // in the vault is of mysterious origin.
     ["source", work.source],
     ["fetched", arrivedOn],
     ["origin-ids", originIds],
-    ["read-status", options.readStatus],
-    ["subjects", subjects.placement === "property" ? terms : undefined],
-    ["tags", asTags.length > 0 ? asTags : undefined],
     // Deliberately no `inbox`/`kept` tag. The folder is the source of truth
     // for whether a paper is kept, and a tag written at generation time cannot
     // track a file the user drags by hand — so it went stale the moment
@@ -234,8 +216,6 @@ export function renderInboxNote(options: InboxNoteOptions): string {
   const parts = [`# ${title}\n`];
   const authorLine = work.authors.map(fullName).filter(Boolean).join(", ");
   if (authorPlacement === "plaintext" && authorLine) parts.push(`**Authors:** ${authorLine}\n`);
-  const why = renderWhy(options.connectedKept ?? []);
-  if (why) parts.push(why);
   parts.push(`## Abstract\n\n${work.abstract?.trim() || NO_ABSTRACT_PLACEHOLDER}\n`);
   const citations = renderCitationsBlock(cites, citedBy);
   if (citations) parts.push(citations);
@@ -246,10 +226,17 @@ export function renderInboxNote(options: InboxNoteOptions): string {
 
 /** Every `[[Name]]` link already inside a citations block — under Cites,
  * under Cited by, or anything the user added by hand. Used only to decide
- * what's missing; nothing already linked is ever touched or removed. */
+ * what's missing; nothing already linked is ever touched or removed.
+ *
+ * Read down to the note name: when a note is renamed, Obsidian may rewrite
+ * links to it as `[[Papers/Name]]` or `[[Name|Old name]]`, and taking those
+ * for a different note added the same link a second time. */
 function existingLinks(block: string): Set<string> {
   const links = new Set<string>();
-  for (const match of block.matchAll(/\[\[([^\]]+)\]\]/g)) links.add(match[1] as string);
+  for (const match of block.matchAll(/\[\[([^\]]+)\]\]/g)) {
+    const target = (match[1] as string).split("|")[0]!.split("#")[0]!.trim();
+    links.add(target.split("/").pop()!.replace(/\.md$/i, ""));
+  }
   return links;
 }
 

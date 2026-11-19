@@ -46,10 +46,14 @@ export function bareOpenAlexId(fullId: string): string {
 }
 
 /** `"http://arxiv.org/abs/2607.15277v1"` -> `"2607.15277"` (URL and version
- * suffix both dropped, so the same paper doesn't arrive twice as v1 and v2). */
+ * suffix both dropped, so the same paper doesn't arrive twice as v1 and v2).
+ * A pre-2007 id keeps its archive — `hep-th/9901001`, not `9901001`, which
+ * is how OpenAlex records it and the only form arXiv itself resolves. */
 export function bareArxivId(fullId: string): string {
-  const parts = fullId.split("/");
-  const tail = parts[parts.length - 1] ?? fullId;
+  const path = fullId.replace(/^.*arxiv\.org\/(?:abs|pdf)\//i, "");
+  const oldStyle = path.match(/^[a-z-]+(?:\.[A-Za-z]{2})?\/\d{7}/);
+  const parts = path.split("/");
+  const tail = oldStyle ? oldStyle[0] : (parts[parts.length - 1] ?? path);
   const lastV = tail.lastIndexOf("v");
   if (lastV > 0) {
     const version = tail.slice(lastV + 1);

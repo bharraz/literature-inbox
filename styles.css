@@ -73,14 +73,51 @@
   background: var(--text-error);
 }
 
-/* The suggested paper's title, in place of a bare heading element. */
-.literature-inbox-suggestion-title {
-  font-size: var(--font-ui-large);
-  font-weight: var(--font-semibold);
-  line-height: var(--line-height-tight);
-  margin-bottom: var(--size-4-2);
-}
-
 .literature-inbox-id-input {
   width: 100%;
+}
+
+/*
+ * Paper-property display, scoped to a Markdown view the plugin has identified.
+ *
+ * Only in this plugin's own paper notes — recognised by their origin-ids
+ * property, so it works on notes written before this existed and never
+ * touches a note the user wrote. Display only: nothing leaves the file, and
+ * source mode shows everything.
+ *
+ * Hidden removes the inline panel; compact hides bookkeeping and tightens
+ * lists. The metadata remains in the file and source mode shows everything.
+ */
+.literature-inbox-paper-properties-hidden .metadata-container {
+  /* Themes often qualify this selector by editor mode. This remains scoped to
+     the individual paper view, while ensuring their rule cannot win. */
+  display: none !important;
+}
+
+.literature-inbox-paper-properties-compact .metadata-property:is(
+    [data-property-key="title"],
+    [data-property-key="origin-ids"],
+    [data-property-key="source"],
+    [data-property-key="fetched"],
+    [data-property-key="item-type"]
+  ) {
+  display: none !important;
+}
+
+/* Denser lists, so a long author list takes fewer lines — every author is
+   still there, just set tighter. */
+.literature-inbox-paper-properties-compact .multi-select-container {
+  row-gap: var(--size-2-1);
+  column-gap: var(--size-2-2);
+}
+
+.literature-inbox-paper-properties-compact .multi-select-pill {
+  font-size: var(--font-ui-smaller);
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* The topic preview's "searched as a phrase, check the results" caveat. */
+.literature-inbox-warning {
+  color: var(--text-warning);
 }

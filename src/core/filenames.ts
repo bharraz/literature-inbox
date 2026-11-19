@@ -105,3 +105,26 @@ export class FilenameAllocator {
     return { filename: candidate, collidedWith };
   }
 }
+
+/**
+ * A name for *work* whose note does not already exist in *folder*.
+ *
+ * The allocator only knows the names it was told about — papers it could
+ * identify and inbox notes it has a record for. A file it was never told
+ * about (a note the user wrote, an inbox note created on another device) can
+ * still sit at the exact path, and writing there would replace it. So the
+ * disk gets the last word: a taken path is reserved and the next name tried.
+ */
+export async function allocateUnused(
+  allocator: FilenameAllocator,
+  work: Work,
+  folder: string,
+  exists: (path: string) => Promise<boolean>,
+): Promise<string> {
+  let { filename } = allocator.allocate(work);
+  while (await exists(`${folder}/${filename}.md`)) {
+    allocator.reserve(filename);
+    ({ filename } = allocator.allocate(work));
+  }
+  return filename;
+}
